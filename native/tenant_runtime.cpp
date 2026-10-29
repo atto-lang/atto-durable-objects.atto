@@ -100,8 +100,13 @@ void schema(sqlite3* db) {
            "request_id TEXT PRIMARY KEY, seq INTEGER NOT NULL,object_id TEXT NOT NULL,"
            "lock_id TEXT NOT NULL,payload BLOB NOT NULL)");
     sql(db,"PRAGMA user_version=1");
-    // Recover abandoned in-flight turns; WAL COMMIT already guarantees that
-    // state mutation and job acknowledgement either both committed or neither did.
+    // Recovery must not overflow the persistent fencing counter. SQLite can
+    // promote an overflowing INTEGER expression to REAL; such a fence would
+    // make stale leases impossible to distinguish reliably.
+    if (scalar(db,"SELECT COUNT(*) FROM jobs WHERE status=1 AND "
+                  "(fence<0 OR fence>=9223372036854775807)") != 0)
+        throw std::overflow_error("durable recovery fencing exhausted");
+    // Recover abandoned in-flight turns; state and ACK share a WAL commit.
     sql(db,"UPDATE jobs SET status=0,fence=fence+1 WHERE status=1");
 }
 } // namespace
@@ -285,18 +290,21 @@ std::optional<TenantRuntime::Lease> TenantRuntime::try_claim(
     const auto cursor=t->active.find(lock_id);
     if (cursor==t->active.end() || cursor->second) return std::nullopt;
     Tx tx(t->db);
-    std::int64_t seq,fence;
+    std::int64_t seq,fence,attempt;
     std::string object,request,payload;
     {
-        Statement q(t->db,"SELECT seq,fence,object_id,request_id,payload FROM jobs "
+        Statement q(t->db,"SELECT seq,fence,attempt,object_id,request_id,payload FROM jobs "
                           "WHERE lock_id=? AND status=0 ORDER BY seq LIMIT 1");
         q.text(1,lock_id);
         if(q.step()!=SQLITE_ROW)return std::nullopt;
-        seq=q.number(0);fence=q.number(1);
-        object=q.str(2);request=q.str(3);payload=q.bytes(4);
+        seq=q.number(0);fence=q.number(1);attempt=q.number(2);
+        object=q.str(3);request=q.str(4);payload=q.bytes(5);
     }
-    if(fence==std::numeric_limits<std::int64_t>::max())
-        throw std::overflow_error("lock lease fencing sequence exhausted");
+    // Reserve one increment for retry/recovery after admission. A lease
+    // cannot be admitted at MAX, even if it might complete immediately.
+    if (fence<0 || fence>=std::numeric_limits<std::int64_t>::max()-1 ||
+        attempt<0 || attempt==std::numeric_limits<std::int64_t>::max())
+        throw std::overflow_error("durable claim fencing or attempt exhausted");
     {
         Statement q(t->db,"UPDATE jobs SET status=1, fence=fence+1, attempt=attempt+1 "
                           "WHERE seq=? AND status=0 AND fence=?");
@@ -349,6 +357,8 @@ void TenantRuntime::complete(Lease& lease, const std::string& next_state) {
 }
 void TenantRuntime::retry_locked(Core& core, Lease& lease) {
     auto t=check_lease(core,lease);
+    if (lease.fence_==std::numeric_limits<std::int64_t>::max())
+        throw std::overflow_error("durable retry fencing exhausted");
     Tx tx(t->db);
     {
         Statement q(t->db,"UPDATE jobs SET status=0,fence=fence+1 "
