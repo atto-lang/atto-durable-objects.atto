@@ -83,6 +83,24 @@ int main() {
                        "UPDATE jobs SET status=1,fence=9223372036854775805");
         reject_corrupt("near-overflow-pending",
                        "UPDATE jobs SET status=0,fence=9223372036854775806");
+
+        // Pending jobs and idempotency receipts must refer to exactly the
+        // same request, sequence, object, lock and payload. Completed jobs
+        // legitimately retain dedupe records without an active queue row.
+        reject_corrupt("missing-receipt", "DELETE FROM dedupe");
+        reject_corrupt("incorrect-receipt-seq", "UPDATE dedupe SET seq=2");
+        reject_corrupt("incorrect-receipt-payload",
+                       "UPDATE dedupe SET payload=X'11'");
+        reject_corrupt("incorrect-receipt-object",
+                       "UPDATE dedupe SET object_id='other'");
+        reject_corrupt("incorrect-receipt-lock",
+                       "UPDATE dedupe SET lock_id='wrong'");
+        reject_corrupt("incorrect-receipt-request",
+                       "UPDATE dedupe SET request_id='other'");
+        reject_corrupt("negative-job-sequence", "UPDATE jobs SET seq=-1");
+        reject_corrupt("receipt-aliases-another-job",
+                       "INSERT INTO dedupe(request_id,seq,object_id,lock_id,payload) "
+                       "VALUES('forged',1,'obj','lock',X'00')");
     } catch (...) {
         std::filesystem::remove_all(root);
         throw;
