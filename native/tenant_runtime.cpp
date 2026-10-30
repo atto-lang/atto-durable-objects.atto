@@ -123,6 +123,22 @@ void schema(sqlite3* db) {
                   "LEFT JOIN objects AS o ON o.object_id=j.object_id "
                   "WHERE o.object_id IS NULL OR o.lock_id<>j.lock_id") != 0)
         throw std::runtime_error("persisted durable job has invalid object lock");
+    // Every pending job must have an identical idempotency receipt. A
+    // completed job may keep its receipt after its queue row is deleted.
+    if (scalar(db,"SELECT COUNT(*) FROM jobs AS j "
+                  "LEFT JOIN dedupe AS d ON d.request_id=j.request_id "
+                  "WHERE j.seq<=0 OR d.request_id IS NULL OR d.seq<>j.seq "
+                  "OR d.object_id<>j.object_id OR d.lock_id<>j.lock_id "
+                  "OR d.payload<>j.payload") != 0)
+        throw std::runtime_error("persisted durable job/receipt mismatch");
+    // A historical receipt must never point at a different live job, even
+    // if its own original job has already been ACKed and removed.
+    if (scalar(db,"SELECT COUNT(*) FROM dedupe AS d "
+                  "JOIN jobs AS j ON j.seq=d.seq "
+                  "WHERE d.request_id<>j.request_id OR d.object_id<>j.object_id "
+                  "OR d.lock_id<>j.lock_id OR d.payload<>j.payload") != 0)
+        throw std::runtime_error("persisted durable receipt aliases another job");
+
     // Recovery must not overflow the persistent fencing counter. SQLite can
     // promote an overflowing INTEGER expression to REAL; such a fence would
     // make stale leases impossible to distinguish reliably.
