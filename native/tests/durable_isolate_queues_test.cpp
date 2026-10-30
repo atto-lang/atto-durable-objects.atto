@@ -143,6 +143,33 @@ int main(int argc, char** argv) {
                                      "recover").status == EnqueueStatus::Duplicate);
             recovered.close_tenant(tenant);
         }
+        // Security regression: refuse a symlinked store root even when its
+        // destination is owner-only. An attacker must not redirect WAL paths.
+        {
+            const auto alias = root / "store-alias";
+            std::filesystem::create_directory_symlink(root, alias);
+            assert(rejects([&] { TenantRuntime bad(alias, config); }));
+            std::filesystem::remove(alias);
+        }
+        // Refuse group-readable roots; never chmod an existing path behind
+        // the operator's back.
+        {
+            const auto readable = root / "group-readable";
+            std::filesystem::create_directory(readable);
+            std::filesystem::permissions(
+                readable, std::filesystem::perms::owner_all |
+                    std::filesystem::perms::group_read,
+                std::filesystem::perm_options::replace);
+            assert(rejects([&] { TenantRuntime bad(readable, config); }));
+        }
+        // A tenant DB must be an owner-only regular file, never a symlink.
+        {
+            const auto private_root = root / "symlink-db";
+            TenantRuntime guarded(private_root, config);
+            std::filesystem::create_symlink(private_root / "target",
+                                            private_root / "tenant-74.sqlite");
+            assert(rejects([&] { guarded.open_tenant("t"); }));
+        }
         // The same durable tenant must not have two concurrent VM leaders.
         {
             TenantRuntime p1(root,config),p2(root,config);
