@@ -99,7 +99,6 @@ void schema(sqlite3* db) {
     sql(db,"CREATE TABLE IF NOT EXISTS dedupe("
            "request_id TEXT PRIMARY KEY, seq INTEGER NOT NULL,object_id TEXT NOT NULL,"
            "lock_id TEXT NOT NULL,payload BLOB NOT NULL)");
-    sql(db,"PRAGMA user_version=1");
     // Fail closed on malformed persistent metadata instead of silently
     // hiding unreachable queue entries or reviving a job under another lock.
     // Read-only validation precedes recovery so an invalid file is not
@@ -121,6 +120,7 @@ void schema(sqlite3* db) {
         throw std::overflow_error("durable recovery fencing exhausted");
     // Recover abandoned in-flight turns; state and ACK share a WAL commit.
     sql(db,"UPDATE jobs SET status=0,fence=fence+1 WHERE status=1");
+    sql(db,"PRAGMA user_version=1");
 }
 } // namespace
 
