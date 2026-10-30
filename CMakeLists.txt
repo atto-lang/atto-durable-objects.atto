@@ -1,0 +1,12 @@
+cmake_minimum_required(VERSION 3.20)
+project(oreslang_durable_storage_smoke LANGUAGES CXX)
+include(CTest)
+find_package(Threads REQUIRED)
+find_package(SQLite3 REQUIRED)
+add_executable(sqlite_durable_storage_test tests/SqliteDurableStoreTest.cpp)
+target_include_directories(sqlite_durable_storage_test PRIVATE src/native)
+target_compile_features(sqlite_durable_storage_test PRIVATE cxx_std_17)
+target_compile_options(sqlite_durable_storage_test PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic -Werror -UNDEBUG>)
+target_link_libraries(sqlite_durable_storage_test PRIVATE SQLite::SQLite3 Threads::Threads)
+add_test(NAME sqlite_durable_storage_test COMMAND sqlite_durable_storage_test)
