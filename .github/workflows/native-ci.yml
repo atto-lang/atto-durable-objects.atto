@@ -3,12 +3,47 @@ on:
   pull_request:
     paths:
       - 'native/**'
+      - 'src/native/**'
+      - 'tests/**'
       - 'CMakeLists.txt'
       - '.github/workflows/native-ci.yml'
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
+  cmake-integrated:
+    name: CMake integrated ${{ matrix.build_type }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify PR head and install SQLite
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+      - name: Build and run complete CTest registry
+        env:
+          BUILD_TYPE: ${{ matrix.build_type }}
+        run: |
+          set -euo pipefail
+          build_dir="$RUNNER_TEMP/durable-$BUILD_TYPE"
+          cmake -S . -B "$build_dir" -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DCMAKE_CXX_COMPILER=g++
+          cmake --build "$build_dir" --parallel 2
+          ctest --test-dir "$build_dir" --show-only=json-v1 > "$RUNNER_TEMP/ctest-list.json"
+          python3 -c 'import json,sys; names={t["name"] for t in json.load(open(sys.argv[1]))["tests"]}; expected={"sqlite_durable_storage_test","durable_isolate_queues","durable_persisted_fence_guard"}; assert names==expected, (names,expected)' "$RUNNER_TEMP/ctest-list.json"
+          ctest --test-dir "$build_dir" --output-on-failure
   address-undefined:
     name: ${{ matrix.compiler }} ASan + UBSan
     runs-on: ubuntu-latest
