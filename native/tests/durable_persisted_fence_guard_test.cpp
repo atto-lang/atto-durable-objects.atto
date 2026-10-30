@@ -76,6 +76,13 @@ int main() {
         reject_corrupt("real-attempt", "UPDATE jobs SET attempt=1e100");
         reject_corrupt("real-version", "UPDATE objects SET version=1e100");
         reject_corrupt("real-dedupe-sequence", "UPDATE dedupe SET seq=1e100");
+        // A recovered active claim needs a further increment for the
+        // next claim; refuse values that would create a permanently
+        // unclaimable persisted queue after startup.
+        reject_corrupt("near-overflow-active",
+                       "UPDATE jobs SET status=1,fence=9223372036854775806");
+        reject_corrupt("near-overflow-pending",
+                       "UPDATE jobs SET status=0,fence=9223372036854775806");
     } catch (...) {
         std::filesystem::remove_all(root);
         throw;
