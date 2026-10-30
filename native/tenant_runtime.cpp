@@ -103,11 +103,19 @@ void schema(sqlite3* db) {
     // hiding unreachable queue entries or reviving a job under another lock.
     // Read-only validation precedes recovery so an invalid file is not
     // partially repaired and accidentally promoted to an active tenant.
+    // SQLite INTEGER affinity does not guarantee integer storage: very
+    // large REAL values are allowed and must never reach sqlite3_column_int64.
     if (scalar(db,"SELECT COUNT(*) FROM jobs WHERE "
-                  "status NOT IN (0,1) OR fence<0 OR attempt<0") != 0)
+                  "status NOT IN (0,1) OR fence<0 OR attempt<0 OR "
+                  "typeof(status)!='integer' OR typeof(fence)!='integer' OR "
+                  "typeof(attempt)!='integer'") != 0)
         throw std::runtime_error("invalid persisted durable job metadata");
-    if (scalar(db,"SELECT COUNT(*) FROM objects WHERE version<0") != 0)
+    if (scalar(db,"SELECT COUNT(*) FROM objects WHERE "
+                  "version<0 OR typeof(version)!='integer'") != 0)
         throw std::runtime_error("invalid persisted durable object version");
+    if (scalar(db,"SELECT COUNT(*) FROM dedupe WHERE "
+                  "seq<=0 OR typeof(seq)!='integer'") != 0)
+        throw std::runtime_error("invalid persisted durable dedupe sequence");
     if (scalar(db,"SELECT COUNT(*) FROM jobs AS j "
                   "LEFT JOIN objects AS o ON o.object_id=j.object_id "
                   "WHERE o.object_id IS NULL OR o.lock_id<>j.lock_id") != 0)
