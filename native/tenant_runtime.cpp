@@ -100,6 +100,19 @@ void schema(sqlite3* db) {
            "request_id TEXT PRIMARY KEY, seq INTEGER NOT NULL,object_id TEXT NOT NULL,"
            "lock_id TEXT NOT NULL,payload BLOB NOT NULL)");
     sql(db,"PRAGMA user_version=1");
+    // Fail closed on malformed persistent metadata instead of silently
+    // hiding unreachable queue entries or reviving a job under another lock.
+    // Read-only validation precedes recovery so an invalid file is not
+    // partially repaired and accidentally promoted to an active tenant.
+    if (scalar(db,"SELECT COUNT(*) FROM jobs WHERE "
+                  "status NOT IN (0,1) OR fence<0 OR attempt<0") != 0)
+        throw std::runtime_error("invalid persisted durable job metadata");
+    if (scalar(db,"SELECT COUNT(*) FROM objects WHERE version<0") != 0)
+        throw std::runtime_error("invalid persisted durable object version");
+    if (scalar(db,"SELECT COUNT(*) FROM jobs AS j "
+                  "LEFT JOIN objects AS o ON o.object_id=j.object_id "
+                  "WHERE o.object_id IS NULL OR o.lock_id<>j.lock_id") != 0)
+        throw std::runtime_error("persisted durable job has invalid object lock");
     // Recovery must not overflow the persistent fencing counter. SQLite can
     // promote an overflowing INTEGER expression to REAL; such a fence would
     // make stale leases impossible to distinguish reliably.
