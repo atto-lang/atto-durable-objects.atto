@@ -88,6 +88,9 @@ void schema(sqlite3* db) {
     sql(db,"PRAGMA journal_mode=WAL");
     sql(db,"PRAGMA synchronous=FULL");
     sql(db,"PRAGMA foreign_keys=ON");
+    // Validate, requeue and promote the schema in one atomic WAL transaction.
+    // A failed admission must never leave a partially recovered queue.
+    Tx startup_tx(db);
     if (scalar(db,"PRAGMA user_version") > 1) throw std::runtime_error("unsupported durable schema");
     sql(db,"CREATE TABLE IF NOT EXISTS objects("
            "object_id TEXT PRIMARY KEY,lock_id TEXT NOT NULL,version INTEGER NOT NULL DEFAULT 0,state BLOB NOT NULL DEFAULT X'')");
@@ -123,12 +126,14 @@ void schema(sqlite3* db) {
     // Recovery must not overflow the persistent fencing counter. SQLite can
     // promote an overflowing INTEGER expression to REAL; such a fence would
     // make stale leases impossible to distinguish reliably.
-    if (scalar(db,"SELECT COUNT(*) FROM jobs WHERE status=1 AND "
-                  "(fence<0 OR fence>=9223372036854775807)") != 0)
+    if (scalar(db,"SELECT COUNT(*) FROM jobs WHERE "
+                  "(status=1 AND fence>=9223372036854775805) OR "
+                  "(status=0 AND fence>=9223372036854775806)") != 0)
         throw std::overflow_error("durable recovery fencing exhausted");
     // Recover abandoned in-flight turns; state and ACK share a WAL commit.
     sql(db,"UPDATE jobs SET status=0,fence=fence+1 WHERE status=1");
     sql(db,"PRAGMA user_version=1");
+    startup_tx.commit();
 }
 } // namespace
 
