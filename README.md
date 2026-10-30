@@ -30,9 +30,36 @@ No implicit thread blocking, actor handler reentrancy, nested `Future` flattenin
 
 ## Backend and verification
 
-The native queue substrate is stacked on [LLVM isolate PR #1158](https://github.com/ores-truffle-oreslang/oreslang-source.llvm/pull/1158), because that branch supplies the private noncopyable tenant IsolateVM and generation-fenced handles. The follow-up PR implements **host-only** bounded in-memory admission and release; it does **not** persist the queue or expose the proposed Oreslang API.
+The native queue substrate is stacked on [LLVM isolate PR #1158](https://github.com/ores-truffle-oreslang/oreslang-source.llvm/pull/1158), because that branch supplies the private noncopyable tenant IsolateVM and generation-fenced handles. The LLVM isolate integration remains unverified here; this repository now includes a separate trusted-host **persisted** SQLite keyed-queue runtime, but does not yet expose a compiler-verified Oreslang guest API.
 
 Current limitations: LLVM #1158 still serializes *trusted synchronous scalar guest turns* per tenant, rather than running general actor turns per lock concurrently. A genuine durable service needs a persisted journal/database, single-owner epoch fencing, replica recovery, authenticated ingress, scheduler binding, crash injection and AOT guest lowering. Trusted native in-process isolates are **not security sandboxes**; untrusted tenants require an actual isolated OS worker and authenticated IPC. No cross-organization private-source CI transfer without independent authorization.
 
 ## New host-only storage reference
 A SQLite/WAL storage adapter with atomic state+dedup+alarm transactions and monotonic epoch checks lives in [src/native/SqliteDurableStore.hpp](src/native/SqliteDurableStore.hpp). It is **not** the Oreslang guest API or a distributed consensus service. The [reference test](tests/SqliteDurableStoreTest.cpp) exercises reopen, rollback, tenant separation, epoch fencing, and concurrent duplicate submissions. Details: [spec/STORAGE_REFERENCE.md](spec/STORAGE_REFERENCE.md).
+
+## Persisted keyed FIFO tenant runtime (PR #2)
+
+The second native reference at [native/tenant_runtime.cpp](native/tenant_runtime.cpp)
+implements per-tenant SQLite WAL admission, immutable deduplication, FIFO work
+queues by `lock_id`, generation/fence-protected leases, atomic state+ACK,
+and crash recovery. Distinct locks may progress concurrently, while one lock
+has at most one active lease. It also uses POSIX `flock` for local-process
+single leadership; this is **not** distributed consensus or hostile-tenant
+sandboxing. Delivery remains **at least once**, not exactly-once external
+effects. This host substrate is separate from the storage reference above;
+neither should be represented as the production public guest API.
+
+Build with C++17, CMake >= 3.20, SQLite >= 3.35 and POSIX locking:
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
+
+The merged CMake project registers three tests: `sqlite_durable_storage_test`,
+`durable_isolate_queues`, and `durable_persisted_fence_guard`. They still
+require execution on the merged tree before CI/merge readiness can be claimed.
+See [native API proposal](docs/API_V0.md) and
+[LLVM integration gates](docs/LLVM_INTEGRATION.md). The optional LLVM adapter
+has not been compiled against the private LLVM integration branch.
