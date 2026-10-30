@@ -1,5 +1,6 @@
 #include "ores/durable/tenant_runtime.hpp"
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <filesystem>
 #include <stdexcept>
@@ -111,6 +112,36 @@ int main(int argc, char** argv) {
             after_restart.complete(*lease,"4");lease.reset();
             after_restart.close_tenant(a);
             after_restart.close_tenant(b);
+        }
+        // This process genuinely execs the --crash-child mode. The child
+        // claims persisted work and exits via _exit(42), without unwinding
+        // a lease or closing SQLite. Reopen must fence the abandoned claim.
+        {
+            const auto child_root = root / "crash-recovery";
+            const pid_t child = ::fork();
+            if (child < 0) throw std::runtime_error("fork crash child failed");
+            if (child == 0) {
+                const auto child_path = child_root.string();
+                ::execl(argv[0], argv[0], "--crash-child", child_path.c_str(),
+                        static_cast<char*>(nullptr));
+                _exit(127);
+            }
+            int status = 0;
+            pid_t waited;
+            do { waited = ::waitpid(child, &status, 0); }
+            while (waited == -1 && errno == EINTR);
+            assert(waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 42);
+            TenantRuntime recovered(child_root, config);
+            auto tenant = recovered.open_tenant("tenant-A");
+            assert(recovered.pending(tenant, "lock-1") == 1);
+            auto lease = recovered.try_claim(tenant, "lock-1");
+            assert(lease && lease->payload() == "recover" && lease->fence() > 1);
+            recovered.complete(*lease, "completed-after-crash");
+            lease.reset();
+            assert(recovered.pending(tenant, "lock-1") == 0);
+            assert(recovered.enqueue(tenant, "counter", "lock-1", "crash-work",
+                                     "recover").status == EnqueueStatus::Duplicate);
+            recovered.close_tenant(tenant);
         }
         // The same durable tenant must not have two concurrent VM leaders.
         {
