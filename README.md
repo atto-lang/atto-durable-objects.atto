@@ -1,52 +1,65 @@
-# Oreslang Durable Objects — LLVM-first substrate
+# Oreslang Durable Objects (LLVM)
 
-This repository implements the first **trusted-host native** durable queue/state
-substrate for Oreslang. It is designed to bind to LLVM's `OresVM` and `IsolateVM`
-(`oreslang-source.llvm` draft PRs #1158/#1159): **one VM isolate per tenant,
-multiple independently scheduled FIFO queues per `lock_id` within that isolate**.
+Status: **draft contract and native LLVM host substrate**, not a production durable-object service.
 
-The repository was empty before this implementation. This is an intentionally
-narrow, buildable starting point, not a claim that the Oreslang compiler already
-supports a `durable actor` syntax or a fully sandboxed production Durable Object.
+A durable object is a stable `(tenant_id, namespace, object_id)` identity with actor-owned state, persistent transactional storage, and a single logical owner at a time. An **OresVM** host owns one **IsolateVM per tenant incarnation**. Each IsolateVM owns **multiple bounded FIFO queues keyed by a tenant-scoped LockId**. Actors and durable objects live inside that tenant isolate; each actor retains sealed state and its own arena.
 
-## Runtime model
+```text
+OresVM root
+  Tenant A -> IsolateVM (generation gA, tenant heap, quotas)
+       LockId 7  -> FIFO [operation 1 -> operation 2 -> operation 3]
+       LockId 19 -> FIFO [operation 8 -> operation 9]
+       Object (namespace, id) -> actor + persisted state + assigned LockId
+  Tenant B -> IsolateVM (generation gB, distinct heaps and queues)
+       LockId 7 -> a completely different FIFO and owner
+```
 
-- **Tenant boundary:** each tenant has one host-controlled isolate identity, a
-  generation-fenced handle and an independent `0600` SQLite database. A
-  cross-process `flock` owner token prohibits two active host processes from
-  owning the same tenant's database at the same time.
-- **Within each tenant:** any number of queues up to the configured quota,
-  indexed by `lock_id`. Each queue is FIFO, with **one active handler per
-  lock**; different lock IDs can process concurrently. A durable object is
-  permanently bound to one lock ID unless an explicit future migration runs.
-- **Durable admission:** queue enqueue, request-key deduplication and object
-  lock binding commit in one SQLite transaction (`WAL` and `synchronous=FULL`).
-  `Accepted` means committed admission, not handler completion.
-- **State commit:** updating an object version and acknowledging its queue item
-  are one transaction. A crash before ACK requeues work on tenant reopen;
-  delivery is **at least once**, so external side effects require independent
-  idempotency or an outbox. A completed request's idempotency key persists.
-- **Safety:** leases are noncopyable, generation- and fence-checked; abandoning
-  a live lease retries it automatically. No handler runs while the host storage
-  mutex is held. Key, request, queue, tenant and data-size quotas are explicit.
-- **Security:** this is *trusted in-process isolation*, **not** a process
-  sandbox. Only trusted Oreslang actors may execute here until LLVM's supervised
-  sandboxed-worker mode exists. No raw SQLite pointer, isolate handle or
-  lease token is part of the proposed guest-facing API.
+## Contract
 
-## Build and run
+Read [spec/DURABLE_OBJECTS_V1.md](spec/DURABLE_OBJECTS_V1.md) for exact queue, transactional storage and isolation invariants. See [spec/TEST_MATRIX.md](spec/TEST_MATRIX.md) for acceptance tests.
 
-Requires a C++17 compiler, CMake >= 3.20, SQLite >= 3.35 and POSIX `flock`.
+The public native-Oreslang API is **proposed**, not yet compiler-confirmed:
 
-```bash
+- `DurableNamespace<T>.id_from_name(name)`, `get(id) -> DurableStub<T>`
+- `DurableStub<T>.send(message)` / `fetch(request)` for authenticated async delivery
+- `DurableObjectContext.storage.get/put/delete/transaction`
+- `DurableObjectContext.with_lock(lock_id, operation)` for FIFO admissions
+- `DurableObjectContext.set_alarm(deadline)`, `delete_alarm()`
+
+No implicit thread blocking, actor handler reentrancy, nested `Future` flattening, or cross-tenant native pointer transfer. State changes use Oreslang actor `state` and sealed `handle_state` under `critical` semantics.
+
+## Backend and verification
+
+The native queue substrate is stacked on [LLVM isolate PR #1158](https://github.com/ores-truffle-oreslang/oreslang-source.llvm/pull/1158), because that branch supplies the private noncopyable tenant IsolateVM and generation-fenced handles. The LLVM isolate integration remains unverified here; this repository now includes a separate trusted-host **persisted** SQLite keyed-queue runtime, but does not yet expose a compiler-verified Oreslang guest API.
+
+Current limitations: LLVM #1158 still serializes *trusted synchronous scalar guest turns* per tenant, rather than running general actor turns per lock concurrently. A genuine durable service needs a persisted journal/database, single-owner epoch fencing, replica recovery, authenticated ingress, scheduler binding, crash injection and AOT guest lowering. Trusted native in-process isolates are **not security sandboxes**; untrusted tenants require an actual isolated OS worker and authenticated IPC. No cross-organization private-source CI transfer without independent authorization.
+
+## New host-only storage reference
+A SQLite/WAL storage adapter with atomic state+dedup+alarm transactions and monotonic epoch checks lives in [src/native/SqliteDurableStore.hpp](src/native/SqliteDurableStore.hpp). It is **not** the Oreslang guest API or a distributed consensus service. The [reference test](tests/SqliteDurableStoreTest.cpp) exercises reopen, rollback, tenant separation, epoch fencing, and concurrent duplicate submissions. Details: [spec/STORAGE_REFERENCE.md](spec/STORAGE_REFERENCE.md).
+
+## Persisted keyed FIFO tenant runtime (PR #2)
+
+The second native reference at [native/tenant_runtime.cpp](native/tenant_runtime.cpp)
+implements per-tenant SQLite WAL admission, immutable deduplication, FIFO work
+queues by `lock_id`, generation/fence-protected leases, atomic state+ACK,
+and crash recovery. Distinct locks may progress concurrently, while one lock
+has at most one active lease. It also uses POSIX `flock` for local-process
+single leadership; this is **not** distributed consensus or hostile-tenant
+sandboxing. Delivery remains **at least once**, not exactly-once external
+effects. This host substrate is separate from the storage reference above;
+neither should be represented as the production public guest API.
+
+Build with C++17, CMake >= 3.20, SQLite >= 3.35 and POSIX locking:
+
+```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-`native/include/ores/durable/tenant_runtime.hpp` contains the tested host API,
-while `llvm_oresvm_adapter.hpp` is an **optional integration adapter** requiring
-an independently authorized checkout of `oreslang-source.llvm` to compile. The
-adapter must not be mistaken for a current working compiler guest bridge.
-
-See [API contract](docs/API_V0.md) and [integration/security checklist](docs/LLVM_INTEGRATION.md).
+The merged CMake project registers three tests: `sqlite_durable_storage_test`,
+`durable_isolate_queues`, and `durable_persisted_fence_guard`. They still
+require execution on the merged tree before CI/merge readiness can be claimed.
+See [native API proposal](docs/API_V0.md) and
+[LLVM integration gates](docs/LLVM_INTEGRATION.md). The optional LLVM adapter
+has not been compiled against the private LLVM integration branch.

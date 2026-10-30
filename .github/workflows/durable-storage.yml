@@ -1,0 +1,24 @@
+name: Durable storage reference tests
+on:
+  pull_request:
+  push:
+    branches:
+      - feat/llvm-tenant-lock-queues
+permissions:
+  contents: read
+jobs:
+  sqlite-host-only:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install SQLite development library
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build --parallel 2
+      - name: Run reference tests
+        run: ctest --test-dir build --output-on-failure
