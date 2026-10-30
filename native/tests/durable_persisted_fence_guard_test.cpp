@@ -68,6 +68,14 @@ int main() {
         reject_corrupt("negative-version", "UPDATE objects SET version=-1");
         reject_corrupt("foreign-lock", "UPDATE jobs SET lock_id='wrong'");
         reject_corrupt("missing-object", "UPDATE jobs SET object_id='missing'");
+        // SQLite's INTEGER affinity accepts huge REAL values without
+        // raising a constraint error; all persisted counters must remain
+        // actual INTEGER storage before the native runtime reads int64.
+        reject_corrupt("real-status", "UPDATE jobs SET status=1e100");
+        reject_corrupt("real-fence", "UPDATE jobs SET fence=1e100");
+        reject_corrupt("real-attempt", "UPDATE jobs SET attempt=1e100");
+        reject_corrupt("real-version", "UPDATE objects SET version=1e100");
+        reject_corrupt("real-dedupe-sequence", "UPDATE dedupe SET seq=1e100");
     } catch (...) {
         std::filesystem::remove_all(root);
         throw;
