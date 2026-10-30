@@ -80,7 +80,7 @@ int main() {
         // next claim; refuse values that would create a permanently
         // unclaimable persisted queue after startup.
         reject_corrupt("near-overflow-active",
-                       "UPDATE jobs SET status=1,fence=9223372036854775806");
+                       "UPDATE jobs SET status=1,fence=9223372036854775805");
         reject_corrupt("near-overflow-pending",
                        "UPDATE jobs SET status=0,fence=9223372036854775806");
     } catch (...) {
