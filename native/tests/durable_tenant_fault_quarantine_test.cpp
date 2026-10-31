@@ -4,6 +4,9 @@
 #include <cassert>
 #include <chrono>
 #include <filesystem>
+#include <memory>
+#include <optional>
+#include <utility>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -52,6 +55,9 @@ static void retry_fault(const char* label, StorageFaultPoint point, int sqlite_c
         healthy.join();
         assert(good.load());
         assert((a.incident_flags() & expected) == expected);
+        const auto incidents=runtime.quarantined_tenants();
+        assert(incidents.size()==1 && incidents[0].first=="tenant-A");
+        assert((incidents[0].second & expected)==expected);
         assert(rejects([&] { (void)runtime.try_claim(a,"lock-A"); }));
         assert(rejects([&] { (void)runtime.enqueue(a,"object-A","lock-A","new","x"); }));
         assert(rejects([&] { runtime.close_tenant(a); }));
@@ -92,6 +98,8 @@ static void ack_fault() {
         runtime.inject_fault_for_test(a,StorageFaultPoint::AckBeforeCommit,SQLITE_FULL);
         assert(rejects([&] { runtime.complete(*claim,"must-not-be-silent"); }));
         assert((a.incident_flags() & AckStorageFailure)!=0);
+        const auto incidents=runtime.quarantined_tenants();
+        assert(incidents.size()==1 && incidents[0].first=="A");
         assert(rejects([&] { (void)runtime.pending(a,"lock"); }));
         assert(rejects([&] { runtime.retry(*claim); }));
         runtime.complete(*healthy,"healthy");
@@ -121,6 +129,9 @@ static void dispose_fault(const char* label, StorageFaultPoint point, unsigned b
         runtime.inject_fault_for_test(a,point);
         assert(rejects([&] { runtime.close_tenant(a); }));
         assert((a.incident_flags() & bit)!=0);
+        const auto incidents=runtime.quarantined_tenants();
+        assert(incidents.size()==1 && incidents[0].first=="A");
+        assert((incidents[0].second & bit)!=0);
         assert(rejects([&] { runtime.enqueue(a,"obj","lock","req","x"); }));
         assert(runtime.enqueue(b,"obj","lock","req","ok").status==EnqueueStatus::Accepted);
         auto claim=runtime.try_claim(b,"lock");
@@ -138,6 +149,34 @@ static void dispose_fault(const char* label, StorageFaultPoint point, unsigned b
     }
     std::filesystem::remove_all(root);
 }
+static void shutdown_with_outstanding_lease() {
+    const auto root=root_for("shutdown-lease");
+    std::optional<TenantRuntime::Lease> orphan;
+    std::int64_t old_fence=0;
+    {
+        auto runtime=std::make_unique<TenantRuntime>(root);
+        const auto a=runtime->open_tenant("A");
+        assert(runtime->enqueue(a,"obj","lock","req","work").status==EnqueueStatus::Accepted);
+        auto admitted=runtime->try_claim(a,"lock");
+        assert(admitted);
+        old_fence=admitted->fence();
+        orphan.emplace(std::move(*admitted));
+        admitted.reset();
+        runtime.reset(); // a Lease still pins Core and tenant-owned POSIX/SQLite resources
+        assert(orphan.has_value());
+        orphan.reset(); // must retry, dispose and release owner lock WITHOUT terminating
+    }
+    {
+        TenantRuntime restarted(root);
+        auto a=restarted.open_tenant("A");
+        auto recovered=restarted.try_claim(a,"lock");
+        assert(recovered && recovered->fence()>old_fence);
+        restarted.complete(*recovered,"committed");
+        recovered.reset();
+        restarted.close_tenant(a);
+    }
+    std::filesystem::remove_all(root);
+}
 int main() {
     retry_fault("retry-ioerr",StorageFaultPoint::RetryBeforeWrite,SQLITE_IOERR,RetryStorageFailure);
     retry_fault("retry-full",StorageFaultPoint::RetryBeforeCommit,SQLITE_FULL,RetryStorageFailure);
@@ -147,4 +186,5 @@ int main() {
     dispose_fault("sqlite-close",StorageFaultPoint::SqliteClose,SqliteCloseFailure);
     dispose_fault("flock-unlock",StorageFaultPoint::LockUnlock,LockUnlockFailure);
     dispose_fault("fd-close",StorageFaultPoint::FileClose,FileCloseFailure);
+    shutdown_with_outstanding_lease();
 }
