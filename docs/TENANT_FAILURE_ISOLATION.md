@@ -73,3 +73,34 @@ The real WAL `xWrite`/`xSync` fault harness now also targets **enqueue admission
 ## POSIX singleton lock release ordering
 
 The `Tenant` destructor and explicit `close_tenant` no longer run `flock(LOCK_UN)` before `close(fd)`. The previous ordering risked unlocking the singleton while retaining an open descriptor if the subsequent close failed. Normal descriptor close now performs release. The legacy `LockUnlock` injection remains a synthetic refusal before release, not an actual failing `flock(LOCK_UN)` syscall; it must not be described as proof of real POSIX unlock-error handling. Ambiguous `close(fd)` failures still require external process-level evidence and review.
+
+
+## Read-path containment and offline exact-head verifier
+
+`read_state` and `pending` now quarantine the affected tenant when SQLite
+throws `std::runtime_error`. A failed read must never be treated as a
+reliable actor snapshot from which a subsequent ACK may be constructed.
+Synthetic `ReadState` and `PendingQuery` fault fixtures exercise refusal
+of further work, healthy-tenant progress, and restart fencing. These are
+**not** real SQLite `xRead` failures; real VFS read/corruption cases remain
+required. An intentionally missing object binding remains a separate
+`std::logic_error`, not a proven disk I/O error.
+
+The script `scripts/verify-durable-native.sh` runs native Debug/Release CTest
+under GCC and Clang, plus GCC/Clang ASan+UBSan and GCC TSan. It rejects a
+missing/mismatched 40-character commit SHA and dirty source checkout, builds
+under a directory outside the source tree, and retains a provenance receipt,
+per-profile logs and explicit pass/fail marker. Run only on an independently
+authorized machine with a checkout of the exact PR head:
+
+```sh
+EXPECTED_HEAD_SHA='<40-character reviewed PR HEAD SHA>' \
+  bash scripts/verify-durable-native.sh
+```
+
+A TSan runtime failure is a failing gate unless a separately reviewed,
+supported-environment rerun supplies legitimate execution receipts. Logs
+may contain private local paths; do not upload them to external carriers
+without authorization. No compiler/CTest or sanitizer execution on this
+complete GitHub tree has been performed in the current session.
+
