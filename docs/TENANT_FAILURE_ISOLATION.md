@@ -28,9 +28,13 @@ The opt-in test executable `durable_sqlite_vfs_fault_test` wraps SQLite's
 original VFS without modifying the production runtime. It injects actual
 `SQLITE_IOERR_WRITE` at WAL `xWrite` and `SQLITE_IOERR_FSYNC` at WAL
 `xSync` for **tenant A only**. The test asserts rejected ACK, quarantine,
-healthy tenant B completion, no new A admission/retry, and restart with a
-strictly higher fence and unchanged state. The VFS is process-global but the
-fixture runs in its own executable and restores the original VFS. A single
+healthy tenant B completion, no new A admission/retry, and restart-time
+**atomic state+ACK** verification. A failed fsync can have an **ambiguous
+commit outcome**: either the request remains pending with unchanged state
+and a strictly higher recovery fence, or the request was fully committed
+and both state and ACK must be visible. Partial state/ACK is rejected.
+The VFS is process-global but the fixture runs in its own executable
+and restores the original VFS. A single
 active wrapper preserves the original VFS callback context.
 
 The VFS **wrapper itself** was locally smoke-tested using stock SQLite 3.46.1
