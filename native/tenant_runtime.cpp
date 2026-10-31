@@ -62,9 +62,20 @@ struct Statement final {
 };
 struct Tx final {
     sqlite3* db;
+    std::atomic<unsigned>* incidents;
+    StorageFaultPoint* pending_fault;
     bool committed = false;
-    explicit Tx(sqlite3* d) : db(d) { sql(db,"BEGIN IMMEDIATE"); }
-    ~Tx() { if (!committed) sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); }
+    explicit Tx(sqlite3* d, std::atomic<unsigned>* i, StorageFaultPoint* f)
+        : db(d), incidents(i), pending_fault(f) { sql(db,"BEGIN IMMEDIATE"); }
+    ~Tx() noexcept {
+        if (committed) return;
+        // Always attempt a real rollback even when a test injects rollback failure.
+        const bool injected = pending_fault && *pending_fault == StorageFaultPoint::Rollback;
+        if (injected) *pending_fault = StorageFaultPoint::None;
+        const int rc = sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr);
+        if (injected || rc != SQLITE_OK)
+            incidents->fetch_or(RollbackStorageFailure, std::memory_order_relaxed);
+    }
     void commit() { sql(db,"COMMIT"); committed = true; }
 };
 void require_key(const std::string& k) {
@@ -112,14 +123,37 @@ void schema(sqlite3* db) {
 } // namespace
 
 TenantRuntime::Tenant::~Tenant() noexcept {
-    if (db && sqlite3_close(db) != SQLITE_OK) std::terminate();
+    // Best effort on shutdown/failed open: no callbacks, allocation or exceptions.
+    if (db) {
+        if (sqlite3_close(db) != SQLITE_OK) {
+            quarantine(SqliteCloseFailure);
+            (void)sqlite3_close_v2(db);
+            static constexpr char msg[] = "durable: tenant SQLite disposal failed\n";
+            (void)::write(STDERR_FILENO, msg, sizeof(msg)-1);
+        }
+        db = nullptr;
+    }
     if (lock_fd >= 0) {
-        if (flock(lock_fd, LOCK_UN) != 0) std::terminate();
-        if (::close(lock_fd) != 0) std::terminate();
+        if (flock(lock_fd, LOCK_UN) != 0) {
+            quarantine(LockUnlockFailure);
+            static constexpr char msg[] = "durable: tenant flock disposal failed\n";
+            (void)::write(STDERR_FILENO, msg, sizeof(msg)-1);
+        }
+        const int fd = lock_fd;
+        lock_fd = -1; // Linux close EINTR can leave descriptor status ambiguous.
+        if (::close(fd) != 0) {
+            quarantine(FileCloseFailure);
+            static constexpr char msg[] = "durable: tenant fd disposal failed\n";
+            (void)::write(STDERR_FILENO, msg, sizeof(msg)-1);
+        }
     }
 }
 TenantRuntime::TenantHandle::TenantHandle(const std::shared_ptr<Tenant>& t)
     : tenant_(t), generation_(t->generation) {}
+unsigned TenantRuntime::TenantHandle::incident_flags() const noexcept {
+    const auto t = tenant_.lock();
+    return t ? t->incidents.load(std::memory_order_relaxed) : NoIncident;
+}
 TenantRuntime::Lease::Lease(std::shared_ptr<Core> c, std::shared_ptr<Tenant> t,
             std::int64_t seq, std::int64_t fence, std::string lock,
             std::string object, std::string request, std::string payload)
@@ -138,7 +172,10 @@ TenantRuntime::Lease::~Lease() noexcept {
     try {
         std::lock_guard<std::mutex> lock(core_->mu);
         TenantRuntime::retry_locked(*core_, *this);
-    } catch (...) { std::terminate(); }
+    } catch (...) {
+        // Never clear active sequence unless the retry was durably committed.
+        if (const auto t = tenant_.lock()) t->quarantine(RetryStorageFailure);
+    }
 }
 TenantRuntime::TenantRuntime(std::filesystem::path root, Limits limits)
     : core_(std::make_shared<Core>(std::move(root), limits)) {
@@ -159,7 +196,8 @@ TenantRuntime::TenantRuntime(std::filesystem::path root, Limits limits)
 std::shared_ptr<TenantRuntime::Tenant> TenantRuntime::check_tenant(
         const Core& core, const TenantHandle& h) {
     auto t = h.tenant_.lock();
-    if (!t || h.generation_ != t->generation || !t->accepting)
+    if (!t || h.generation_ != t->generation || !t->accepting ||
+        t->incidents.load(std::memory_order_relaxed) != NoIncident)
         throw std::logic_error("stale tenant isolate handle");
     const auto it = core.tenants.find(t->id);
     if (it==core.tenants.end() || it->second!=t)
@@ -171,7 +209,8 @@ std::shared_ptr<TenantRuntime::Tenant> TenantRuntime::check_lease(
     if (!lease.active_ || lease.core_.get()!=&core)
         throw std::logic_error("settled or foreign durable lease");
     auto t=lease.tenant_.lock();
-    if (!t || lease.generation_ != t->generation)
+    if (!t || lease.generation_ != t->generation ||
+        t->incidents.load(std::memory_order_relaxed) != NoIncident)
         throw std::logic_error("retired tenant durable lease");
     const auto it=core.tenants.find(t->id);
     if (it==core.tenants.end() || it->second!=t ||
@@ -223,8 +262,59 @@ void TenantRuntime::close_tenant(const TenantHandle& h) {
     const auto t=check_tenant(*core_,h);
     for(const auto& [_,seq]:t->active)
         if (seq) throw std::logic_error("tenant has active lock leases");
+    // Explicit disposal errors remain observable; quarantine retains registry entry.
+    if (t->db) {
+        if (t->fault_point == StorageFaultPoint::SqliteClose) {
+            t->fault_point = StorageFaultPoint::None;
+            t->quarantine(SqliteCloseFailure);
+            throw std::runtime_error("injected tenant SQLite close failure");
+        }
+        if (sqlite3_close(t->db) != SQLITE_OK) {
+            t->quarantine(SqliteCloseFailure);
+            throw std::runtime_error("tenant SQLite close failed");
+        }
+        t->db = nullptr;
+    }
+    if (t->lock_fd >= 0) {
+        if (t->fault_point == StorageFaultPoint::LockUnlock) {
+            t->fault_point = StorageFaultPoint::None;
+            t->quarantine(LockUnlockFailure);
+            throw std::runtime_error("injected tenant flock unlock failure");
+        }
+        if (flock(t->lock_fd, LOCK_UN) != 0) {
+            t->quarantine(LockUnlockFailure);
+            throw std::system_error(errno,std::generic_category(),"tenant flock unlock");
+        }
+        if (t->fault_point == StorageFaultPoint::FileClose) {
+            t->fault_point = StorageFaultPoint::None;
+            t->quarantine(FileCloseFailure);
+            throw std::runtime_error("injected tenant fd close failure");
+        }
+        const int fd = t->lock_fd;
+        t->lock_fd = -1;
+        if (::close(fd) != 0) {
+            t->quarantine(FileCloseFailure);
+            throw std::system_error(errno,std::generic_category(),"tenant fd close");
+        }
+    }
     t->accepting=false;
     core_->tenants.erase(t->id);
+}
+void TenantRuntime::inject_fault_for_test(
+        const TenantHandle& h, StorageFaultPoint point, int sqlite_code) {
+    if (sqlite_code != SQLITE_IOERR && sqlite_code != SQLITE_FULL &&
+        sqlite_code != SQLITE_BUSY)
+        throw std::invalid_argument("unsupported synthetic SQLite failure code");
+    std::lock_guard<std::mutex> lock(core_->mu);
+    const auto t=check_tenant(*core_,h);
+    t->fault_point=point;
+    t->fault_code=sqlite_code;
+}
+void TenantRuntime::inject_sqlite_fault(Tenant& tenant, StorageFaultPoint point) {
+    if (tenant.fault_point != point) return;
+    tenant.fault_point = StorageFaultPoint::None;
+    throw std::runtime_error(std::string("injected SQLite status: ") +
+                             sqlite3_errstr(tenant.fault_code));
 }
 Receipt TenantRuntime::enqueue(const TenantHandle& h, const std::string& object,
                    const std::string& lock_id, const std::string& request,
@@ -234,7 +324,7 @@ Receipt TenantRuntime::enqueue(const TenantHandle& h, const std::string& object,
         throw std::invalid_argument("request payload exceeds limit");
     std::lock_guard<std::mutex> lock(core_->mu);
     const auto t=check_tenant(*core_,h);
-    Tx tx(t->db);
+    Tx tx(t->db, &t->incidents, &t->fault_point);
     {
         Statement q(t->db,"SELECT seq,object_id,lock_id,payload FROM dedupe WHERE request_id=?");
         q.text(1,request);
@@ -289,7 +379,7 @@ std::optional<TenantRuntime::Lease> TenantRuntime::try_claim(
     const auto t=check_tenant(*core_,h);
     const auto cursor=t->active.find(lock_id);
     if (cursor==t->active.end() || cursor->second) return std::nullopt;
-    Tx tx(t->db);
+    Tx tx(t->db, &t->incidents, &t->fault_point);
     std::int64_t seq,fence,attempt;
     std::string object,request,payload;
     {
@@ -332,7 +422,11 @@ void TenantRuntime::complete(Lease& lease, const std::string& next_state) {
         throw std::invalid_argument("durable state exceeds limit");
     std::lock_guard<std::mutex> lock(core_->mu);
     auto t=check_lease(*core_,lease);
-    Tx tx(t->db);
+    try {
+    Tx tx(t->db, &t->incidents, &t->fault_point);
+    if (t->fault_point == StorageFaultPoint::Rollback)
+        throw std::runtime_error("injected SQLite failure before ROLLBACK");
+    inject_sqlite_fault(*t, StorageFaultPoint::AckBeforeWrite);
     {
         Statement q(t->db,"SELECT fence FROM jobs WHERE seq=? AND status=1");
         q.integer(1,lease.sequence_);
@@ -351,24 +445,38 @@ void TenantRuntime::complete(Lease& lease, const std::string& next_state) {
         q.integer(1,lease.sequence_);q.integer(2,lease.fence_);q.step();
         if(sqlite3_changes(t->db)!=1)throw std::logic_error("durable ACK failed");
     }
+    inject_sqlite_fault(*t, StorageFaultPoint::AckBeforeCommit);
     tx.commit();
     t->active.at(lease.lock_id_)=0;
     lease.active_=false;
+    } catch (...) {
+        t->quarantine(AckStorageFailure);
+        throw;
+    }
 }
 void TenantRuntime::retry_locked(Core& core, Lease& lease) {
     auto t=check_lease(core,lease);
     if (lease.fence_==std::numeric_limits<std::int64_t>::max())
         throw std::overflow_error("durable retry fencing exhausted");
-    Tx tx(t->db);
+    try {
+    Tx tx(t->db, &t->incidents, &t->fault_point);
+    if (t->fault_point == StorageFaultPoint::Rollback)
+        throw std::runtime_error("injected SQLite failure before ROLLBACK");
+    inject_sqlite_fault(*t, StorageFaultPoint::RetryBeforeWrite);
     {
         Statement q(t->db,"UPDATE jobs SET status=0,fence=fence+1 "
                           "WHERE seq=? AND status=1 AND fence=?");
         q.integer(1,lease.sequence_);q.integer(2,lease.fence_);q.step();
         if(sqlite3_changes(t->db)!=1)throw std::logic_error("durable retry fencing failed");
     }
+    inject_sqlite_fault(*t, StorageFaultPoint::RetryBeforeCommit);
     tx.commit();
     t->active.at(lease.lock_id_)=0;
     lease.active_=false;
+    } catch (...) {
+        t->quarantine(RetryStorageFailure);
+        throw;
+    }
 }
 void TenantRuntime::retry(Lease& lease) {
     std::lock_guard<std::mutex> lock(core_->mu);
