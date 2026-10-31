@@ -45,7 +45,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-          test -z "$(git status --porcelain --untracked-files=all)"
+          bash scripts/verify-native-tree.sh .
       - name: Test verifier success and fail-closed contracts (source-free fixture)
         run: |
           set -euo pipefail
@@ -68,7 +68,7 @@ jobs:
           EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-          test -z "$(git status --porcelain --untracked-files=all)"
+          bash scripts/verify-native-tree.sh .
           git ls-tree -r HEAD native CMakeLists.txt
       - name: Install system SQLite development headers
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
@@ -106,7 +106,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-          test -z "$(git status --porcelain --untracked-files=all)"
+          bash scripts/verify-native-tree.sh .
       - name: Build and execute assert-enabled CTest
         env:
           EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -140,7 +140,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-          test -z "$(git status --porcelain --untracked-files=all)"
+          bash scripts/verify-native-tree.sh .
           sudo apt-get update && sudo apt-get install -y libsqlite3-dev
           for test_name in durable_isolate_queues_test durable_tenant_fault_quarantine_test durable_sqlite_vfs_fault_test; do
             g++ -std=c++17 -pthread -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG \
