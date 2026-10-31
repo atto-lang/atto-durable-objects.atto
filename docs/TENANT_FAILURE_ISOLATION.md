@@ -68,3 +68,8 @@ On fallback `Tenant::~Tenant()` disposal, the destructor no longer writes direct
 ## Integrated VFS test additions (source only; no exact-head execution yet)
 
 The real WAL `xWrite`/`xSync` fault harness now also targets **enqueue admission** and **try_claim**, not only ACK, with a separate tenant-B successful completion and subsequent tenant-A recovery. Runtime catches SQL `std::runtime_error` from BEGIN, prepare, statements, and COMMIT in both operations and sets atomic `AdmissionStorageFailure`/`ClaimStorageFailure` quarantine flags. This avoids continuing a live runtime after an ambiguous write/commit outcome. These tests are intentionally strict about eventual complete/pending queue consistency, but do **not** assume whether an xSync failure committed before error. They are still uncompiled/unexecuted on the repository exact head; zero-step Actions do not validate them.
+
+
+## POSIX singleton lock release ordering
+
+The `Tenant` destructor and explicit `close_tenant` no longer run `flock(LOCK_UN)` before `close(fd)`. The previous ordering risked unlocking the singleton while retaining an open descriptor if the subsequent close failed. Normal descriptor close now performs release. The legacy `LockUnlock` injection remains a synthetic refusal before release, not an actual failing `flock(LOCK_UN)` syscall; it must not be described as proof of real POSIX unlock-error handling. Ambiguous `close(fd)` failures still require external process-level evidence and review.
