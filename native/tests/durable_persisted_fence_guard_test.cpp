@@ -141,6 +141,11 @@ int main() {
                                  "UPDATE sqlite_sequence SET seq=1e100 WHERE name='jobs'");
         reject_completed_history("negative-sequence",
                                  "UPDATE sqlite_sequence SET seq=-1 WHERE name='jobs'");
+        reject_completed_history("duplicate-sqlite-sequence-record",
+                                 "INSERT INTO sqlite_sequence(name,seq) VALUES('jobs',1)");
+        reject_completed_history("destroyed-schema-and-version",
+            "DROP TABLE dedupe; DROP TABLE jobs; DROP TABLE objects;"
+            "PRAGMA user_version=0");
         reject_completed_history("historical-receipt-alias",
             "INSERT INTO dedupe(request_id,seq,object_id,lock_id,payload) "
             "SELECT 'alias',seq,object_id,lock_id,payload FROM dedupe LIMIT 1");
