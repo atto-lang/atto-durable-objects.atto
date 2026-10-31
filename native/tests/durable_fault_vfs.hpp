@@ -7,6 +7,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace ores::durable::test {
 class FaultVfs final {
@@ -17,12 +18,18 @@ public:
         if (!original_) throw std::runtime_error("SQLite VFS not found");
         proxy_ = *original_;
         proxy_.zName = "ores-test-fault-vfs";
-        proxy_.pAppData = this;
+        // Preserve underlying VFS pAppData for all forwarded callbacks.
+        // This isolated test process admits one active fault VFS.
+        FaultVfs* expected = nullptr;
+        if (!active_.compare_exchange_strong(expected, this))
+            throw std::logic_error("another fault VFS is already active");
         proxy_.pNext = nullptr;
         proxy_.szOsFile = static_cast<int>(offsetof(File, storage) + original_->szOsFile);
         proxy_.xOpen = &open;
-        if (sqlite3_vfs_register(&proxy_, 1) != SQLITE_OK)
+        if (sqlite3_vfs_register(&proxy_, 1) != SQLITE_OK) {
+            active_.store(nullptr, std::memory_order_release);
             throw std::runtime_error("SQLite fault VFS registration failed");
+        }
         registered_ = true;
     }
     FaultVfs(const FaultVfs&) = delete;
@@ -31,6 +38,7 @@ public:
         if (registered_) {
             (void)sqlite3_vfs_register(original_, 1);
             (void)sqlite3_vfs_unregister(&proxy_);
+            active_.store(nullptr, std::memory_order_release);
         }
     }
     void arm(Point p) noexcept { point_.store(static_cast<int>(p), std::memory_order_release); }
@@ -53,9 +61,10 @@ private:
         f->owner->hits_.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
-    static int open(sqlite3_vfs* vfs, const char* name, sqlite3_file* out,
+    static int open(sqlite3_vfs*, const char* name, sqlite3_file* out,
                     int flags, int* out_flags) noexcept {
-        auto* self = static_cast<FaultVfs*>(vfs->pAppData);
+        auto* self = active_.load(std::memory_order_acquire);
+        if (!self) return SQLITE_IOERR;
         auto* w = cast(out);
         w->real = reinterpret_cast<sqlite3_file*>(w->storage);
         w->owner = self;
@@ -135,6 +144,7 @@ private:
         };
         return io;
     }
+    static inline std::atomic<FaultVfs*> active_{nullptr};
     sqlite3_vfs* original_ = nullptr;
     sqlite3_vfs proxy_{};
     std::string target_;
