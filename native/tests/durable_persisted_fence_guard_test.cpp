@@ -158,6 +158,21 @@ int main() {
             "INSERT INTO dedupe(request_id,seq,object_id,lock_id,payload) "
             "SELECT 'alias',seq,object_id,lock_id,payload FROM dedupe LIMIT 1");
 
+        // A completed job deliberately has no live jobs row, but its
+        // historical receipt and object bindings must still be valid keys.
+        // SQLite's TEXT affinity permits embedded NUL/control bytes and
+        // even separately stored BLOB values, none of which are guest keys.
+        reject_completed_history("control-receipt-request",
+            "UPDATE dedupe SET request_id=char(1)||request_id");
+        reject_completed_history("nul-receipt-object",
+            "UPDATE dedupe SET object_id=char(0)||object_id");
+        reject_completed_history("blob-receipt-request",
+            "UPDATE dedupe SET request_id=X'726571'");
+        reject_completed_history("oversized-receipt-lock",
+            "UPDATE dedupe SET lock_id=printf('%0129d',0)");
+        reject_completed_history("control-object-lock",
+            "UPDATE objects SET lock_id=char(127)||lock_id");
+
         // On restart, current Limits also apply to previously persisted
         // records. Raising limits during a previous session must not allow
         // a subsequent stricter tenant to admit too much state/backlog.
