@@ -346,6 +346,20 @@ static void incident_marker_lifecycle_regression() {
         assert(rejects([&]{ (void)clean.recover_tenant("A"); }));
         auto a=clean.open_tenant("A");
         assert(std::filesystem::is_regular_file(marker));
+        // WAL is a persisted database property: verify it through a separate
+        // SQLite connection, not just the runtime's successful PRAGMA return.
+        sqlite3* verifier=nullptr;
+        assert(sqlite3_open_v2(db.c_str(),&verifier,
+               SQLITE_OPEN_READWRITE|SQLITE_OPEN_FULLMUTEX,nullptr)==SQLITE_OK);
+        sqlite3_stmt* journal=nullptr;
+        assert(sqlite3_prepare_v2(verifier,"PRAGMA journal_mode",-1,
+                                  &journal,nullptr)==SQLITE_OK);
+        assert(sqlite3_step(journal)==SQLITE_ROW);
+        const unsigned char* mode=sqlite3_column_text(journal,0);
+        assert(mode && std::string(reinterpret_cast<const char*>(mode))=="wal");
+        assert(sqlite3_step(journal)==SQLITE_DONE);
+        assert(sqlite3_finalize(journal)==SQLITE_OK);
+        assert(sqlite3_close(verifier)==SQLITE_OK);
         clean.close_tenant(a);
         assert(!std::filesystem::exists(marker));
     }
