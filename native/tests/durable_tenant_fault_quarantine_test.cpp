@@ -155,6 +155,14 @@ static void dispose_fault(const char* label, StorageFaultPoint point, unsigned b
         // A retired marker must never disappear on a rejected disposal.
         assert(std::filesystem::is_regular_file(
             root/"tenant-41.sqlite.incident"));
+        if(point==StorageFaultPoint::IncidentUnlink ||
+           point==StorageFaultPoint::IncidentDirSync ||
+           point==StorageFaultPoint::IncidentGuardRelease) {
+            // The second marker was committed before retiring .incident.
+            // A pre-release interruption may NOT lose both witnesses.
+            assert(std::filesystem::is_regular_file(
+                root/"tenant-41.sqlite.retiring"));
+        }
         const auto incidents=runtime.quarantined_tenants();
         assert(incidents.size()==1 && incidents[0].first=="A");
         assert((incidents[0].second & bit)!=0);
@@ -176,6 +184,8 @@ static void dispose_fault(const char* label, StorageFaultPoint point, unsigned b
         auto a=restarted.recover_tenant("A");
         assert(restarted.enqueue(a,"obj","lock","req","new").status==EnqueueStatus::Accepted);
         restarted.close_tenant(a);
+        assert(!std::filesystem::exists(root/"tenant-41.sqlite.retiring"));
+        assert(!std::filesystem::exists(root/"tenant-41.sqlite.incident"));
     }
     // After explicit clean retirement, a genuinely independent process
     // must be able to open and close the same tenant (no leaked guard).
