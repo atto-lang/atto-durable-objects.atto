@@ -166,3 +166,24 @@ This is **source-level hardening only**. It has not passed the exact-head
 native CTest, sanitizer, or concurrent recovery stress suite, which remain
 mandatory release gates. These locks protect processes on the same POSIX
 host, not distributed nodes.
+
+
+## Independent-process lock-gate acceptance
+
+A plain `fork()` does not prove that another host process is fenced:
+the child inherits the parent's locked open-file description. The native
+`durable_tenant_fault_quarantine_test` therefore forks **and execs**
+`/proc/self/exe` (Linux CI target) for its competing-owner checks. The
+tenant lock descriptor has `O_CLOEXEC`, so the probe starts without the
+parent's inherited flock. During each injected close/incident-retirement
+failure, the fresh process must fail **specifically** on the singleton
+owner-lock check, not on a SQLite error or an incident marker. After the
+original runtime has shut down and a supervisor has explicitly recovered
+and cleanly closed the tenant, a second fresh executable must also be
+able to open and close that tenant. The negative and positive cases
+ensure both that a lock is not released early and that it does not
+remain unnecessarily held after clean retirement.
+
+This test is host POSIX/SQLite-only and remains unexecuted until the
+exact-head native CTest gate runs; a standalone POSIX reproducer is not
+a runtime receipt or Oreslang guest-isolation evidence.
