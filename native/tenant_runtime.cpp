@@ -128,9 +128,22 @@ void require_incident_marker(const std::string& path) {
     if(!valid||closed!=0) throw std::logic_error("unsafe or malformed incident marker");
 }
 void schema(sqlite3* db) {
-    sql(db,"PRAGMA journal_mode=WAL");
+    // A successful PRAGMA statement is not proof that SQLite entered WAL.
+    // Refuse an engine silently operating under another journal mode.
+    {
+        Statement journal(db,"PRAGMA journal_mode=WAL");
+        if (journal.step()!=SQLITE_ROW || journal.str(0)!="wal" ||
+            journal.step()!=SQLITE_DONE)
+            throw std::runtime_error("durable store requires effective SQLite WAL mode");
+    }
     sql(db,"PRAGMA synchronous=FULL");
     sql(db,"PRAGMA foreign_keys=ON");
+    // Both are connection-scoped; enforce the actual values before any
+    // durable jobs, recovery mutations, or schema writes are admitted.
+    if (scalar(db,"PRAGMA synchronous")!=2)
+        throw std::runtime_error("durable store requires SQLite synchronous FULL");
+    if (scalar(db,"PRAGMA foreign_keys")!=1)
+        throw std::runtime_error("durable store requires SQLite foreign keys enabled");
     if (scalar(db,"PRAGMA user_version") > 1) throw std::runtime_error("unsupported durable schema");
     sql(db,"CREATE TABLE IF NOT EXISTS objects("
            "object_id TEXT PRIMARY KEY,lock_id TEXT NOT NULL,version INTEGER NOT NULL DEFAULT 0,state BLOB NOT NULL DEFAULT X'')");
