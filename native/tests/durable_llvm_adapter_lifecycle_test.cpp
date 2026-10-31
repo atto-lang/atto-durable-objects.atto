@@ -1,4 +1,5 @@
 #include "ores/durable/llvm_oresvm_adapter.hpp"
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
