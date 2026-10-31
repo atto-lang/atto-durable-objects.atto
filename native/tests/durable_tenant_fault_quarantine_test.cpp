@@ -122,6 +122,26 @@ static void ack_fault(const char* label, StorageFaultPoint point, int sqlite_cod
     }
     std::filesystem::remove_all(root);
 }
+// Process-isolation probe: a second process must not acquire the lock while
+// the first process holds a quarantined tenant. Run in the single-threaded
+// disposal fixture. The child must _exit, never unwind inherited SQLite state.
+static void assert_other_process_cannot_open(const std::filesystem::path& root) {
+    const pid_t child=::fork();
+    if (child<0) throw std::runtime_error("fork competing-owner probe failed");
+    if (child==0) {
+        try {
+            TenantRuntime contender(root);
+            (void)contender.open_tenant("A");
+            _exit(81); // second process incorrectly obtained tenant ownership
+        } catch (const std::exception&) {
+            _exit(0); // expected: singleton owner lock was not released
+        }
+    }
+    int status=0;
+    if (::waitpid(child,&status,0)!=child)
+        throw std::runtime_error("waitpid competing-owner probe failed");
+    assert(WIFEXITED(status) && WEXITSTATUS(status)==0);
+}
 static void dispose_fault(const char* label, StorageFaultPoint point, unsigned bit) {
     const auto root=root_for(label);
     {
@@ -137,6 +157,7 @@ static void dispose_fault(const char* label, StorageFaultPoint point, unsigned b
         assert(rejects([&] { runtime.enqueue(a,"obj","lock","req","x"); }));
         TenantRuntime contender(root);
         assert(rejects([&] { (void)contender.open_tenant("A"); }));
+        assert_other_process_cannot_open(root);
         assert(runtime.enqueue(b,"obj","lock","req","ok").status==EnqueueStatus::Accepted);
         auto claim=runtime.try_claim(b,"lock");
         assert(claim);
