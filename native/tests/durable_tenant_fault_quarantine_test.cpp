@@ -7,6 +7,8 @@
 #include <memory>
 #include <optional>
 #include <utility>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -177,6 +179,41 @@ static void shutdown_with_outstanding_lease() {
     }
     std::filesystem::remove_all(root);
 }
+static void process_kill_before_ack() {
+    const auto root=root_for("crash-before-ack");
+    const pid_t child=::fork();
+    if (child<0) throw std::runtime_error("fork failed");
+    if (child==0) {
+        try {
+            TenantRuntime runtime(root);
+            const auto a=runtime.open_tenant("A");
+            if (runtime.enqueue(a,"obj","lock","req","payload").status
+                != EnqueueStatus::Accepted) _exit(91);
+            auto claimed=runtime.try_claim(a,"lock");
+            if (!claimed || claimed->fence()!=1) _exit(92);
+            // Abrupt death: neither ACK, retry nor destructors can run.
+            _exit(42);
+        } catch (...) { _exit(93); }
+    }
+    int status=0;
+    if (::waitpid(child,&status,0)!=child)
+        throw std::runtime_error("waitpid failed");
+    assert(WIFEXITED(status) && WEXITSTATUS(status)==42);
+    {
+        TenantRuntime restarted(root);
+        auto a=restarted.open_tenant("A");
+        assert(restarted.enqueue(a,"obj","lock","req","payload").status
+               == EnqueueStatus::Duplicate);
+        auto recovered=restarted.try_claim(a,"lock");
+        assert(recovered && recovered->fence()>1);
+        assert(restarted.read_state(*recovered).bytes.empty());
+        assert(restarted.read_state(*recovered).version==0);
+        restarted.complete(*recovered,"committed-after-kill");
+        recovered.reset();
+        restarted.close_tenant(a);
+    }
+    std::filesystem::remove_all(root);
+}
 int main() {
     retry_fault("retry-ioerr",StorageFaultPoint::RetryBeforeWrite,SQLITE_IOERR,RetryStorageFailure);
     retry_fault("retry-full",StorageFaultPoint::RetryBeforeCommit,SQLITE_FULL,RetryStorageFailure);
@@ -187,4 +224,5 @@ int main() {
     dispose_fault("flock-unlock",StorageFaultPoint::LockUnlock,LockUnlockFailure);
     dispose_fault("fd-close",StorageFaultPoint::FileClose,FileCloseFailure);
     shutdown_with_outstanding_lease();
+    process_kill_before_ack();
 }
