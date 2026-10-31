@@ -339,23 +339,48 @@ void TenantRuntime::close_tenant(const TenantHandle& h) {
             t->quarantine(FileCloseFailure);
             throw std::runtime_error("injected tenant fd close failure");
         }
-        const int fd = t->lock_fd;
-        t->lock_fd = -1;
-        if (::close(fd) != 0) {
+        // flock belongs to the open FILE DESCRIPTION, not merely this fd.
+        // Duplicate before closing the primary owner fd so no contender can
+        // take over the tenant while the incident marker is being retired.
+        const int guard_fd=::fcntl(t->lock_fd,F_DUPFD_CLOEXEC,0);
+        if(guard_fd<0) {
             t->quarantine(FileCloseFailure);
-            throw std::system_error(errno,std::generic_category(),"tenant fd close");
+            throw std::system_error(errno,std::generic_category(),"tenant guard fd duplicate");
+        }
+        const int primary_fd=t->lock_fd;
+        t->lock_fd=guard_fd; // retains the SAME open-file-description flock
+        if (::close(primary_fd) != 0) {
+            // The original close result is ambiguous. Retain guard + marker;
+            // never retry the primary fd (its number may have been reused).
+            t->quarantine(FileCloseFailure);
+            throw std::system_error(errno,std::generic_category(),"tenant primary fd close");
         }
     }
-    // DB and owner descriptor must both be closed before retiring the
-    // incident. Between descriptor close and unlink, competitors see the
-    // marker and fail closed. A failed disposal retains it across restart.
+    // The duplicate still owns the flock while unlink+directory fsync run.
+    // Without the duplicate, supervised recovery could race between closing
+    // the primary fd and removing .incident and lose the new session marker.
     const auto marker_path=(core_->root/filename(t->id)).string()+".incident";
+    if(t->fault_point==StorageFaultPoint::IncidentUnlink) {
+        t->fault_point=StorageFaultPoint::None;
+        t->quarantine(FileCloseFailure);
+        throw std::runtime_error("injected incident retirement interruption");
+    }
     if(::unlink(marker_path.c_str())!=0) {
         t->quarantine(FileCloseFailure);
         throw std::system_error(errno,std::generic_category(),"incident marker unlink");
     }
     try { sync_incident_dir(core_->root); }
     catch (...) { t->quarantine(FileCloseFailure); throw; }
+    if(t->lock_fd>=0) {
+        // Now that the SQLite connection is closed and marker removal is
+        // durable, the last flock holder may release singleton ownership.
+        const int guard_fd=t->lock_fd;
+        t->lock_fd=-1;
+        if(::close(guard_fd)!=0) {
+            t->quarantine(FileCloseFailure);
+            throw std::system_error(errno,std::generic_category(),"tenant guard fd close");
+        }
+    }
     t->accepting=false;
     core_->tenants.erase(t->id);
 }

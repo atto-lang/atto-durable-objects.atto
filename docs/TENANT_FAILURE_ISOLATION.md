@@ -140,3 +140,29 @@ An ordinary crash also requires explicit supervisor recovery. This is a
 durable unclean-session indicator, *not* a durable reason-code event log,
 distributed authority, or proof of OS isolation. Native crash/fsync,
 disk-full, sanitizer, and exact-tree testing remain mandatory.
+
+
+## P0: guard the singleton lock during incident-marker retirement
+
+The original retirement sequence closed the owner fd (releasing `flock`)
+**before** removing the `.incident` sidecar. A contender could acquire the
+flock and enter supervised recovery while the closing host still intended
+to unlink the marker, causing the new session to run without its incident
+record. Merely relying on marker presence is insufficient because a trusted
+supervisor is allowed to recover a marked tenant.
+
+The corrected path duplicates the locked file descriptor using
+`F_DUPFD_CLOEXEC` (same open-file-description `flock`) before closing
+the primary fd. It keeps the duplicate until **after** unlink and successful
+directory `fsync`. An interruption or failure before unlink retains the
+marker and the locked duplicate; a failure after unlink happens only after
+SQLite was fully closed and leaves no admitted guest work. It never retries
+an fd number after an ambiguous `close()` result. The synthetic
+`IncidentUnlink` failure injects an interruption at the critical boundary,
+and the existing competing-process test requires rejection specifically at
+the POSIX owner fence before permitted supervised recovery.
+
+This is **source-level hardening only**. It has not passed the exact-head
+native CTest, sanitizer, or concurrent recovery stress suite, which remain
+mandatory release gates. These locks protect processes on the same POSIX
+host, not distributed nodes.

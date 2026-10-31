@@ -344,6 +344,9 @@ int main() {
     dispose_fault("sqlite-close",StorageFaultPoint::SqliteClose,SqliteCloseFailure);
     dispose_fault("flock-unlock",StorageFaultPoint::LockUnlock,LockUnlockFailure);
     dispose_fault("fd-close",StorageFaultPoint::FileClose,FileCloseFailure);
+    // Simulated interruption after primary fd close but before marker unlink.
+    // A duplicate must continue to own the exact same flock description.
+    dispose_fault("incident-retire",StorageFaultPoint::IncidentUnlink,FileCloseFailure);
     shutdown_with_outstanding_lease();
     process_kill_before_ack();
     admission_or_claim_commit_failure("enqueue-commit",StorageFaultPoint::EnqueueBeforeCommit,

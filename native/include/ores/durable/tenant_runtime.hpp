@@ -50,7 +50,8 @@ enum TenantIncident : unsigned {
 enum class StorageFaultPoint {
     None, EnqueueBeforeCommit, ClaimBeforeCommit, RetryBeforeWrite, RetryBeforeCommit,
     AckBeforeWrite, AckBeforeCommit,
-    Rollback, SqliteClose, LockUnlock, FileClose, ReadState, PendingQuery
+    Rollback, SqliteClose, LockUnlock, FileClose, ReadState, PendingQuery,
+    IncidentUnlink
 };
 struct Receipt {
     EnqueueStatus status;
