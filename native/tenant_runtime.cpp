@@ -234,6 +234,15 @@ void schema(sqlite3* db, std::atomic<unsigned>* incidents, StorageFaultPoint* pe
                   "GROUP BY seq HAVING COUNT(*)>1)") != 0)
         throw std::runtime_error("two durable receipts alias one historical sequence");
 
+    // SQLite BLOB affinity permits a corrupt database to store TEXT values.
+    // TEXT length() counts characters, not bytes, and silently changes the
+    // runtime's byte-oriented quota/receipt identity contract. Refuse such
+    // rows instead of reinterpreting them as canonical host-written blobs.
+    if (scalar(db,"SELECT COUNT(*) FROM objects WHERE typeof(state)!='blob'") != 0 ||
+        scalar(db,"SELECT COUNT(*) FROM jobs WHERE typeof(payload)!='blob'") != 0 ||
+        scalar(db,"SELECT COUNT(*) FROM dedupe WHERE typeof(payload)!='blob'") != 0)
+        throw std::runtime_error("invalid persisted durable blob storage class");
+
     // Admission limits also govern persisted data. Without this guard, a
     // restart with tightened quotas can restore unbounded host-side buffers
     // and queues that new enqueue/complete operations could never create.
@@ -250,14 +259,14 @@ void schema(sqlite3* db, std::atomic<unsigned>* incidents, StorageFaultPoint* pe
             scalar(db,"SELECT COUNT(*) FROM dedupe")) > limits.max_dedupe_keys)
         throw std::logic_error("persisted durable dedupe keys exceed quota");
     if (static_cast<std::uint64_t>(
-            scalar(db,"SELECT COALESCE(MAX(length(state)),0) FROM objects")) >
+            scalar(db,"SELECT COALESCE(MAX(length(CAST(state AS BLOB))),0) FROM objects")) >
             limits.max_state_bytes)
         throw std::logic_error("persisted durable state exceeds byte quota");
     if (static_cast<std::uint64_t>(
-            scalar(db,"SELECT COALESCE(MAX(length(payload)),0) FROM jobs")) >
+            scalar(db,"SELECT COALESCE(MAX(length(CAST(payload AS BLOB))),0) FROM jobs")) >
             limits.max_request_bytes ||
         static_cast<std::uint64_t>(
-            scalar(db,"SELECT COALESCE(MAX(length(payload)),0) FROM dedupe")) >
+            scalar(db,"SELECT COALESCE(MAX(length(CAST(payload AS BLOB))),0) FROM dedupe")) >
             limits.max_request_bytes)
         throw std::logic_error("persisted durable request exceeds byte quota");
 
