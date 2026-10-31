@@ -341,6 +341,7 @@ static void incident_marker_lifecycle_regression() {
     const auto root=root_for("incident-lifecycle");
     const auto db=root/"tenant-41.sqlite";
     const auto marker=std::filesystem::path(db.string()+".incident");
+    const auto witness=std::filesystem::path(db.string()+".retiring");
     {
         TenantRuntime clean(root);
         assert(rejects([&]{ (void)clean.recover_tenant("A"); }));
@@ -362,6 +363,7 @@ static void incident_marker_lifecycle_regression() {
         assert(sqlite3_close(verifier)==SQLITE_OK);
         clean.close_tenant(a);
         assert(!std::filesystem::exists(marker));
+        assert(!std::filesystem::exists(witness));
     }
     {
         TenantRuntime abandoned(root);
@@ -394,6 +396,41 @@ static void incident_marker_lifecycle_regression() {
         assert(std::filesystem::is_regular_file(marker));
     }
     std::filesystem::remove_all(root);
+
+    // Simulate process death in the interval after the durable witness
+    // was created but the incident was removed. An ordinary open must
+    // fail; supervised recovery must restore .incident before retirement
+    // witness clearance, not assume the database was cleanly closed.
+    const auto mid=root_for("incident-mid-retirement");
+    const auto mid_db=mid/"tenant-41.sqlite";
+    const auto mid_marker=std::filesystem::path(mid_db.string()+".incident");
+    const auto mid_witness=std::filesystem::path(mid_db.string()+".retiring");
+    {
+        TenantRuntime interrupted(mid);
+        auto a=interrupted.open_tenant("A");
+        assert(interrupted.enqueue(a,"obj","lock","req","work").status==
+               EnqueueStatus::Accepted);
+        assert(std::filesystem::copy_file(mid_marker,mid_witness));
+        std::filesystem::permissions(mid_witness,std::filesystem::perms::owner_read|
+            std::filesystem::perms::owner_write,std::filesystem::perm_options::replace);
+        std::filesystem::remove(mid_marker);
+        // Scope exit simulates losing the owner before a clean close.
+    }
+    assert(!std::filesystem::exists(mid_marker));
+    assert(std::filesystem::is_regular_file(mid_witness));
+    {
+        TenantRuntime supervisor(mid);
+        assert(rejects([&]{ (void)supervisor.open_tenant("A"); }));
+        auto recovered=supervisor.recover_tenant("A");
+        assert(std::filesystem::is_regular_file(mid_marker));
+        assert(!std::filesystem::exists(mid_witness));
+        assert(supervisor.enqueue(recovered,"obj","lock","req","work").status==
+               EnqueueStatus::Duplicate);
+        supervisor.close_tenant(recovered);
+    }
+    assert(!std::filesystem::exists(mid_marker));
+    assert(!std::filesystem::exists(mid_witness));
+    std::filesystem::remove_all(mid);
 
     const auto forged=root_for("incident-forged-marker");
     const auto forged_db=forged/"tenant-41.sqlite";
