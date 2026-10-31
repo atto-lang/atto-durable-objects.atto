@@ -48,6 +48,7 @@ if(BUILD_TESTING AND ORES_DURABLE_TEST_LLVM_ADAPTER)
   add_executable(durable_llvm_adapter_lifecycle_test
     native/tests/durable_llvm_adapter_lifecycle_test.cpp)
   target_compile_features(durable_llvm_adapter_lifecycle_test PRIVATE cxx_std_17)
+  target_compile_definitions(durable_llvm_adapter_lifecycle_test PRIVATE ORES_DURABLE_TESTING=1)
   target_include_directories(durable_llvm_adapter_lifecycle_test PRIVATE "${ORESVM_INCLUDE_DIR}")
   target_link_libraries(durable_llvm_adapter_lifecycle_test PRIVATE ores_durable_objects)
   target_compile_options(durable_llvm_adapter_lifecycle_test PRIVATE
