@@ -104,3 +104,19 @@ may contain private local paths; do not upload them to external carriers
 without authorization. No compiler/CTest or sanitizer execution on this
 complete GitHub tree has been performed in the current session.
 
+
+
+## Competing-process tenant ownership regression
+
+`durable_tenant_fault_quarantine_test` now executes two owner-fencing checks
+after each synthetic explicit-disposal failure (SQLite close, pre-release
+lock fault, and file-close fault). A second in-process runtime must fail to
+open tenant A, and a forked child process using a new runtime must fail
+**specifically** with the singleton-owner-lock rejection, not an unrelated
+SQLite/filesystem error. The child uses `_exit` to avoid unwinding inherited
+SQLite state. Tenant B must still complete its queue work, and tenant A's
+persisted state is checked on subsequent controlled restart.
+
+The forked contender executes against the same POSIX host/kernel and is not
+a multi-host isolation proof. The test source is committed but native CTest
+execution is still required; zero-step GitHub Actions are not test receipts.
