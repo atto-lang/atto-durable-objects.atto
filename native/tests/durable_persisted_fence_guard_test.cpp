@@ -102,6 +102,49 @@ int main() {
                        "INSERT INTO dedupe(request_id,seq,object_id,lock_id,payload) "
                        "VALUES('forged',1,'obj','lock',X'00')");
 
+        // Completed requests retain their dedupe receipt after their job
+        // row is deleted. A lost table or reset AUTOINCREMENT high-water must
+        // fail on reopen, otherwise an ACKed request can be run twice.
+        const auto reject_completed_history = [&](const std::string& name,
+                                                  const char* mutation) {
+            const auto isolated = root / ("completed-" + name);
+            {
+                TenantRuntime seeded(isolated);
+                auto tenant = seeded.open_tenant("t");
+                assert(seeded.enqueue(tenant,"obj","lock","req","data").status
+                       == EnqueueStatus::Accepted);
+                auto lease = seeded.try_claim(tenant,"lock");
+                assert(lease.has_value());
+                seeded.complete(*lease,"done");
+                lease.reset();
+                seeded.close_tenant(tenant);
+            }
+            const auto db_file = isolated / "tenant-74.sqlite";
+            sqlite3* db = nullptr;
+            assert(sqlite3_open_v2(db_file.c_str(), &db, SQLITE_OPEN_READWRITE,
+                                   nullptr) == SQLITE_OK);
+            assert(sqlite3_exec(db, mutation, nullptr, nullptr, nullptr) == SQLITE_OK);
+            assert(sqlite3_close(db) == SQLITE_OK);
+            TenantRuntime recovered(isolated);
+            bool rejected = false;
+            try { (void)recovered.open_tenant("t"); }
+            catch (const std::runtime_error&) { rejected = true; }
+            assert(rejected);
+        };
+        reject_completed_history("dropped-dedupe", "DROP TABLE dedupe");
+        reject_completed_history("reset-schema-version", "PRAGMA user_version=0");
+        reject_completed_history("reset-sequence",
+                                 "UPDATE sqlite_sequence SET seq=0 WHERE name='jobs'");
+        reject_completed_history("deleted-sequence",
+                                 "DELETE FROM sqlite_sequence WHERE name='jobs'");
+        reject_completed_history("real-sequence",
+                                 "UPDATE sqlite_sequence SET seq=1e100 WHERE name='jobs'");
+        reject_completed_history("negative-sequence",
+                                 "UPDATE sqlite_sequence SET seq=-1 WHERE name='jobs'");
+        reject_completed_history("historical-receipt-alias",
+            "INSERT INTO dedupe(request_id,seq,object_id,lock_id,payload) "
+            "SELECT 'alias',seq,object_id,lock_id,payload FROM dedupe LIMIT 1");
+
         // A damaged second receipt must prevent recovery from advancing a
         // different in-flight row. Validate everything before any requeue.
         {
