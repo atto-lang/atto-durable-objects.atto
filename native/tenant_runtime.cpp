@@ -156,7 +156,22 @@ void schema(sqlite3* db, std::atomic<unsigned>* incidents, StorageFaultPoint* pe
     // Validate, requeue and promote the schema in one atomic WAL transaction.
     // A failed admission must never leave a partially recovered queue.
     Tx startup_tx(db, incidents, pending_fault);
-    if (scalar(db,"PRAGMA user_version") > 1) throw std::runtime_error("unsupported durable schema");
+    // Schema version zero means an empty, never-admitted tenant database.
+    // Recreating a dropped dedupe table in an existing tenant would erase
+    // historical idempotency and allow previously completed requests to run
+    // twice. Validate the schema BEFORE CREATE TABLE IF NOT EXISTS.
+    const auto stored_version = scalar(db,"PRAGMA user_version");
+    if (stored_version != 0 && stored_version != 1)
+        throw std::runtime_error("unsupported durable schema");
+    const auto required_tables = scalar(db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+        "AND name IN ('objects','jobs','dedupe')");
+    if (stored_version == 1 && required_tables != 3)
+        throw std::runtime_error("existing durable tenant is missing required tables");
+    if (stored_version == 0 && scalar(db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%'") != 0)
+        throw std::runtime_error("unversioned durable tenant contains persistent tables");
     sql(db,"CREATE TABLE IF NOT EXISTS objects("
            "object_id TEXT PRIMARY KEY,lock_id TEXT NOT NULL,version INTEGER NOT NULL DEFAULT 0,state BLOB NOT NULL DEFAULT X'')");
     sql(db,"CREATE TABLE IF NOT EXISTS jobs("
@@ -203,6 +218,22 @@ void schema(sqlite3* db, std::atomic<unsigned>* incidents, StorageFaultPoint* pe
                   "WHERE d.request_id<>j.request_id OR d.object_id<>j.object_id "
                   "OR d.lock_id<>j.lock_id OR d.payload<>j.payload") != 0)
         throw std::runtime_error("persisted durable receipt aliases another job");
+
+    // A deleted/reduced sqlite_sequence permits AUTOINCREMENT to reuse the
+    // sequence of an ACKed historical job, even though its dedupe receipt is
+    // retained. Prevent aliases and orphaned idempotency identities at startup.
+    if (scalar(db,"SELECT COUNT(*) FROM sqlite_sequence WHERE name='jobs' "
+                  "AND (typeof(seq)!='integer' OR seq<0)") != 0 ||
+        scalar(db,"SELECT COUNT(*) FROM sqlite_sequence WHERE name='jobs'") > 1)
+        throw std::runtime_error("invalid durable jobs sqlite_sequence");
+    const auto highwater = scalar(db,
+        "SELECT COALESCE(MAX(seq),0) FROM sqlite_sequence WHERE name='jobs'");
+    if (highwater < scalar(db,"SELECT COALESCE(MAX(seq),0) FROM jobs") ||
+        highwater < scalar(db,"SELECT COALESCE(MAX(seq),0) FROM dedupe"))
+        throw std::runtime_error("durable jobs sequence was reset or reused");
+    if (scalar(db,"SELECT COUNT(*) FROM (SELECT seq FROM dedupe "
+                  "GROUP BY seq HAVING COUNT(*)>1)") != 0)
+        throw std::runtime_error("two durable receipts alias one historical sequence");
 
     // Refuse a persisted tenant that already exceeds the configured isolate
     // lock-queue budget BEFORE requeueing in-flight jobs or advancing fences.
