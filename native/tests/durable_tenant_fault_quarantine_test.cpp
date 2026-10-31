@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <utility>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <stdexcept>
@@ -331,6 +332,77 @@ static void read_failure_quarantines_tenant(const char* label, StorageFaultPoint
     std::filesystem::remove_all(root);
 }
 
+// Persistent marker contract: clean close clears it, an unclean exit
+// cannot silently restart, and missing/forged storage remains quarantined.
+static void incident_marker_lifecycle_regression() {
+    const auto root=root_for("incident-lifecycle");
+    const auto db=root/"tenant-41.sqlite";
+    const auto marker=std::filesystem::path(db.string()+".incident");
+    {
+        TenantRuntime clean(root);
+        assert(rejects([&]{ (void)clean.recover_tenant("A"); }));
+        auto a=clean.open_tenant("A");
+        assert(std::filesystem::is_regular_file(marker));
+        clean.close_tenant(a);
+        assert(!std::filesystem::exists(marker));
+    }
+    {
+        TenantRuntime abandoned(root);
+        auto a=abandoned.open_tenant("A");
+        assert(abandoned.enqueue(a,"obj","lock","req","body").status ==
+               EnqueueStatus::Accepted);
+        // No explicit close: the marker must survive scope exit.
+    }
+    assert(std::filesystem::is_regular_file(marker));
+    {
+        TenantRuntime supervisor(root);
+        assert(rejects([&]{ (void)supervisor.open_tenant("A"); }));
+        auto a=supervisor.recover_tenant("A");
+        assert(supervisor.enqueue(a,"obj","lock","req","body").status ==
+               EnqueueStatus::Duplicate);
+        supervisor.close_tenant(a);
+    }
+    assert(!std::filesystem::exists(marker));
+    {
+        TenantRuntime abandoned(root);
+        auto a=abandoned.open_tenant("A");
+        (void)a;
+    }
+    assert(std::filesystem::is_regular_file(marker));
+    assert(std::filesystem::remove(db));
+    {
+        TenantRuntime supervisor(root);
+        assert(rejects([&]{ (void)supervisor.open_tenant("A"); }));
+        assert(rejects([&]{ (void)supervisor.recover_tenant("A"); }));
+        assert(std::filesystem::is_regular_file(marker));
+    }
+    std::filesystem::remove_all(root);
+
+    const auto forged=root_for("incident-forged-marker");
+    const auto forged_db=forged/"tenant-41.sqlite";
+    const auto forged_marker=std::filesystem::path(forged_db.string()+".incident");
+    {
+        TenantRuntime clean(forged);
+        auto a=clean.open_tenant("A");
+        clean.close_tenant(a);
+    }
+    std::filesystem::create_symlink(forged_db,forged_marker);
+    {
+        TenantRuntime supervisor(forged);
+        assert(rejects([&]{ (void)supervisor.open_tenant("A"); }));
+        assert(rejects([&]{ (void)supervisor.recover_tenant("A"); }));
+    }
+    std::filesystem::remove(forged_marker);
+    // Regression: an O_RDONLY open of a FIFO would block forever before
+    // fstat could reject it. Marker validation must use nonblocking I/O.
+    assert(::mkfifo(forged_marker.c_str(),0600)==0);
+    {
+        TenantRuntime supervisor(forged);
+        assert(rejects([&]{ (void)supervisor.open_tenant("A"); }));
+        assert(rejects([&]{ (void)supervisor.recover_tenant("A"); }));
+    }
+    std::filesystem::remove_all(forged);
+}
 int main(int argc, char** argv) {
     if (argc==3 && (std::string(argv[1])=="--probe-singleton-lock" ||
                     std::string(argv[1])=="--probe-clean-reopen")) {
@@ -371,4 +443,5 @@ int main(int argc, char** argv) {
                                       ClaimStorageFailure);
     read_failure_quarantines_tenant("read-state",StorageFaultPoint::ReadState);
     read_failure_quarantines_tenant("pending-count",StorageFaultPoint::PendingQuery);
+    incident_marker_lifecycle_regression();
 }
