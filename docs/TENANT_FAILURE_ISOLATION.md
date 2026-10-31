@@ -58,3 +58,9 @@ schema migration. These are separate gates rather than claimed coverage.
 5. Define and test supervisor incident persistence/acknowledgment outside the in-process diagnostic snapshot. Current incident bits are **volatile**, and best-effort stderr diagnostics are not a durable incident ledger.
 
 The host SQLite reference is not a guest ABI, hostile guest sandbox, distributed lease authority or compiled Oreslang DurableObject implementation.
+
+## Follow-up: transaction admission and lease-claim COMMIT ambiguity
+
+Synthetic `EnqueueBeforeCommit` and `ClaimBeforeCommit` exceptions now quarantine the relevant tenant, rather than leaving a committed-but-unindexed queue or a claimed-without-issued-lease row accessible to later same-process operations. The preallocated per-lock index is retained on uncertain enqueue COMMIT, and claim has not issued any Lease. The normal recovery pass must resolve persistence and advance in-flight fences on process restart. These synthetic hooks run *before* SQLite COMMIT and do not demonstrate what a failed VFS `xSync` actually committed; separate real VFS injection at enqueue/claim COMMIT is a required next gate.
+
+On fallback `Tenant::~Tenant()` disposal, the destructor no longer writes directly to stderr: a closed pipe can send SIGPIPE or a full pipe can block. If SQLite close or flock unlock fails, the process deliberately retains the OS flock/descriptor until process exit to avoid prematurely admitting another process owner. This may leak resources on a truly failing shutdown path; the explicit host `close_tenant()` path is the observable disposal API. No production-safe durable supervisor incident ledger is yet implemented.

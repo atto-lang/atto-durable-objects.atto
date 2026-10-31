@@ -39,13 +39,16 @@ enum TenantIncident : unsigned {
     RollbackStorageFailure = 1u << 2,
     SqliteCloseFailure = 1u << 3,
     LockUnlockFailure = 1u << 4,
-    FileCloseFailure = 1u << 5
+    FileCloseFailure = 1u << 5,
+    AdmissionStorageFailure = 1u << 6,
+    ClaimStorageFailure = 1u << 7
 };
 
 // Test-only fault seam at the trusted host's SQLite/POSIX call boundaries.
 // Synthetic failures exercise containment; they are not SQLite VFS I/O receipts.
 enum class StorageFaultPoint {
-    None, RetryBeforeWrite, RetryBeforeCommit, AckBeforeWrite, AckBeforeCommit,
+    None, EnqueueBeforeCommit, ClaimBeforeCommit, RetryBeforeWrite, RetryBeforeCommit,
+    AckBeforeWrite, AckBeforeCommit,
     Rollback, SqliteClose, LockUnlock, FileClose
 };
 struct Receipt {

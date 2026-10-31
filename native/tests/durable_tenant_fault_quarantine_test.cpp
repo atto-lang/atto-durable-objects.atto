@@ -214,6 +214,49 @@ static void process_kill_before_ack() {
     }
     std::filesystem::remove_all(root);
 }
+static void admission_or_claim_commit_failure(
+    const char* label, StorageFaultPoint point, unsigned expected_flag) {
+    const auto root=root_for(label);
+    {
+        TenantRuntime runtime(root);
+        auto a=runtime.open_tenant("tenant-A");
+        auto b=runtime.open_tenant("tenant-B");
+        assert(runtime.enqueue(b,"obj","lock","req-B","b").status==EnqueueStatus::Accepted);
+        if (point==StorageFaultPoint::ClaimBeforeCommit)
+            assert(runtime.enqueue(a,"obj","lock","req-A","a").status==EnqueueStatus::Accepted);
+        runtime.inject_fault_for_test(a,point,SQLITE_IOERR);
+        if (point==StorageFaultPoint::EnqueueBeforeCommit)
+            assert(rejects([&] { (void)runtime.enqueue(a,"obj","lock","req-A","a"); }));
+        else
+            assert(rejects([&] { (void)runtime.try_claim(a,"lock"); }));
+        assert((a.incident_flags() & expected_flag)!=0);
+        assert(rejects([&] { (void)runtime.try_claim(a,"lock"); }));
+        assert(rejects([&] { (void)runtime.enqueue(a,"obj","lock","another","x"); }));
+        auto healthy=runtime.try_claim(b,"lock");
+        assert(healthy && healthy->payload()=="b");
+        runtime.complete(*healthy,"healthy");
+        healthy.reset();
+        runtime.close_tenant(b);
+    }
+    {
+        TenantRuntime runtime(root);
+        auto a=runtime.open_tenant("tenant-A");
+        // The injected error happened before COMMIT, so SQLite rolled back.
+        // A real xSync failure has an ambiguous outcome; see VFS integration.
+        assert(runtime.enqueue(a,"obj","lock","req-A","a").status
+               == (point==StorageFaultPoint::EnqueueBeforeCommit
+                       ? EnqueueStatus::Accepted : EnqueueStatus::Duplicate));
+        auto claim=runtime.try_claim(a,"lock");
+        assert(claim && claim->payload()=="a");
+        runtime.complete(*claim,"recovered");
+        claim.reset();
+        runtime.close_tenant(a);
+        auto b=runtime.open_tenant("tenant-B");
+        assert(runtime.enqueue(b,"obj","lock","req-B","b").status==EnqueueStatus::Duplicate);
+        runtime.close_tenant(b);
+    }
+    std::filesystem::remove_all(root);
+}
 int main() {
     retry_fault("retry-ioerr",StorageFaultPoint::RetryBeforeWrite,SQLITE_IOERR,RetryStorageFailure);
     retry_fault("retry-full",StorageFaultPoint::RetryBeforeCommit,SQLITE_FULL,RetryStorageFailure);
@@ -226,4 +269,8 @@ int main() {
     dispose_fault("fd-close",StorageFaultPoint::FileClose,FileCloseFailure);
     shutdown_with_outstanding_lease();
     process_kill_before_ack();
+    admission_or_claim_commit_failure("enqueue-commit",StorageFaultPoint::EnqueueBeforeCommit,
+                                      AdmissionStorageFailure);
+    admission_or_claim_commit_failure("claim-commit",StorageFaultPoint::ClaimBeforeCommit,
+                                      ClaimStorageFailure);
 }

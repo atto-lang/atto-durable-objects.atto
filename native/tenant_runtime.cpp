@@ -123,28 +123,32 @@ void schema(sqlite3* db) {
 } // namespace
 
 TenantRuntime::Tenant::~Tenant() noexcept {
-    // Best effort on shutdown/failed open: no callbacks, allocation or exceptions.
+    // Last-chance disposal: no guest callbacks, heap allocations, exceptions or
+    // diagnostics written to arbitrary stderr (broken pipe can raise SIGPIPE).
+    // Normal host shutdown should use close_tenant() to observe errors first.
     if (db) {
         if (sqlite3_close(db) != SQLITE_OK) {
             quarantine(SqliteCloseFailure);
-            (void)sqlite3_close_v2(db);
-            static constexpr char msg[] = "durable: tenant SQLite disposal failed\n";
-            (void)::write(STDERR_FILENO, msg, sizeof(msg)-1);
+            // A SQLITE_BUSY connection can still own unfinalized statements.
+            // Intentionally retain the DB handle AND its singleton flock until
+            // process exit; unlocking now could admit another process while
+            // the old connection is still alive. Never pretend close succeeded.
+            return;
         }
         db = nullptr;
     }
     if (lock_fd >= 0) {
         if (flock(lock_fd, LOCK_UN) != 0) {
             quarantine(LockUnlockFailure);
-            static constexpr char msg[] = "durable: tenant flock disposal failed\n";
-            (void)::write(STDERR_FILENO, msg, sizeof(msg)-1);
+            // close(fd) would implicitly release a possibly still-held flock.
+            // Retain it through process exit rather than enable a second owner.
+            return;
         }
         const int fd = lock_fd;
-        lock_fd = -1; // Linux close EINTR can leave descriptor status ambiguous.
+        lock_fd = -1; // Linux close EINTR may leave descriptor status ambiguous.
         if (::close(fd) != 0) {
             quarantine(FileCloseFailure);
-            static constexpr char msg[] = "durable: tenant fd disposal failed\n";
-            (void)::write(STDERR_FILENO, msg, sizeof(msg)-1);
+            // Never retry ambiguous close: the fd may already have been reused.
         }
     }
 }
@@ -341,7 +345,14 @@ Receipt TenantRuntime::enqueue(const TenantHandle& h, const std::string& object,
             if(q.str(1)!=object || q.str(2)!=lock_id || q.bytes(3)!=payload)
                 throw std::logic_error("idempotency key reused with different request");
             const auto seq=q.number(0);
-            tx.commit();return {EnqueueStatus::Duplicate,seq};
+            try {
+                inject_sqlite_fault(*t, StorageFaultPoint::EnqueueBeforeCommit);
+                tx.commit();
+            } catch (...) {
+                t->quarantine(AdmissionStorageFailure);
+                throw;
+            }
+            return {EnqueueStatus::Duplicate,seq};
         }
     }
     if (static_cast<std::size_t>(scalar(t->db,"SELECT COUNT(*) FROM dedupe"))
@@ -377,8 +388,16 @@ Receipt TenantRuntime::enqueue(const TenantHandle& h, const std::string& object,
     }
     // Allocate the index BEFORE persisting transaction, to preserve exception safety.
     if(fresh_lock) t->active.emplace(lock_id,0);
-    try { tx.commit(); }
-    catch (...) { if(fresh_lock) t->active.erase(lock_id); throw; }
+    try {
+        inject_sqlite_fault(*t, StorageFaultPoint::EnqueueBeforeCommit);
+        tx.commit();
+    } catch (...) {
+        // A failed SQLite COMMIT is ambiguous (especially xSync failures):
+        // retaining the preallocated index and quarantining is safer than
+        // erasing it and silently continuing to accept work in this process.
+        t->quarantine(AdmissionStorageFailure);
+        throw;
+    }
     return {EnqueueStatus::Accepted,seq};
 }
 std::optional<TenantRuntime::Lease> TenantRuntime::try_claim(
@@ -413,7 +432,15 @@ std::optional<TenantRuntime::Lease> TenantRuntime::try_claim(
     Lease lease(core_,t,seq,fence+1,lock_id,object,request,payload);
     lease.active_=false;
     // No allocations after durable commit; map key was installed on enqueue/open.
-    tx.commit();
+    try {
+        inject_sqlite_fault(*t, StorageFaultPoint::ClaimBeforeCommit);
+        tx.commit();
+    } catch (...) {
+        // No Lease escaped; the WAL may nevertheless contain an in-flight row.
+        // Do not claim again until next-process recovery advances its fence.
+        t->quarantine(ClaimStorageFailure);
+        throw;
+    }
     cursor->second=seq;
     lease.active_=true;
     return std::optional<Lease>(std::move(lease));
