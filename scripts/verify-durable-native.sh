@@ -7,13 +7,26 @@ cd "$root"
 actual="$(git rev-parse HEAD)"
 [[ "$actual" == "$EXPECTED_HEAD_SHA" ]] || { echo "Wrong HEAD: $actual" >&2; exit 65; }
 [[ -z "$(git status --porcelain --untracked-files=all)" ]] || { echo 'Refusing dirty checkout' >&2; exit 66; }
+actual_tree="$(git rev-parse 'HEAD^{tree}')"
+# A vetted cross-repository mirror has a different commit SHA but must keep
+# the source tree bit-for-bit identical. This is a separate, fail-closed gate:
+# EXPECTED_HEAD_SHA authenticates the *carrier commit*; this authenticates
+# the reviewed source tree (including executable bits and workflow files).
+if [[ -n "${EXPECTED_SOURCE_TREE_SHA:-}" ]]; then
+  [[ "$EXPECTED_SOURCE_TREE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || { echo 'Malformed EXPECTED_SOURCE_TREE_SHA' >&2; exit 67; }
+  [[ "${actual_tree,,}" == "${EXPECTED_SOURCE_TREE_SHA,,}" ]] || {
+    echo "Source tree mismatch: actual $actual_tree expected $EXPECTED_SOURCE_TREE_SHA" >&2
+    exit 68
+  }
+fi
 for tool in cmake ctest g++ clang++ git; do command -v "$tool" >/dev/null || { echo "Missing $tool" >&2; exit 69; }; done
 report="${DURABLE_REPORT_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/ores-durable-verify.XXXXXXXX")}" 
 mkdir -p "$report"; report="$(cd "$report" && pwd -P)"
 [[ "$report" != "$root" && "$report" != "$root/"* ]] || { echo 'Report directory must be outside checkout' >&2; exit 66; }
 {
   echo "HEAD=$actual"
-  echo "TREE=$(git rev-parse HEAD^{tree})"
+  echo "TREE=$actual_tree"
+  echo "REVIEWED_SOURCE_TREE=${EXPECTED_SOURCE_TREE_SHA:-not-supplied}"
   echo "UTC_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   cmake --version | head -1
   g++ --version | head -1
