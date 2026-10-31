@@ -432,6 +432,16 @@ void TenantRuntime::close_tenant(const TenantHandle& h) {
         catch (...) { /* original error propagates; durability is unverified */ }
         throw;
     }
+    // A pre-release interruption MUST happen before retiring the durable
+    // witness. Even if recreating the .incident marker fails, .retiring
+    // remains synchronized and ordinary admission cannot proceed.
+    if(t->fault_point==StorageFaultPoint::IncidentGuardRelease) {
+        t->fault_point=StorageFaultPoint::None;
+        t->quarantine(FileCloseFailure);
+        try { prearm_incident_marker(core_->root,marker_path); }
+        catch (...) { /* durable .retiring witness remains as fallback */ }
+        throw std::runtime_error("injected final guard release interruption");
+    }
     // The SQLite connection is shut down and .incident removal is durable.
     // Retire the witness last. If its fsync fails, a stale witness may
     // require supervised recovery, but cannot make dirty data look clean.
@@ -442,17 +452,6 @@ void TenantRuntime::close_tenant(const TenantHandle& h) {
     try { sync_incident_dir(core_->root); }
     catch (...) { t->quarantine(FileCloseFailure); throw; }
     if(t->lock_fd>=0) {
-        // Failure immediately before releasing the final guard is handled
-        // while its flock is STILL held. Restore a durable supervisor marker
-        // so a later process cannot confuse the interrupted close with a
-        // clean handoff. This fault seam does not simulate ambiguous close(2).
-        if(t->fault_point==StorageFaultPoint::IncidentGuardRelease) {
-            t->fault_point=StorageFaultPoint::None;
-            t->quarantine(FileCloseFailure);
-            try { prearm_incident_marker(core_->root,marker_path); }
-            catch (...) { /* refuse; persistent recovery remains unverified */ }
-            throw std::runtime_error("injected final guard release interruption");
-        }
         // Now that the SQLite connection is closed and marker removal is
         // durable, the last flock holder may release singleton ownership.
         const int guard_fd=t->lock_fd;
