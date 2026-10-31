@@ -11,6 +11,8 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace ores::durable {
 
@@ -101,6 +103,8 @@ public:
     void close_tenant(const TenantHandle&); // leaves persisted queues for restart
     // Trusted test harness only: never expose to Oreslang guest code.
     void inject_fault_for_test(const TenantHandle&, StorageFaultPoint, int sqlite_code = SQLITE_IOERR);
+    // Host supervisor polls this outside noexcept teardown. Never a guest callback.
+    std::vector<std::pair<std::string, unsigned>> quarantined_tenants() const;
 
     Receipt enqueue(const TenantHandle&, const std::string& object_id,
                     const std::string& lock_id, const std::string& request_id,
