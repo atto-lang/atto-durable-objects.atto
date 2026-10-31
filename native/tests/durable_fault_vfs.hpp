@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstring>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -65,18 +66,23 @@ private:
                     int flags, int* out_flags) noexcept {
         auto* self = active_.load(std::memory_order_acquire);
         if (!self) return SQLITE_IOERR;
-        auto* w = cast(out);
+        auto* w = ::new (out) File{};
         w->real = reinterpret_cast<sqlite3_file*>(w->storage);
         w->owner = self;
         w->target = name && (flags & SQLITE_OPEN_WAL) != 0 &&
             std::strstr(name, self->target_.c_str()) != nullptr;
         const int result = self->original_->xOpen(self->original_, name, w->real, flags, out_flags);
-        if (result != SQLITE_OK) return result;
+        if (result != SQLITE_OK) { w->~File(); return result; }
         w->original = w->real->pMethods;
         w->base.pMethods = &methods();
         return SQLITE_OK;
     }
-    static int close(sqlite3_file* p) noexcept { auto* f = cast(p); return f->original->xClose(f->real); }
+    static int close(sqlite3_file* p) noexcept {
+        auto* f = cast(p);
+        const int rc = f->original->xClose(f->real);
+        f->~File();
+        return rc;
+    }
     static int read(sqlite3_file* p, void* dst, int n, sqlite3_int64 offset) noexcept {
         auto* f = cast(p); return f->original->xRead(f->real,dst,n,offset);
     }
