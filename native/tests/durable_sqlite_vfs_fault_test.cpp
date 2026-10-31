@@ -59,18 +59,35 @@ static void exercise(FaultVfs::Point fault) {
                     "quarantined tenant close unexpectedly succeeded");
         }
         {
-            // Restart with the stock VFS. The failed ACK must NOT be
-            // represented as a committed state change or invisible job.
+            // Restart with the stock VFS. Failed write/sync may leave an
+            // uncertain commit, but state+ACK must remain atomic.
             TenantRuntime restarted(root);
             auto a=restarted.open_tenant("A");
+            require(restarted.enqueue(a,"object","lock","req-A","payload").status==
+                    EnqueueStatus::Duplicate,"missing immutable request receipt");
             auto pending=restarted.try_claim(a,"lock");
-            require(bool(pending) && pending->fence()>old_fence,
-                    "recover pending job at strictly higher fence");
-            auto snapshot=restarted.read_state(*pending);
-            require(snapshot.version==0 && snapshot.bytes.empty(),
-                    "failed ACK must not publish object state");
-            restarted.complete(*pending,"recovered");
-            pending.reset();
+            if (pending) {
+                require(pending->fence()>old_fence,
+                        "pending job must recover at a higher fence");
+                auto snapshot=restarted.read_state(*pending);
+                require(snapshot.version==0 && snapshot.bytes.empty(),
+                        "state changed without atomic ACK");
+                restarted.complete(*pending,"recovered");
+                pending.reset();
+            } else {
+                // A failed fsync can leave the commit result ambiguous.
+                // If ACK is already visible, the state write MUST also be
+                // visible atomically; never assume a failed sync rolled back.
+                require(restarted.enqueue(a,"object","lock","probe","read").status==
+                        EnqueueStatus::Accepted,"probe admission");
+                auto probe=restarted.try_claim(a,"lock");
+                require(bool(probe),"probe queue missing");
+                const auto snapshot=restarted.read_state(*probe);
+                require(snapshot.version==1 && snapshot.bytes=="uncommitted",
+                        "ACK visible without its committed state");
+                restarted.complete(*probe,"uncommitted");
+                probe.reset();
+            }
             restarted.close_tenant(a);
             auto b=restarted.open_tenant("B");
             require(restarted.enqueue(b,"object","lock","req-B","payload").status==
