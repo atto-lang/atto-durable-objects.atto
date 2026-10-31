@@ -133,8 +133,13 @@ static void assert_other_process_cannot_open(const std::filesystem::path& root) 
             TenantRuntime contender(root);
             (void)contender.open_tenant("A");
             _exit(81); // second process incorrectly obtained tenant ownership
-        } catch (const std::exception&) {
-            _exit(0); // expected: singleton owner lock was not released
+        } catch (const std::logic_error& e) {
+            // Reject specifically on the POSIX singleton owner check, not
+            // an unrelated filesystem/SQLite failure that masks the bug.
+            _exit(std::string(e.what())=="tenant already has an active process owner"
+                      ? 0 : 82);
+        } catch (...) {
+            _exit(83);
         }
     }
     int status=0;
