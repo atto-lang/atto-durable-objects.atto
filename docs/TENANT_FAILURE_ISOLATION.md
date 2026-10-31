@@ -358,3 +358,38 @@ Source-hosted CTest/sanitizer runs still fail before any steps are recorded.
 No cross-organization private source mirror was created. Incident #22 and
 the other private-CI security authorization blockers remain open; the
 transfer/merge gate is still **HOLD**.
+
+
+## Preserving completed-job idempotency across damaged SQLite catalogs
+
+On a previously admitted version-1 tenant, the `CREATE TABLE IF NOT EXISTS`
+statements alone cannot safely restore a missing `dedupe` table: an ACKed
+job intentionally loses its queue row but must retain its historical receipt.
+Likewise, resetting/deleting `sqlite_sequence` for the AUTOINCREMENT `jobs`
+table can allow reuse of a completed job's sequence, and duplicated historical
+`dedupe.seq` values can alias two different requests.
+
+The startup transaction now **fails closed before schema mutation** when
+`user_version=1` does not have all three required tables, or when
+`user_version=0` is already nonempty (including leftover SQLite internal
+sequence tables). After loading the schema, it rejects malformed/duplicated
+`jobs` `sqlite_sequence` rows, sequence high-water values below live jobs or
+historical receipts, and multiple distinct receipts sharing the same
+historical sequence. No reset, automatic repair, or forced admission is
+attempted. Any rejection leaves the existing session incident marker in
+place for explicit supervised review.
+
+Nine `durable_persisted_fence_guard_test` regression cases were added for
+completed-job history: dropped dedupe, user-version reset, sequence rollback,
+sequence deletion, REAL/negative high-water, duplicate historical receipt,
+duplicate sequence rows, and removal of all user tables. These are **authored
+in the private source tree but not yet executed on its exact head**.
+
+A separate standalone SQLite C++ contract fixture (not the private runtime)
+was compiled and executed locally with GCC and Clang, with ASan+UBSan enabled:
+each of these nine synthetic history mutations was rejected (9/9 for each
+compiler, 18 successful cases total). This is a SQL-contract/sanitizer smoke
+test, **not** a full CTest/native/guest proof for PR #7. Exact-tree CI in the
+source organization remains blocked before runner execution. No private
+source was exported to another GitHub organization, pending independent
+resolution of the private-CI security incidents.
