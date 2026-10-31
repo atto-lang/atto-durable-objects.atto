@@ -63,6 +63,17 @@ int main() {
         rejects<std::logic_error>([&]{reopened.apply(a,2,"op3","balance","400","no");});
         rejects<std::logic_error>([&]{reopened.apply(b,2,"x","balance","1","1");});
     }
+    // A pre-hardening receipt has no verifiable request identity. Refuse
+    // startup instead of silently accepting a possibly conflicting replay.
+    {
+        sqlite3* db = nullptr;
+        assert(sqlite3_open_v2(file.c_str(), &db, SQLITE_OPEN_READWRITE, nullptr) == SQLITE_OK);
+        assert(sqlite3_exec(db,
+            "DELETE FROM dedup_requests WHERE tenant='tenant-A' AND op_key='op1'",
+            nullptr, nullptr, nullptr) == SQLITE_OK);
+        assert(sqlite3_close(db) == SQLITE_OK);
+        rejects<std::logic_error>([&]{SqliteDurableStore legacy(file);});
+    }
     std::remove((file+"-wal").c_str());
     std::remove((file+"-shm").c_str());
     std::remove(file.c_str());
