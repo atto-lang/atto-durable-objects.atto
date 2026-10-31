@@ -43,8 +43,20 @@ int main() {
                 ==EnqueueStatus::Accepted,"other tenant still progressing");
         host.retry(*lease);
         lease.reset();
+        // Simulate a destroy-time interruption after confirmed store close.
+        // A retry must skip store shutdown, not use a retired SQLite ticket.
+        host.inject_vm_destroy_failure_once_for_test();
+        require(rejects([&] { host.close_tenant(a); }),
+                "injected VM destroy interruption must be reported");
+        require(rejects([&] { host.enqueue(a,"counter","lock-a","req-3","x"); }),
+                "retired store must reject admission");
+        require(rejects([&] { (void)host.pending(a,"lock-a"); }),
+                "retired store must reject reads");
         host.close_tenant(a);
         require(rejects([&] { (void)host.snapshot(a); }),"closed ticket must be stale");
+        // No stale tenant registration or VM generation may survive.
+        auto reopened=host.open_tenant("tenant-a",4096,4);
+        host.close_tenant(reopened);
         host.close_tenant(b);
 
         // Force store-open failure AFTER isolate creation. The VM registration
