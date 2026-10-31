@@ -84,8 +84,8 @@ static void retry_fault(const char* label, StorageFaultPoint point, int sqlite_c
     }
     std::filesystem::remove_all(root);
 }
-static void ack_fault() {
-    const auto root=root_for("ack");
+static void ack_fault(const char* label, StorageFaultPoint point, int sqlite_code) {
+    const auto root=root_for(label);
     std::int64_t fence=0;
     {
         TenantRuntime runtime(root);
@@ -97,7 +97,7 @@ static void ack_fault() {
         auto healthy=runtime.try_claim(b,"lock");
         assert(claim && healthy);
         fence=claim->fence();
-        runtime.inject_fault_for_test(a,StorageFaultPoint::AckBeforeCommit,SQLITE_FULL);
+        runtime.inject_fault_for_test(a,point,sqlite_code);
         assert(rejects([&] { runtime.complete(*claim,"must-not-be-silent"); }));
         assert((a.incident_flags() & AckStorageFailure)!=0);
         const auto incidents=runtime.quarantined_tenants();
@@ -219,7 +219,8 @@ int main() {
     retry_fault("retry-full",StorageFaultPoint::RetryBeforeCommit,SQLITE_FULL,RetryStorageFailure);
     retry_fault("rollback",StorageFaultPoint::Rollback,SQLITE_IOERR,
                 RetryStorageFailure | RollbackStorageFailure);
-    ack_fault();
+    ack_fault("ack-before-write-ioerr",StorageFaultPoint::AckBeforeWrite,SQLITE_IOERR);
+    ack_fault("ack-before-commit-full",StorageFaultPoint::AckBeforeCommit,SQLITE_FULL);
     dispose_fault("sqlite-close",StorageFaultPoint::SqliteClose,SqliteCloseFailure);
     dispose_fault("flock-unlock",StorageFaultPoint::LockUnlock,LockUnlockFailure);
     dispose_fault("fd-close",StorageFaultPoint::FileClose,FileCloseFailure);
