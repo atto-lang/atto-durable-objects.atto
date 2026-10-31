@@ -150,6 +150,114 @@ int main() {
             "INSERT INTO dedupe(request_id,seq,object_id,lock_id,payload) "
             "SELECT 'alias',seq,object_id,lock_id,payload FROM dedupe LIMIT 1");
 
+        // On restart, current Limits also apply to previously persisted
+        // records. Raising limits during a previous session must not allow
+        // a subsequent stricter tenant to admit too much state/backlog.
+        const auto reject_tightened_quota = [&](const std::string& name,
+                const Limits& limits, bool two_jobs, bool completed,
+                const std::string& expected_error) {
+            const auto isolated = root / ("quota-" + name);
+            {
+                TenantRuntime seeded(isolated);
+                const auto tenant = seeded.open_tenant("t");
+                assert(seeded.enqueue(tenant,"obj","lock","one","data").status
+                       == EnqueueStatus::Accepted);
+                if (two_jobs)
+                    assert(seeded.enqueue(tenant,"obj","lock","two","more").status
+                           == EnqueueStatus::Accepted);
+                if (completed) {
+                    auto lease = seeded.try_claim(tenant,"lock");
+                    assert(lease.has_value());
+                    seeded.complete(*lease,"done");
+                    lease.reset();
+                }
+                seeded.close_tenant(tenant);
+            }
+            TenantRuntime restarted_case(isolated,limits);
+            bool rejected = false;
+            try { (void)restarted_case.open_tenant("t"); }
+            catch (const std::logic_error& ex) {
+                rejected = std::string(ex.what()).find(expected_error)
+                           != std::string::npos;
+            }
+            assert(rejected);
+        };
+        {
+            Limits limits;
+            limits.max_jobs_per_tenant = 1;
+            reject_tightened_quota("tenant-backlog",limits,true,false,
+                                   "job count exceeds tenant quota");
+        }
+        {
+            Limits limits;
+            limits.max_jobs_per_lock = 1;
+            reject_tightened_quota("lock-backlog",limits,true,false,
+                                   "lock backlog exceeds quota");
+        }
+        {
+            Limits limits;
+            limits.max_dedupe_keys = 1;
+            reject_tightened_quota("dedupe-history",limits,true,false,
+                                   "dedupe keys exceed quota");
+        }
+        {
+            Limits limits;
+            limits.max_state_bytes = 1;
+            reject_tightened_quota("object-state",limits,false,true,
+                                   "state exceeds byte quota");
+        }
+        {
+            Limits limits;
+            limits.max_request_bytes = 1;
+            reject_tightened_quota("queued-request",limits,false,false,
+                                   "request exceeds byte quota");
+            reject_tightened_quota("completed-request",limits,false,true,
+                                   "request exceeds byte quota");
+        }
+        // A too-small quota must refuse an abandoned claim before modifying
+        // its fence or status; a failed open cannot partially requeue history.
+        {
+            const auto isolated = root / "quota-atomic-recovery";
+            {
+                TenantRuntime seeded(isolated);
+                const auto tenant = seeded.open_tenant("t");
+                assert(seeded.enqueue(tenant,"obj","lock","one","data").status
+                       == EnqueueStatus::Accepted);
+                assert(seeded.enqueue(tenant,"obj","lock","two","data").status
+                       == EnqueueStatus::Accepted);
+                seeded.close_tenant(tenant);
+            }
+            const auto db_file = isolated / "tenant-74.sqlite";
+            sqlite3* db = nullptr;
+            assert(sqlite3_open_v2(db_file.c_str(), &db, SQLITE_OPEN_READWRITE,
+                                   nullptr) == SQLITE_OK);
+            assert(sqlite3_exec(db,
+                "UPDATE jobs SET status=1,fence=7 WHERE request_id='one'",
+                nullptr,nullptr,nullptr) == SQLITE_OK);
+            assert(sqlite3_close(db) == SQLITE_OK);
+            Limits limits;
+            limits.max_jobs_per_tenant = 1;
+            TenantRuntime restarted_case(isolated,limits);
+            bool rejected = false;
+            try { (void)restarted_case.open_tenant("t"); }
+            catch (const std::logic_error& ex) {
+                rejected = std::string(ex.what()).find(
+                    "job count exceeds tenant quota") != std::string::npos;
+            }
+            assert(rejected);
+            assert(sqlite3_open_v2(db_file.c_str(), &db, SQLITE_OPEN_READWRITE,
+                                   nullptr) == SQLITE_OK);
+            sqlite3_stmt* query = nullptr;
+            assert(sqlite3_prepare_v2(db,
+                "SELECT status,fence FROM jobs WHERE request_id='one'",
+                -1,&query,nullptr) == SQLITE_OK);
+            assert(sqlite3_step(query) == SQLITE_ROW);
+            assert(sqlite3_column_int(query,0) == 1);
+            assert(sqlite3_column_int64(query,1) == 7);
+            assert(sqlite3_finalize(query) == SQLITE_OK);
+            assert(sqlite3_close(db) == SQLITE_OK);
+        }
+
         // A damaged second receipt must prevent recovery from advancing a
         // different in-flight row. Validate everything before any requeue.
         {
