@@ -1,7 +1,9 @@
 #pragma once
 
 #include <sqlite3.h>
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -63,12 +65,29 @@ public:
                  "PRIMARY KEY(tenant,space,object_id,op_key),"
                  "FOREIGN KEY(tenant,space,object_id) REFERENCES objects"
                  "(tenant,space,object_id)) WITHOUT ROWID");
+            // Keep the immutable request identity separate from the response receipt.
+            // Legacy receipts cannot be reconstructed from the reply alone.
+            exec("CREATE TABLE IF NOT EXISTS dedup_requests("
+                 "tenant TEXT NOT NULL, space TEXT NOT NULL, object_id TEXT NOT NULL,"
+                 "op_key TEXT NOT NULL, data_key TEXT NOT NULL, value BLOB NOT NULL,"
+                 "alarm_name TEXT, alarm_due_ms INTEGER,"
+                 "PRIMARY KEY(tenant,space,object_id,op_key),"
+                 "FOREIGN KEY(tenant,space,object_id,op_key) REFERENCES dedup"
+                 "(tenant,space,object_id,op_key) ON DELETE CASCADE) WITHOUT ROWID");
             exec("CREATE TABLE IF NOT EXISTS alarms("
                  "tenant TEXT NOT NULL, space TEXT NOT NULL, object_id TEXT NOT NULL,"
                  "name TEXT NOT NULL, due_ms INTEGER NOT NULL CHECK(due_ms>=0),"
                  "PRIMARY KEY(tenant,space,object_id,name),"
                  "FOREIGN KEY(tenant,space,object_id) REFERENCES objects"
                  "(tenant,space,object_id)) WITHOUT ROWID");
+            // No silent replay of receipts written by an older, unverifiable
+            // schema. Operators must migrate with independent request evidence.
+            Statement legacy(db_, "SELECT COUNT(*) FROM dedup AS d LEFT JOIN dedup_requests AS r "
+                "ON r.tenant=d.tenant AND r.space=d.space AND "
+                "r.object_id=d.object_id AND r.op_key=d.op_key "
+                "WHERE r.op_key IS NULL");
+            if (sqlite3_step(legacy.p) != SQLITE_ROW || sqlite3_column_int64(legacy.p, 0) != 0)
+                throw std::logic_error("legacy durable dedup receipts lack request identity");
         } catch (...) {
             sqlite3_close(db_);
             db_ = nullptr;
@@ -128,6 +147,20 @@ public:
             bind_key(read, key); bind_text(read, 4, op_key);
             const int rc = sqlite3_step(read.p);
             if (rc == SQLITE_ROW) {
+                Statement original(db_, "SELECT data_key,value,alarm_name,alarm_due_ms "
+                    "FROM dedup_requests WHERE tenant=? AND space=? AND object_id=? AND op_key=?");
+                bind_key(original, key); bind_text(original, 4, op_key);
+                const int proof_rc = sqlite3_step(original.p);
+                if (proof_rc != SQLITE_ROW ||
+                    !column_matches(original.p, 0, data_key, SQLITE_TEXT) ||
+                    !column_matches(original.p, 1, value, SQLITE_BLOB) ||
+                    (alarm ?
+                        (!column_matches(original.p, 2, alarm->name, SQLITE_TEXT) ||
+                         sqlite3_column_type(original.p, 3) != SQLITE_INTEGER ||
+                         sqlite3_column_int64(original.p, 3) != alarm->due_unix_ms) :
+                        (sqlite3_column_type(original.p, 2) != SQLITE_NULL ||
+                         sqlite3_column_type(original.p, 3) != SQLITE_NULL)))
+                    throw std::logic_error("idempotency key reused with different request");
                 const auto* ptr = static_cast<const char*>(sqlite3_column_blob(read.p, 0));
                 const int size = sqlite3_column_bytes(read.p, 0);
                 std::string stored(ptr ? ptr : "", static_cast<std::size_t>(size));
@@ -146,6 +179,22 @@ public:
             Statement record(db_, "INSERT INTO dedup(tenant,space,object_id,op_key,reply) VALUES(?,?,?,?,?)");
             bind_key(record, key); bind_text(record, 4, op_key); bind_blob(record, 5, reply);
             step_done(record);
+        }
+        {
+            Statement identity(db_, "INSERT INTO dedup_requests("
+                "tenant,space,object_id,op_key,data_key,value,alarm_name,alarm_due_ms) "
+                "VALUES(?,?,?,?,?,?,?,?)");
+            bind_key(identity, key); bind_text(identity, 4, op_key);
+            bind_text(identity, 5, data_key); bind_blob(identity, 6, value);
+            if (alarm) {
+                bind_text(identity, 7, alarm->name);
+                bind_i64(identity, 8, alarm->due_unix_ms);
+            } else {
+                if (sqlite3_bind_null(identity.p, 7) != SQLITE_OK ||
+                    sqlite3_bind_null(identity.p, 8) != SQLITE_OK)
+                    throw std::runtime_error("sqlite bind_null failed");
+            }
+            step_done(identity);
         }
         if (alarm) {
             Statement schedule(db_, "INSERT INTO alarms(tenant,space,object_id,name,due_ms) VALUES(?,?,?,?,?) "
@@ -208,8 +257,16 @@ private:
         bool committed_ = false;
     };
     static void check_label(std::string_view v) {
-        if (v.empty() || v.size() > MAX_NAME)
-            throw std::invalid_argument("empty or overlong key");
+        if (v.empty() || v.size() > MAX_NAME ||
+            std::any_of(v.begin(), v.end(), [](unsigned char c) { return c < 0x20 || c == 0x7f; }))
+            throw std::invalid_argument("empty, invalid or overlong key");
+    }
+    static bool column_matches(sqlite3_stmt* stmt, int col, std::string_view expected, int type) {
+        if (sqlite3_column_type(stmt, col) != type) return false;
+        const int length = sqlite3_column_bytes(stmt, col);
+        if (length < 0 || static_cast<std::size_t>(length) != expected.size()) return false;
+        const void* bytes = sqlite3_column_blob(stmt, col);
+        return length == 0 || (bytes && std::memcmp(bytes, expected.data(), expected.size()) == 0);
     }
     static void check(const ObjectKey& key) {
         check_label(key.tenant); check_label(key.space); check_label(key.object);
