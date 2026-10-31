@@ -123,25 +123,17 @@ static void ack_fault(const char* label, StorageFaultPoint point, int sqlite_cod
     }
     std::filesystem::remove_all(root);
 }
-// Process-isolation probe: a second process must not acquire the lock while
-// the first process holds a quarantined tenant. Run in the single-threaded
-// disposal fixture. The child must _exit, never unwind inherited SQLite state.
+// The contender must exec a fresh process image. A fork-only child inherits
+// the parent's locked open-file-description; that could make this test pass
+// for the wrong reason. The lock fd is O_CLOEXEC, so exec drops that copy.
 static void assert_other_process_cannot_open(const std::filesystem::path& root) {
     const pid_t child=::fork();
     if (child<0) throw std::runtime_error("fork competing-owner probe failed");
     if (child==0) {
-        try {
-            TenantRuntime contender(root);
-            (void)contender.open_tenant("A");
-            _exit(81); // second process incorrectly obtained tenant ownership
-        } catch (const std::logic_error& e) {
-            // Reject specifically on the POSIX singleton owner check, not
-            // an unrelated filesystem/SQLite failure that masks the bug.
-            _exit(std::string(e.what())=="tenant already has an active process owner"
-                      ? 0 : 82);
-        } catch (...) {
-            _exit(83);
-        }
+        const auto path=root.string();
+        ::execl("/proc/self/exe","durable_tenant_fault_quarantine_test",
+                "--probe-singleton-lock",path.c_str(),static_cast<char*>(nullptr));
+        _exit(84); // exec failed: never count this as a lock refusal
     }
     int status=0;
     if (::waitpid(child,&status,0)!=child)
@@ -334,7 +326,21 @@ static void read_failure_quarantines_tenant(const char* label, StorageFaultPoint
     std::filesystem::remove_all(root);
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc==3 && std::string(argv[1])=="--probe-singleton-lock") {
+        // This is a new process after exec, with no inherited tenant lock fd.
+        try {
+            TenantRuntime contender(argv[2]);
+            (void)contender.open_tenant("A");
+            return 81; // lock lost: a second owner was incorrectly admitted
+        } catch (const std::logic_error& e) {
+            return std::string(e.what())=="tenant already has an active process owner"
+                      ? 0 : 82; // unrelated validation error is not a pass
+        } catch (...) {
+            return 83;
+        }
+    }
+    if (argc!=1) return 85;
     retry_fault("retry-ioerr",StorageFaultPoint::RetryBeforeWrite,SQLITE_IOERR,RetryStorageFailure);
     retry_fault("retry-full",StorageFaultPoint::RetryBeforeCommit,SQLITE_FULL,RetryStorageFailure);
     retry_fault("rollback",StorageFaultPoint::Rollback,SQLITE_IOERR,
