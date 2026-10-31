@@ -23,6 +23,15 @@ mkdir -p "$report"; report="$(cd "$report" && pwd -P)"
 cat "$report/provenance.txt"
 finish() { rc=$?; echo "EXIT_STATUS=$rc" >> "$report/provenance.txt"; echo "UTC_FINISHED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$report/provenance.txt"; if ((rc == 0)); then echo passed > "$report/overall-status.txt"; else echo failed > "$report/overall-status.txt"; fi; echo "Reports at $report"; }
 trap finish EXIT
+# Every CTest configuration must discover the complete native regression set.
+# CTest may otherwise return success even when a build registers zero tests.
+expected_tests=(
+  sqlite_durable_storage_test
+  durable_isolate_queues
+  durable_persisted_fence_guard
+  durable_tenant_fault_quarantine
+  durable_sqlite_vfs_fault
+)
 run_ctest() {
   local tag="$1" compiler="$2" type="$3" sanitizer="$4"
   local flags='-Wall -Wextra -Wpedantic -Werror -UNDEBUG' link=''
@@ -36,6 +45,23 @@ run_ctest() {
   echo "START $tag" | tee -a "$report/steps.txt"
   cmake -S "$root" -B "$build" -DCMAKE_BUILD_TYPE="$type" -DBUILD_TESTING=ON -DCMAKE_CXX_COMPILER="$compiler" "-DCMAKE_CXX_FLAGS=$flags" "-DCMAKE_EXE_LINKER_FLAGS=$link" > "$report/$tag.configure.log" 2>&1 || { cat "$report/$tag.configure.log"; return 1; }
   cmake --build "$build" --parallel 2 > "$report/$tag.build.log" 2>&1 || { cat "$report/$tag.build.log"; return 1; }
+  ctest --test-dir "$build" --show-only > "$report/$tag.discovery.log" 2>&1 || { cat "$report/$tag.discovery.log"; return 1; }
+  local count expected
+  count="$(grep -Ec '^[[:space:]]*Test[[:space:]]*#[0-9]+:' "$report/$tag.discovery.log" || true)"
+  if [[ "$count" -ne "${#expected_tests[@]}" ]] ||
+     ! grep -Eq "Total Tests: ${#expected_tests[@]}$" "$report/$tag.discovery.log"; then
+    echo "CTest manifest mismatch ($tag): discovered $count, expected ${#expected_tests[@]}" >&2
+    cat "$report/$tag.discovery.log" >&2
+    return 1
+  fi
+  for expected in "${expected_tests[@]}"; do
+    if ! grep -Eq "^[[:space:]]*Test[[:space:]]*#[0-9]+:[[:space:]]+${expected}$" "$report/$tag.discovery.log"; then
+      echo "CTest missing required regression ($tag): $expected" >&2
+      cat "$report/$tag.discovery.log" >&2
+      return 1
+    fi
+  done
+  echo "DISCOVERED $tag TESTS=$count" | tee -a "$report/steps.txt"
   (export ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 TSAN_OPTIONS=halt_on_error=1; ctest --test-dir "$build" --output-on-failure --verbose) > "$report/$tag.ctest.log" 2>&1 || { cat "$report/$tag.ctest.log"; return 1; }
   echo "PASS $tag HEAD=$actual" | tee -a "$report/steps.txt"
 }
