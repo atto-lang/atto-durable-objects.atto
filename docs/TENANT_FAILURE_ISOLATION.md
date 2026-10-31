@@ -20,7 +20,7 @@ The new native CTest covers **synthetic, synchronous call-boundary failures**, n
 - Simulated SQLite close, POSIX flock unlock and fd-close errors during explicit host disposal.
 - Healthy-tenant progress on another thread; fail-closed operations on the quarantined tenant; restart to pending with a strictly greater fence; and shutdown with an outstanding Lease.
 
-The existing process-kill-before-ACK test lives in `durable_isolate_queues_test.cpp` and must be executed on the **same exact PR head**, with assert checks enabled in both Debug and Release.
+The new test suite forks a native child and calls `_exit(42)` while holding an unacknowledged claim; the parent verifies a pending recovery with a strictly greater fence. This must be **executed on the exact PR head**, with assertions enabled in both Debug and Release. The separate legacy `--crash-child` mode is not itself proof unless a parent launches it.
 
 ## Remaining mandatory gates
 
