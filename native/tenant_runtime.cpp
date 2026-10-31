@@ -300,6 +300,15 @@ void TenantRuntime::close_tenant(const TenantHandle& h) {
     t->accepting=false;
     core_->tenants.erase(t->id);
 }
+std::vector<std::pair<std::string, unsigned>> TenantRuntime::quarantined_tenants() const {
+    std::lock_guard<std::mutex> lock(core_->mu);
+    std::vector<std::pair<std::string, unsigned>> result;
+    for (const auto& entry : core_->tenants) {
+        const unsigned flags = entry.second->incidents.load(std::memory_order_relaxed);
+        if (flags != NoIncident) result.emplace_back(entry.first, flags);
+    }
+    return result;
+}
 void TenantRuntime::inject_fault_for_test(
         const TenantHandle& h, StorageFaultPoint point, int sqlite_code) {
     if (sqlite_code != SQLITE_IOERR && sqlite_code != SQLITE_FULL &&
