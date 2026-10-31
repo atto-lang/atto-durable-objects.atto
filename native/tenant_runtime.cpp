@@ -118,7 +118,8 @@ void prearm_incident_marker(const std::filesystem::path& root, const std::string
     sync_incident_dir(root); // mark is durable BEFORE SQLite admission
 }
 void require_incident_marker(const std::string& path) {
-    const int fd=::open(path.c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW);
+    // Never block on a forged FIFO or device while validating a marker.
+    const int fd=::open(path.c_str(),O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_NOFOLLOW);
     if(fd<0) throw std::logic_error("supervisor recovery requires existing incident");
     struct stat st={};
     const bool valid=::fstat(fd,&st)==0 && S_ISREG(st.st_mode)
