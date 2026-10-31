@@ -455,6 +455,10 @@ int main(int argc, char** argv) {
     // Failure AFTER unlink: the runtime must re-arm the marker while the
     // duplicate owner flock still blocks all competing processes.
     dispose_fault("incident-dir-sync",StorageFaultPoint::IncidentDirSync,FileCloseFailure);
+    // Failure at the final guard-release boundary: marker must be durably
+    // re-armed WHILE the same open-file-description still owns the flock.
+    // A separate exec'd process must observe lock refusal; tenant B works.
+    dispose_fault("incident-guard-release",StorageFaultPoint::IncidentGuardRelease,FileCloseFailure);
     shutdown_with_outstanding_lease();
     process_kill_before_ack();
     admission_or_claim_commit_failure("enqueue-commit",StorageFaultPoint::EnqueueBeforeCommit,
