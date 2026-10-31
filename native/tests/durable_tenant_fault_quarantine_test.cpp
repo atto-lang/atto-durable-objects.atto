@@ -152,6 +152,9 @@ static void dispose_fault(const char* label, StorageFaultPoint point, unsigned b
         runtime.inject_fault_for_test(a,point);
         assert(rejects([&] { runtime.close_tenant(a); }));
         assert((a.incident_flags() & bit)!=0);
+        // A retired marker must never disappear on a rejected disposal.
+        assert(std::filesystem::is_regular_file(
+            root/"tenant-41.sqlite.incident"));
         const auto incidents=runtime.quarantined_tenants();
         assert(incidents.size()==1 && incidents[0].first=="A");
         assert((incidents[0].second & bit)!=0);
@@ -435,6 +438,9 @@ int main(int argc, char** argv) {
     // Simulated interruption after primary fd close but before marker unlink.
     // A duplicate must continue to own the exact same flock description.
     dispose_fault("incident-retire",StorageFaultPoint::IncidentUnlink,FileCloseFailure);
+    // Failure AFTER unlink: the runtime must re-arm the marker while the
+    // duplicate owner flock still blocks all competing processes.
+    dispose_fault("incident-dir-sync",StorageFaultPoint::IncidentDirSync,FileCloseFailure);
     shutdown_with_outstanding_lease();
     process_kill_before_ack();
     admission_or_claim_commit_failure("enqueue-commit",StorageFaultPoint::EnqueueBeforeCommit,
