@@ -187,3 +187,27 @@ remain unnecessarily held after clean retirement.
 This test is host POSIX/SQLite-only and remains unexecuted until the
 exact-head native CTest gate runs; a standalone POSIX reproducer is not
 a runtime receipt or Oreslang guest-isolation evidence.
+
+## Incident marker validation and failed retirement sync (2026-10-31)
+
+The incident-marker reader now uses `O_NONBLOCK` with `O_NOFOLLOW`, then
+`fstat` checks that the entry is a private, owner-owned, zero-length regular
+file. A forged FIFO must be rejected without blocking, and symlinks are not
+followed. The lifecycle regression checks clean close, unclean destructor
+exit, explicit recovery, missing database, forged symlink, and FIFO marker.
+
+If marker unlink succeeds but the parent-directory fsync fails, the runtime
+retains the duplicate singleton-lock guard, quarantines the tenant, and
+attempts to recreate and fsync the incident marker before unwinding. A new
+`IncidentDirSync` test seam exercises this exact failure interval, including
+another process's denied owner claim, healthy-tenant progress, and subsequent
+supervisor recovery. This is a compensating **best-effort** action: if the
+filesystem also rejects the repair, durable incident persistence cannot be
+proven, and promotion must remain blocked.
+
+The final owner-guard close occurs *after* marker retirement. POSIX
+`close(2)` failures can be ambiguous; there is no proof here that a failure
+after a successfully fsynced unlink is durably recorded across process death.
+This still requires a reviewed lifecycle protocol and executable fault
+receipts. Do not treat source-only tests, POSIX standalone probes, or zero-step
+GitHub Actions as completed native integration verification.
