@@ -400,6 +400,17 @@ void TenantRuntime::close_tenant(const TenantHandle& h) {
         throw;
     }
     if(t->lock_fd>=0) {
+        // Failure immediately before releasing the final guard is handled
+        // while its flock is STILL held. Restore a durable supervisor marker
+        // so a later process cannot confuse the interrupted close with a
+        // clean handoff. This fault seam does not simulate ambiguous close(2).
+        if(t->fault_point==StorageFaultPoint::IncidentGuardRelease) {
+            t->fault_point=StorageFaultPoint::None;
+            t->quarantine(FileCloseFailure);
+            try { prearm_incident_marker(core_->root,marker_path); }
+            catch (...) { /* refuse; persistent recovery remains unverified */ }
+            throw std::runtime_error("injected final guard release interruption");
+        }
         // Now that the SQLite connection is closed and marker removal is
         // durable, the last flock holder may release singleton ownership.
         const int guard_fd=t->lock_fd;
