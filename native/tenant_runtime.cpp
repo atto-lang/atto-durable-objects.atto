@@ -136,7 +136,7 @@ void require_incident_marker(const std::string& path) {
     if(!valid||closed!=0) throw std::logic_error("unsafe or malformed incident marker");
 }
 void schema(sqlite3* db, std::atomic<unsigned>* incidents, StorageFaultPoint* pending_fault,
-            std::size_t max_lock_queues) {
+            const Limits& limits) {
     // A successful PRAGMA statement is not proof that SQLite entered WAL.
     // Refuse an engine silently operating under another journal mode.
     {
@@ -234,11 +234,38 @@ void schema(sqlite3* db, std::atomic<unsigned>* incidents, StorageFaultPoint* pe
                   "GROUP BY seq HAVING COUNT(*)>1)") != 0)
         throw std::runtime_error("two durable receipts alias one historical sequence");
 
+    // Admission limits also govern persisted data. Without this guard, a
+    // restart with tightened quotas can restore unbounded host-side buffers
+    // and queues that new enqueue/complete operations could never create.
+    // Validate before the abandoned-lease requeue transaction commits.
+    if (static_cast<std::uint64_t>(
+            scalar(db,"SELECT COUNT(*) FROM jobs")) > limits.max_jobs_per_tenant)
+        throw std::logic_error("persisted durable job count exceeds tenant quota");
+    if (static_cast<std::uint64_t>(
+            scalar(db,"SELECT COALESCE(MAX(n),0) FROM "
+                      "(SELECT COUNT(*) AS n FROM jobs GROUP BY lock_id)")) >
+            limits.max_jobs_per_lock)
+        throw std::logic_error("persisted durable lock backlog exceeds quota");
+    if (static_cast<std::uint64_t>(
+            scalar(db,"SELECT COUNT(*) FROM dedupe")) > limits.max_dedupe_keys)
+        throw std::logic_error("persisted durable dedupe keys exceed quota");
+    if (static_cast<std::uint64_t>(
+            scalar(db,"SELECT COALESCE(MAX(length(state)),0) FROM objects")) >
+            limits.max_state_bytes)
+        throw std::logic_error("persisted durable state exceeds byte quota");
+    if (static_cast<std::uint64_t>(
+            scalar(db,"SELECT COALESCE(MAX(length(payload)),0) FROM jobs")) >
+            limits.max_request_bytes ||
+        static_cast<std::uint64_t>(
+            scalar(db,"SELECT COALESCE(MAX(length(payload)),0) FROM dedupe")) >
+            limits.max_request_bytes)
+        throw std::logic_error("persisted durable request exceeds byte quota");
+
     // Refuse a persisted tenant that already exceeds the configured isolate
     // lock-queue budget BEFORE requeueing in-flight jobs or advancing fences.
     // The later in-memory index check remains defense in depth.
     if (static_cast<std::uint64_t>(
-            scalar(db,"SELECT COUNT(DISTINCT lock_id) FROM objects")) > max_lock_queues)
+            scalar(db,"SELECT COUNT(DISTINCT lock_id) FROM objects")) > limits.max_lock_queues)
         throw std::logic_error("persisted lock queues exceed tenant quota");
     // Recovery must not overflow the persistent fencing counter. SQLite can
     // promote an overflowing INTEGER expression to REAL; such a fence would
@@ -420,7 +447,7 @@ TenantRuntime::TenantHandle TenantRuntime::open_impl(const std::string& id,
             throw std::runtime_error("supervised recovery refused SQLite integrity check");
     }
     schema(t->db, &t->incidents, &t->fault_point,
-           core_->limits.max_lock_queues);
+           core_->limits);
     { Statement q(t->db,"SELECT DISTINCT lock_id FROM objects");
       while(q.step()==SQLITE_ROW) t->active.emplace(q.str(0),0); }
     if (t->active.size()>core_->limits.max_lock_queues)
