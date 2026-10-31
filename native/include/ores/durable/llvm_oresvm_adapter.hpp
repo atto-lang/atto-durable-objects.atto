@@ -7,6 +7,7 @@
 #include "oreslang/runtime/OresVM.hpp"
 
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -52,16 +53,42 @@ public:
         cfg.max_actors=max_actors;
         cfg.mode=oreslang::runtime::IsolateMode::TrustedInProcess;
         auto isolate=vm_.create_isolate(std::move(cfg));
-        vm_.start(isolate);
+        std::optional<TenantRuntime::TenantHandle> store;
         try {
-            auto store=queues_.open_tenant(id);
-            auto tenant=std::make_shared<Tenant>(id,std::move(isolate),std::move(store));
-            tenants_.emplace(id,tenant);
-            return Handle(tenant);
+            // Start belongs inside the cleanup region: a failed start must
+            // not leave a created isolate permanently occupying the tenant ID.
+            vm_.start(isolate);
+            store.emplace(queues_.open_tenant(id));
+            // These handles are weak, copyable tickets. Keep the originals
+            // intact until insertion succeeds so rollback never uses a
+            // moved-from VM or durable-store ticket.
+            auto tenant=std::make_shared<Tenant>(id,isolate,*store);
+            const auto [it, inserted]=tenants_.emplace(id,tenant);
+            if (!inserted) throw std::logic_error("duplicate durable VM tenant");
+            return Handle(it->second);
         } catch (...) {
-            vm_.begin_shutdown(isolate);
-            vm_.complete_shutdown(isolate);
-            vm_.destroy(isolate);
+            // No guest work or durable lease can have been admitted yet.
+            // Both registries must be cleaned up, independently. If cleanup
+            // fails, the host must treat the tenant as unavailable; never
+            // report a successful open or reuse a stale ticket.
+            bool cleanup_ok=true;
+            if (store) {
+                try { queues_.close_tenant(*store); }
+                catch (...) { cleanup_ok=false; }
+            }
+            try {
+                auto phase=vm_.snapshot(isolate).phase;
+                if (phase==oreslang::runtime::IsolatePhase::Created ||
+                    phase==oreslang::runtime::IsolatePhase::Running)
+                    vm_.begin_shutdown(isolate);
+                phase=vm_.snapshot(isolate).phase;
+                if (phase==oreslang::runtime::IsolatePhase::Quiescing)
+                    vm_.complete_shutdown(isolate);
+                vm_.destroy(isolate);
+            } catch (...) { cleanup_ok=false; }
+            if (!cleanup_ok)
+                throw std::runtime_error(
+                    "durable tenant activation failed and cleanup was incomplete: "+id);
             throw;
         }
     }
@@ -71,12 +98,15 @@ public:
                     const std::string& payload) {
         std::lock_guard<std::mutex> guard(mu_);
         auto t=checked(h);
+        require_running(*t);
         return queues_.enqueue(t->store,object,lock_id,request_id,payload);
     }
     std::optional<TenantRuntime::Lease> try_claim(const Handle& h,
                                                    const std::string& lock_id) {
         std::lock_guard<std::mutex> guard(mu_);
-        return queues_.try_claim(checked(h)->store,lock_id);
+        auto t=checked(h);
+        require_running(*t);
+        return queues_.try_claim(t->store,lock_id);
     }
     StateSnapshot read_state(const TenantRuntime::Lease& lease) const {
         return queues_.read_state(lease);
@@ -96,13 +126,27 @@ public:
     void close_tenant(const Handle& h) {
         std::lock_guard<std::mutex> guard(mu_);
         auto t=checked(h);
-        queues_.close_tenant(t->store); // fails if any active durable lease
-        vm_.begin_shutdown(t->vm);
-        vm_.complete_shutdown(t->vm); // fails on actor/guest execution pins
+        // Close guest admission and physically drain actor/guest pins BEFORE
+        // storage retirement. A failure leaves the tenant registered and
+        // non-running, so a later call can finish shutdown safely.
+        auto phase=vm_.snapshot(t->vm).phase;
+        if (phase==oreslang::runtime::IsolatePhase::Created ||
+            phase==oreslang::runtime::IsolatePhase::Running)
+            vm_.begin_shutdown(t->vm);
+        phase=vm_.snapshot(t->vm).phase;
+        if (phase==oreslang::runtime::IsolatePhase::Quiescing)
+            vm_.complete_shutdown(t->vm); // rejects live actor/guest pins
+        if (vm_.snapshot(t->vm).phase!=oreslang::runtime::IsolatePhase::Stopped)
+            throw std::logic_error("durable VM isolate did not stop");
+        queues_.close_tenant(t->store); // rejects live durable leases
         vm_.destroy(t->vm);
         tenants_.erase(t->id);
     }
 private:
+    void require_running(const Tenant& t) const {
+        if (vm_.snapshot(t.vm).phase!=oreslang::runtime::IsolatePhase::Running)
+            throw std::logic_error("durable VM isolate is shutting down");
+    }
     std::shared_ptr<Tenant> checked(const Handle& h) const {
         auto t=h.tenant_.lock();
         if(!t) throw std::logic_error("expired LLVM durable isolate ticket");
