@@ -370,8 +370,22 @@ void TenantRuntime::close_tenant(const TenantHandle& h) {
         t->quarantine(FileCloseFailure);
         throw std::system_error(errno,std::generic_category(),"incident marker unlink");
     }
-    try { sync_incident_dir(core_->root); }
-    catch (...) { t->quarantine(FileCloseFailure); throw; }
+    try {
+        if(t->fault_point==StorageFaultPoint::IncidentDirSync) {
+            t->fault_point=StorageFaultPoint::None;
+            throw std::runtime_error("injected incident directory fsync failure");
+        }
+        sync_incident_dir(core_->root);
+    } catch (...) {
+        // The last flock holder is still live. Before unwinding, restore
+        // the persistent incident marker if the unlink cannot be certified.
+        // A real filesystem fsync failure may also prevent durable repair:
+        // quarantine and surface the error; never call this a clean close.
+        t->quarantine(FileCloseFailure);
+        try { prearm_incident_marker(core_->root,marker_path); }
+        catch (...) { /* original error propagates; durability is unverified */ }
+        throw;
+    }
     if(t->lock_fd>=0) {
         // Now that the SQLite connection is closed and marker removal is
         // durable, the last flock holder may release singleton ownership.
