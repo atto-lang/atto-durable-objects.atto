@@ -22,9 +22,32 @@ The new native CTest covers **synthetic, synchronous call-boundary failures**, n
 
 The new test suite forks a native child and calls `_exit(42)` while holding an unacknowledged claim; the parent verifies a pending recovery with a strictly greater fence. This must be **executed on the exact PR head**, with assertions enabled in both Debug and Release. The separate legacy `--crash-child` mode is not itself proof unless a parent launches it.
 
+## Real SQLite WAL VFS fault tests (new, unexecuted in repository)
+
+The opt-in test executable `durable_sqlite_vfs_fault_test` wraps SQLite's
+original VFS without modifying the production runtime. It injects actual
+`SQLITE_IOERR_WRITE` at WAL `xWrite` and `SQLITE_IOERR_FSYNC` at WAL
+`xSync` for **tenant A only**. The test asserts rejected ACK, quarantine,
+healthy tenant B completion, no new A admission/retry, and restart with a
+strictly higher fence and unchanged state. The VFS is process-global but the
+fixture runs in its own executable and restores the original VFS. A single
+active wrapper preserves the original VFS callback context.
+
+The VFS **wrapper itself** was locally smoke-tested using stock SQLite 3.46.1
+on GCC and Clang C++17 with ASan+UBSan: each injected WAL callback returned a
+real SQLite I/O failure without detected sanitizer violations. This does **not**
+mean that `TenantRuntime` + wrapper compiled or passed; integrated native
+CTest, ASan/UBSan, TSan and runtime recovery results remain **unexecuted** on
+the exact GitHub PR head. No private repository source was transferred.
+
+Remaining real-fault coverage includes main-database `xWrite`, checkpoint
+and WAL truncation, actual `xClose` failures, partial/failed rollback,
+`SQLITE_FULL` from actual storage exhaustion, and failure during initial
+schema migration. These are separate gates rather than claimed coverage.
+
 ## Remaining mandatory gates
 
-1. An independent **actual SQLite VFS fault injector** for `xWrite`, `xSync`, `xClose`, rollback and WAL/checkpoint error paths, able to return `SQLITE_IOERR` and `SQLITE_FULL` deterministically. Synthetic status injection does not meet this gate.
+1. Execute the new real WAL `xWrite`/`xSync` fault test against `TenantRuntime` on the exact PR SHA; extend the VFS test to cover `xClose`, rollback, main DB, checkpoint and `SQLITE_FULL` fault paths. Synthetic status injection alone does not meet this gate.
 2. Exact-head native CMake/CTest Debug and Release results, GCC/Clang ASan + UBSan, and TSan under supported runner configurations. Preserve the checked-out SHA, job IDs, run attempt and **nonzero executed steps**; `steps=[]` is runner admission failure.
 3. Validate crash-before-ACK, DB reopen after injected failures, complete/fence semantics, live-lease shutdown, and healthy tenant progress with the real SQLite fault layer. No success claim from a zero-step job.
 4. Independent security review and protected-branch governance before promotion. Private-source transfer into an unrelated CI organization requires independent authorization; do not transfer source to bypass minutes/runner limits.
