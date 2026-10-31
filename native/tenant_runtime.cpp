@@ -169,8 +169,7 @@ void schema(sqlite3* db, std::atomic<unsigned>* incidents, StorageFaultPoint* pe
     if (stored_version == 1 && required_tables != 3)
         throw std::runtime_error("existing durable tenant is missing required tables");
     if (stored_version == 0 && scalar(db,
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
-        "AND name NOT LIKE 'sqlite_%'") != 0)
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table'") != 0)
         throw std::runtime_error("unversioned durable tenant contains persistent tables");
     sql(db,"CREATE TABLE IF NOT EXISTS objects("
            "object_id TEXT PRIMARY KEY,lock_id TEXT NOT NULL,version INTEGER NOT NULL DEFAULT 0,state BLOB NOT NULL DEFAULT X'')");
