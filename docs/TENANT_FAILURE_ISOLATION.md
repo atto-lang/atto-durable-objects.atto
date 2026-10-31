@@ -318,3 +318,43 @@ jobs returned `steps=[]`. They are runner-admission failures, not evidence
 that any source test ran. The final commit after this document update requires
 a fresh exact-head, executed-step CI receipt, sanitizer coverage, and independent
 review before promotion.
+
+
+## Filter-free raw Git checkout gate (2026-10-31)
+
+The offline verifier and the native workflow previously invoked `git status`
+before testing source. This operation can execute repository-configured
+`filter.<name>.clean` commands merely to check cleanliness, making it unsafe
+as a pre-execution identity guard for an untrusted checkout.
+
+`scripts/verify-native-tree.sh` now independently checks the complete HEAD
+Git tree, stage-zero index entries, raw worktree blob hashes calculated with
+`git hash-object --no-filters`, executable-bit agreement, and absence of
+untracked **including ignored** entries. It rejects unsupported symlink and
+gitlink modes, missing files, index changes, mismatched raw contents and
+ancestor symlink traversal. The native workflow uses it in all four prior
+`git status` locations. The storage-reference workflow also now pins
+`actions/checkout` to an immutable version, verifies its exact PR/push HEAD,
+uses this raw-tree gate, and requires discovery of exactly the five intended
+CTest cases before permitting a test-pass claim.
+
+The new source-free `scripts/tests/verify-native-tree-contract.sh` checks
+nine synthetic positive/negative cases, including a deliberately configured
+malicious clean filter, raw-byte tampering, staged index mismatch, file-mode
+drift, missing files, ignored untracked entries and symlink substitutions.
+The synthetic fixture passed 9/9 when executed locally; this **does not**
+constitute exact-source native-runtime execution.
+
+A separate wholly source-free GitHub Actions carrier validation ran on
+verified-private `usa-acc/usa-acc-e2e`: [run #41234315001](https://github.com/usa-acc/usa-acc-e2e/actions/runs/41234315001),
+commit `e57d3a0cf9e5777e3dd4207396615123fe228f0c`. All 4/4 jobs
+succeeded with nonzero steps: GCC and Clang synthetic SQLite,
+synthetic Git-tree identity, and a synthetic malicious clean-filter
+nonexecution regression. These independently authored carrier fixtures
+contain **no private Durable Objects source** and are **not** the same as
+running the exact private verifier script or compiling the private runtime.
+
+Source-hosted CTest/sanitizer runs still fail before any steps are recorded.
+No cross-organization private source mirror was created. Incident #22 and
+the other private-CI security authorization blockers remain open; the
+transfer/merge gate is still **HOLD**.
