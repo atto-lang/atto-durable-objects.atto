@@ -70,7 +70,8 @@ static void retry_fault(const char* label, StorageFaultPoint point, int sqlite_c
     // is recovered as pending with a STRICTLY HIGHER persistent fence.
     {
         TenantRuntime restarted(root);
-        const auto a = restarted.open_tenant("tenant-A");
+        assert(rejects([&]{ (void)restarted.open_tenant("tenant-A"); }));
+        const auto a = restarted.recover_tenant("tenant-A");
         auto recovered = restarted.try_claim(a,"lock-A");
         assert(recovered && recovered->fence()>first_fence);
         assert(restarted.read_state(*recovered).version==0);
@@ -111,7 +112,7 @@ static void ack_fault(const char* label, StorageFaultPoint point, int sqlite_cod
     }
     {
         TenantRuntime restarted(root);
-        auto a=restarted.open_tenant("A");
+        auto a=restarted.recover_tenant("A");
         auto recovered=restarted.try_claim(a,"lock");
         assert(recovered && recovered->fence()>fence);
         assert(restarted.read_state(*recovered).bytes.empty());
@@ -173,7 +174,8 @@ static void dispose_fault(const char* label, StorageFaultPoint point, unsigned b
     // The tenant data remains recoverable when the host is safely restarted.
     {
         TenantRuntime restarted(root);
-        auto a=restarted.open_tenant("A");
+        assert(rejects([&]{ (void)restarted.open_tenant("A"); }));
+        auto a=restarted.recover_tenant("A");
         assert(restarted.enqueue(a,"obj","lock","req","new").status==EnqueueStatus::Accepted);
         restarted.close_tenant(a);
     }
@@ -198,7 +200,7 @@ static void shutdown_with_outstanding_lease() {
     }
     {
         TenantRuntime restarted(root);
-        auto a=restarted.open_tenant("A");
+        auto a=restarted.recover_tenant("A");
         auto recovered=restarted.try_claim(a,"lock");
         assert(recovered && recovered->fence()>old_fence);
         restarted.complete(*recovered,"committed");
@@ -229,7 +231,7 @@ static void process_kill_before_ack() {
     assert(WIFEXITED(status) && WEXITSTATUS(status)==42);
     {
         TenantRuntime restarted(root);
-        auto a=restarted.open_tenant("A");
+        auto a=restarted.recover_tenant("A");
         assert(restarted.enqueue(a,"obj","lock","req","payload").status
                == EnqueueStatus::Duplicate);
         auto recovered=restarted.try_claim(a,"lock");
@@ -268,7 +270,7 @@ static void admission_or_claim_commit_failure(
     }
     {
         TenantRuntime runtime(root);
-        auto a=runtime.open_tenant("tenant-A");
+        auto a=runtime.recover_tenant("tenant-A");
         // The injected error happened before COMMIT, so SQLite rolled back.
         // A real xSync failure has an ambiguous outcome; see VFS integration.
         assert(runtime.enqueue(a,"obj","lock","req-A","a").status
@@ -317,7 +319,7 @@ static void read_failure_quarantines_tenant(const char* label, StorageFaultPoint
     }
     {
         TenantRuntime restarted(root);
-        auto a=restarted.open_tenant("tenant-A");
+        auto a=restarted.recover_tenant("tenant-A");
         auto recovered=restarted.try_claim(a,"lock");
         assert(recovered && recovered->fence()>first_fence);
         auto state=restarted.read_state(*recovered);

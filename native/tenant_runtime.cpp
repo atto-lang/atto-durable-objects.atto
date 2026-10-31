@@ -95,6 +95,37 @@ std::int64_t scalar(sqlite3* db, const char* statement, const std::string* bind 
     if (q.step() != SQLITE_ROW) error(db,"missing scalar");
     return q.number(0);
 }
+// Presence of an owner-only, pre-fsynced .incident sidecar means a session
+// was opened but not cleanly closed. Destructor paths do no marker I/O.
+void sync_incident_dir(const std::filesystem::path& root) {
+    const int fd=::open(root.c_str(), O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+    if(fd<0) throw std::system_error(errno,std::generic_category(),"incident directory open");
+    const int rc=::fsync(fd); const int saved=errno;
+    const int closed=::close(fd);
+    if(rc!=0) throw std::system_error(saved,std::generic_category(),"incident directory fsync");
+    if(closed!=0) throw std::system_error(errno,std::generic_category(),"incident directory close");
+}
+void prearm_incident_marker(const std::filesystem::path& root, const std::string& path) {
+    const int fd=::open(path.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
+    if(fd<0) {
+        if(errno==EEXIST) throw std::logic_error("persistent incident requires supervised recovery");
+        throw std::system_error(errno,std::generic_category(),"incident marker create");
+    }
+    const int rc=::fsync(fd); const int saved=errno;
+    const int closed=::close(fd);
+    if(rc!=0) throw std::system_error(saved,std::generic_category(),"incident marker fsync");
+    if(closed!=0) throw std::system_error(errno,std::generic_category(),"incident marker close");
+    sync_incident_dir(root); // mark is durable BEFORE SQLite admission
+}
+void require_incident_marker(const std::string& path) {
+    const int fd=::open(path.c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW);
+    if(fd<0) throw std::logic_error("supervisor recovery requires existing incident");
+    struct stat st={};
+    const bool valid=::fstat(fd,&st)==0 && S_ISREG(st.st_mode)
+        && st.st_uid==::geteuid() && !(st.st_mode&0077) && st.st_size==0;
+    const int closed=::close(fd);
+    if(!valid||closed!=0) throw std::logic_error("unsafe or malformed incident marker");
+}
 void schema(sqlite3* db) {
     sql(db,"PRAGMA journal_mode=WAL");
     sql(db,"PRAGMA synchronous=FULL");
@@ -220,6 +251,13 @@ std::shared_ptr<TenantRuntime::Tenant> TenantRuntime::check_lease(
     return t;
 }
 TenantRuntime::TenantHandle TenantRuntime::open_tenant(const std::string& id) {
+    return open_impl(id,false);
+}
+TenantRuntime::TenantHandle TenantRuntime::recover_tenant(const std::string& id) {
+    return open_impl(id,true);
+}
+TenantRuntime::TenantHandle TenantRuntime::open_impl(const std::string& id,
+        bool supervised_recovery) {
     require_key(id);
     std::lock_guard<std::mutex> lock(core_->mu);
     if (core_->tenants.count(id)) throw std::logic_error("exactly one isolate per tenant");
@@ -238,8 +276,14 @@ TenantRuntime::TenantHandle TenantRuntime::open_tenant(const std::string& id) {
     if (::fstat(t->lock_fd,&lock_stat)!=0 || !S_ISREG(lock_stat.st_mode)
         || lock_stat.st_uid!=::geteuid() || (lock_stat.st_mode & 0077))
         throw std::logic_error("tenant lock file must be private regular file");
-    // Create 0600 storage before SQLite opens it, and refuse symlink aliases.
-    const int dbfd=::open(path.c_str(),O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW,0600);
+    // Refuse unresolved incidents on ordinary admission, and never recreate
+    // missing tenant data during controlled recovery.
+    const auto marker_path=path.string()+".incident";
+    if(supervised_recovery) require_incident_marker(marker_path);
+    else prearm_incident_marker(core_->root,marker_path);
+    const int dbflags=O_RDWR|O_CLOEXEC|O_NOFOLLOW
+        |(supervised_recovery ? 0 : O_CREAT);
+    const int dbfd=::open(path.c_str(),dbflags,0600);
     if(dbfd<0)throw std::system_error(errno,std::generic_category(),"tenant database open");
     struct stat dbstat={};
     const bool safe=::fstat(dbfd,&dbstat)==0 && S_ISREG(dbstat.st_mode)
@@ -249,6 +293,12 @@ TenantRuntime::TenantHandle TenantRuntime::open_tenant(const std::string& id) {
     if (sqlite3_open_v2(path.string().c_str(),&t->db,SQLITE_OPEN_READWRITE|SQLITE_OPEN_FULLMUTEX,nullptr)
         != SQLITE_OK) error(t->db,"open tenant store");
     sqlite3_busy_timeout(t->db,5000);
+    if(supervised_recovery) {
+        Statement integrity(t->db,"PRAGMA integrity_check");
+        if(integrity.step()!=SQLITE_ROW || integrity.str(0)!="ok"
+            || integrity.step()!=SQLITE_DONE)
+            throw std::runtime_error("supervised recovery refused SQLite integrity check");
+    }
     schema(t->db);
     { Statement q(t->db,"SELECT DISTINCT lock_id FROM objects");
       while(q.step()==SQLITE_ROW) t->active.emplace(q.str(0),0); }
@@ -296,6 +346,16 @@ void TenantRuntime::close_tenant(const TenantHandle& h) {
             throw std::system_error(errno,std::generic_category(),"tenant fd close");
         }
     }
+    // DB and owner descriptor must both be closed before retiring the
+    // incident. Between descriptor close and unlink, competitors see the
+    // marker and fail closed. A failed disposal retains it across restart.
+    const auto marker_path=(core_->root/filename(t->id)).string()+".incident";
+    if(::unlink(marker_path.c_str())!=0) {
+        t->quarantine(FileCloseFailure);
+        throw std::system_error(errno,std::generic_category(),"incident marker unlink");
+    }
+    try { sync_incident_dir(core_->root); }
+    catch (...) { t->quarantine(FileCloseFailure); throw; }
     t->accepting=false;
     core_->tenants.erase(t->id);
 }

@@ -62,7 +62,7 @@ static void exercise(FaultVfs::Point fault) {
             // Restart with the stock VFS. Failed write/sync may leave an
             // uncertain commit, but state+ACK must remain atomic.
             TenantRuntime restarted(root);
-            auto a=restarted.open_tenant("A");
+            auto a=restarted.recover_tenant("A");
             require(restarted.enqueue(a,"object","lock","req-A","payload").status==
                     EnqueueStatus::Duplicate,"missing immutable request receipt");
             auto pending=restarted.try_claim(a,"lock");
@@ -137,7 +137,7 @@ static void exercise_enqueue_or_claim_fault(FaultVfs::Point fault, bool at_claim
         }
         {
             TenantRuntime restarted(root);
-            auto a=restarted.open_tenant("A");
+            auto a=restarted.recover_tenant("A");
             // An xSync failure can return an error AFTER a commit became
             // durable. Both original receipt states are permissible.
             const auto receipt=restarted.enqueue(a,"object","lock","req-A","payload");

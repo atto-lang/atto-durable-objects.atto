@@ -104,6 +104,8 @@ public:
     TenantRuntime(const TenantRuntime&) = delete;
     TenantRuntime& operator=(const TenantRuntime&) = delete;
     TenantHandle open_tenant(const std::string& tenant_id);
+    // Trusted supervisor-only recovery; never call automatically on restart.
+    TenantHandle recover_tenant(const std::string& tenant_id);
     void close_tenant(const TenantHandle&); // leaves persisted queues for restart
     // Trusted test harness only: never expose to Oreslang guest code.
     void inject_fault_for_test(const TenantHandle&, StorageFaultPoint, int sqlite_code = SQLITE_IOERR);
@@ -143,6 +145,7 @@ private:
         Core(std::filesystem::path p, Limits l) : root(std::move(p)), limits(l) {}
     };
     std::shared_ptr<Core> core_;
+    TenantHandle open_impl(const std::string& tenant_id, bool supervised_recovery);
     static std::shared_ptr<Tenant> check_tenant(const Core&, const TenantHandle&);
     static std::shared_ptr<Tenant> check_lease(const Core&, const Lease&);
     static void retry_locked(Core&, Lease&);

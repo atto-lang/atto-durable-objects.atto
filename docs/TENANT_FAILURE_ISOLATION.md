@@ -120,3 +120,23 @@ persisted state is checked on subsequent controlled restart.
 The forked contender executes against the same POSIX host/kernel and is not
 a multi-host isolation proof. The test source is committed but native CTest
 execution is still required; zero-step GitHub Actions are not test receipts.
+
+
+## Durable unclean-session incident sidecar (unexecuted native patch)
+
+The host now pre-arms a private, fsynced `tenant-*.sqlite.incident`
+marker (including parent-directory fsync) before the first SQLite access.
+Its presence on restart blocks ordinary `open_tenant`, so an unexpected
+shutdown or failed noexcept disposal cannot be mistaken for clean release.
+The marker is removed only after successful explicit SQLite/owner-fd close,
+and the containing directory is fsynced. A failed close leaves the sidecar.
+
+`recover_tenant` is a trusted host supervisor-only method. Under the
+exclusive tenant flock, it requires a valid marker and existing database,
+runs `PRAGMA integrity_check`, and only then invokes existing recovery
+which fences persisted unfinished leases. The new session retains the
+marker until successful close; recovery is never invoked automatically.
+An ordinary crash also requires explicit supervisor recovery. This is a
+durable unclean-session indicator, *not* a durable reason-code event log,
+distributed authority, or proof of OS isolation. Native crash/fsync,
+disk-full, sanitizer, and exact-tree testing remain mandatory.
