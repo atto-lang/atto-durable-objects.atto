@@ -51,7 +51,7 @@ enum class StorageFaultPoint {
     None, EnqueueBeforeCommit, ClaimBeforeCommit, RetryBeforeWrite, RetryBeforeCommit,
     AckBeforeWrite, AckBeforeCommit,
     Rollback, SqliteClose, LockUnlock, FileClose, ReadState, PendingQuery,
-    IncidentUnlink, IncidentDirSync
+    IncidentUnlink, IncidentDirSync, IncidentGuardRelease
 };
 struct Receipt {
     EnqueueStatus status;
