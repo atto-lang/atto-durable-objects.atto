@@ -97,7 +97,73 @@ static void exercise(FaultVfs::Point fault) {
     } catch (...) { std::filesystem::remove_all(root); throw; }
     std::filesystem::remove_all(root);
 }
+static void exercise_enqueue_or_claim_fault(FaultVfs::Point fault, bool at_claim) {
+    auto root=(std::filesystem::temp_directory_path()/"ores-durable-vfs-admission-XXXXXX").string();
+    if (!::mkdtemp(root.data())) throw std::runtime_error("mkdtemp failed");
+    try {
+        {
+            FaultVfs vfs("tenant-41.sqlite-wal");
+            TenantRuntime runtime(root);
+            const auto a=runtime.open_tenant("A");
+            const auto b=runtime.open_tenant("B");
+            require(runtime.enqueue(b,"object","lock","req-B","payload").status==
+                    EnqueueStatus::Accepted,"B admission before A WAL fault");
+            if (at_claim)
+                require(runtime.enqueue(a,"object","lock","req-A","payload").status==
+                        EnqueueStatus::Accepted,"A admission before claim fault");
+            const unsigned before=vfs.faults();
+            vfs.arm(fault);
+            if (at_claim) {
+                require(rejects([&]{ (void)runtime.try_claim(a,"lock"); }),
+                        "VFS claim failure unexpectedly succeeded");
+                require((a.incident_flags() & ores::durable::ClaimStorageFailure)!=0,
+                        "claim failure did not quarantine tenant A");
+            } else {
+                require(rejects([&]{ (void)runtime.enqueue(a,"object","lock","req-A","payload"); }),
+                        "VFS admission failure unexpectedly succeeded");
+                require((a.incident_flags() & ores::durable::AdmissionStorageFailure)!=0,
+                        "admission failure did not quarantine tenant A");
+            }
+            require(vfs.faults()==before+1,"targeted A WAL callback not triggered");
+            require(rejects([&]{ (void)runtime.enqueue(a,"object","lock","new","no"); }),
+                    "quarantined tenant A admitted new work");
+            require(rejects([&]{ (void)runtime.try_claim(a,"lock"); }),
+                    "quarantined tenant A admitted a new lease");
+            auto healthy=runtime.try_claim(b,"lock");
+            require(bool(healthy),"tenant B claim after A WAL failure");
+            runtime.complete(*healthy,"healthy");
+            healthy.reset();
+            runtime.close_tenant(b);
+        }
+        {
+            TenantRuntime restarted(root);
+            auto a=restarted.open_tenant("A");
+            // An xSync failure can return an error AFTER a commit became
+            // durable. Both original receipt states are permissible.
+            const auto receipt=restarted.enqueue(a,"object","lock","req-A","payload");
+            require(receipt.status==EnqueueStatus::Duplicate ||
+                    receipt.status==EnqueueStatus::Accepted,
+                    "restart admission/dedupe state incoherent");
+            auto claim=restarted.try_claim(a,"lock");
+            require(bool(claim),"restart claim of unacknowledged A job missing");
+            require(restarted.read_state(*claim).version==0,
+                    "unexpected state change from failed admission/claim");
+            restarted.complete(*claim,"recovered");
+            claim.reset();
+            restarted.close_tenant(a);
+            auto b=restarted.open_tenant("B");
+            require(restarted.enqueue(b,"object","lock","req-B","payload").status==
+                    EnqueueStatus::Duplicate,"tenant B lost immutable receipt");
+            restarted.close_tenant(b);
+        }
+    } catch (...) { std::filesystem::remove_all(root); throw; }
+    std::filesystem::remove_all(root);
+}
 int main() {
     exercise(FaultVfs::Point::WalWrite);
     exercise(FaultVfs::Point::WalSync);
+    exercise_enqueue_or_claim_fault(FaultVfs::Point::WalWrite,false);
+    exercise_enqueue_or_claim_fault(FaultVfs::Point::WalSync,false);
+    exercise_enqueue_or_claim_fault(FaultVfs::Point::WalWrite,true);
+    exercise_enqueue_or_claim_fault(FaultVfs::Point::WalSync,true);
 }

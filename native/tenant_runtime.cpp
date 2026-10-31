@@ -337,6 +337,7 @@ Receipt TenantRuntime::enqueue(const TenantHandle& h, const std::string& object,
         throw std::invalid_argument("request payload exceeds limit");
     std::lock_guard<std::mutex> lock(core_->mu);
     const auto t=check_tenant(*core_,h);
+    try {
     Tx tx(t->db, &t->incidents, &t->fault_point);
     {
         Statement q(t->db,"SELECT seq,object_id,lock_id,payload FROM dedupe WHERE request_id=?");
@@ -399,6 +400,12 @@ Receipt TenantRuntime::enqueue(const TenantHandle& h, const std::string& object,
         throw;
     }
     return {EnqueueStatus::Accepted,seq};
+    } catch (const std::runtime_error&) {
+        // BEGIN, prepare, step, COMMIT and ambiguous SQLite errors all fail
+        // closed. Intentional quota/idempotency logic errors are not I/O faults.
+        t->quarantine(AdmissionStorageFailure);
+        throw;
+    }
 }
 std::optional<TenantRuntime::Lease> TenantRuntime::try_claim(
         const TenantHandle& h, const std::string& lock_id) {
@@ -407,6 +414,7 @@ std::optional<TenantRuntime::Lease> TenantRuntime::try_claim(
     const auto t=check_tenant(*core_,h);
     const auto cursor=t->active.find(lock_id);
     if (cursor==t->active.end() || cursor->second) return std::nullopt;
+    try {
     Tx tx(t->db, &t->incidents, &t->fault_point);
     std::int64_t seq,fence,attempt;
     std::string object,request,payload;
@@ -444,6 +452,12 @@ std::optional<TenantRuntime::Lease> TenantRuntime::try_claim(
     cursor->second=seq;
     lease.active_=true;
     return std::optional<Lease>(std::move(lease));
+    } catch (const std::runtime_error&) {
+        // A claim may be durably in-flight even when SQLite reports a failed
+        // WAL write/sync. Never issue a second lease in the same process.
+        t->quarantine(ClaimStorageFailure);
+        throw;
+    }
 }
 StateSnapshot TenantRuntime::read_state(const Lease& lease) const {
     std::lock_guard<std::mutex> lock(core_->mu);
