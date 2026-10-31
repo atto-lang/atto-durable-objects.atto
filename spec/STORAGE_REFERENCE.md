@@ -21,3 +21,9 @@ The local GCC/Clang C++17 tests and Clang ASan/UBSan/leak test passed before pub
 - No transactional outbox, actual alarm scheduler, message delivery retry, schema migration/version negotiation, ciphertext-at-rest, replication, backup recovery, quota on database growth, process crash while writing, or filesystem fault-injection evidence.
 - `fail_before_commit` is a test-only injection hook; must be isolated from production guest-facing APIs.
 - Do not connect it directly to untrusted native code or claim exactly-once delivery or guaranteed availability from this demonstration.
+
+## Idempotency identity hardening
+
+A replay is accepted only when the tenant, namespace, object, operation key, data key, value and optional alarm name/deadline exactly match the original committed request. The prior committed **reply** is returned even if a later caller recomputes a different provisional reply. Reusing an operation key for different inputs is a hard error, never a silent deduplication hit.
+
+New requests persist a `dedup_requests` identity row in the same transaction as the reply receipt, data update, and alarm. An older database with legacy dedup receipts but no verifiable request-identity rows is refused at open; there is no automatic, lossy migration. Restore or migrate only with independently verified original request data. This reference implementation still lacks persistent size budgets, outbox and authenticated guest storage capabilities.
