@@ -22,9 +22,13 @@ namespace ores::durable {
 class LlvmDurableIsolates final {
     using VM = oreslang::runtime::OresVM;
     struct Tenant final {
+        // Monotone state transitions. Storage may be retired before VM
+        // destruction succeeds; never close a retired store on retry.
+        enum class Stage { Active, VmStopped, StoreRetired, VmDestroyed };
         std::string id;
         VM::IsolateHandle vm;
         TenantRuntime::TenantHandle store;
+        Stage stage = Stage::Active;
         Tenant(std::string name, VM::IsolateHandle isolate,
                TenantRuntime::TenantHandle durable)
             : id(std::move(name)), vm(std::move(isolate)), store(std::move(durable)) {}
@@ -117,7 +121,12 @@ public:
     void retry(TenantRuntime::Lease& lease) { queues_.retry(lease); }
     std::size_t pending(const Handle& h, const std::string& lock_id) const {
         std::lock_guard<std::mutex> guard(mu_);
-        return queues_.pending(checked(h)->store,lock_id);
+        auto t=checked(h);
+        // Never dereference a durable store ticket after retirement.
+        if (t->stage==Tenant::Stage::StoreRetired ||
+            t->stage==Tenant::Stage::VmDestroyed)
+            throw std::logic_error("durable store has been retired");
+        return queues_.pending(t->store,lock_id);
     }
     oreslang::runtime::IsolateSnapshot snapshot(const Handle& h) const {
         std::lock_guard<std::mutex> guard(mu_);
@@ -126,25 +135,52 @@ public:
     void close_tenant(const Handle& h) {
         std::lock_guard<std::mutex> guard(mu_);
         auto t=checked(h);
-        // Close guest admission and physically drain actor/guest pins BEFORE
-        // storage retirement. A failure leaves the tenant registered and
-        // non-running, so a later call can finish shutdown safely.
-        auto phase=vm_.snapshot(t->vm).phase;
-        if (phase==oreslang::runtime::IsolatePhase::Created ||
-            phase==oreslang::runtime::IsolatePhase::Running)
-            vm_.begin_shutdown(t->vm);
-        phase=vm_.snapshot(t->vm).phase;
-        if (phase==oreslang::runtime::IsolatePhase::Quiescing)
-            vm_.complete_shutdown(t->vm); // rejects live actor/guest pins
-        if (vm_.snapshot(t->vm).phase!=oreslang::runtime::IsolatePhase::Stopped)
-            throw std::logic_error("durable VM isolate did not stop");
-        queues_.close_tenant(t->store); // rejects live durable leases
-        vm_.destroy(t->vm);
-        tenants_.erase(t->id);
+        using Stage = Tenant::Stage;
+        // The storage ticket is valid only until StoreRetired. Every step
+        // commits its in-memory phase AFTER the external operation succeeds.
+        // If a step throws, retry resumes there without replaying prior steps.
+        if (t->stage==Stage::Active) {
+            auto phase=vm_.snapshot(t->vm).phase;
+            if (phase==oreslang::runtime::IsolatePhase::Created ||
+                phase==oreslang::runtime::IsolatePhase::Running)
+                vm_.begin_shutdown(t->vm);
+            phase=vm_.snapshot(t->vm).phase;
+            if (phase==oreslang::runtime::IsolatePhase::Quiescing)
+                vm_.complete_shutdown(t->vm); // may reject outstanding pins
+            if (vm_.snapshot(t->vm).phase!=oreslang::runtime::IsolatePhase::Stopped)
+                throw std::logic_error("durable VM isolate did not stop");
+            t->stage=Stage::VmStopped;
+        }
+        if (t->stage==Stage::VmStopped) {
+            queues_.close_tenant(t->store); // may reject active durable leases
+            t->stage=Stage::StoreRetired;
+        }
+        if (t->stage==Stage::StoreRetired) {
+#if defined(ORES_DURABLE_TESTING)
+            // Test seam: interruption after confirmed store retirement, before
+            // VM destruction. Does not pretend to be a provider failure.
+            if (fail_vm_destroy_once_) {
+                fail_vm_destroy_once_=false;
+                throw std::runtime_error("injected failure before VM destroy");
+            }
+#endif
+            vm_.destroy(t->vm);
+            t->stage=Stage::VmDestroyed;
+        }
+        // No VM or storage operations may be retried beyond this point.
+        if (t->stage==Stage::VmDestroyed) tenants_.erase(t->id);
     }
+#if defined(ORES_DURABLE_TESTING)
+    // Trusted test harness only; never part of the Oreslang guest API.
+    void inject_vm_destroy_failure_once_for_test() noexcept {
+        std::lock_guard<std::mutex> guard(mu_);
+        fail_vm_destroy_once_=true;
+    }
+#endif
 private:
     void require_running(const Tenant& t) const {
-        if (vm_.snapshot(t.vm).phase!=oreslang::runtime::IsolatePhase::Running)
+        if (t.stage!=Tenant::Stage::Active ||
+            vm_.snapshot(t.vm).phase!=oreslang::runtime::IsolatePhase::Running)
             throw std::logic_error("durable VM isolate is shutting down");
     }
     std::shared_ptr<Tenant> checked(const Handle& h) const {
@@ -159,6 +195,9 @@ private:
     VM vm_;
     TenantRuntime queues_;
     std::unordered_map<std::string,std::shared_ptr<Tenant>> tenants_;
+#if defined(ORES_DURABLE_TESTING)
+    bool fail_vm_destroy_once_ = false;
+#endif
 };
 
 } // namespace ores::durable
