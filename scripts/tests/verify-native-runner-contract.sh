@@ -5,6 +5,10 @@ set -Eeuo pipefail
 verifier="${1:-$(dirname "${BASH_SOURCE[0]}")/../verify-durable-native.sh}"
 verifier="$(realpath "$verifier")"
 bash -n "$verifier"
+tree_guard="$(dirname "$verifier")/verify-native-tree.sh"
+bash -n "$tree_guard"
+# Independent adversarial source-free check, before mock CMake execution.
+bash "$(dirname "${BASH_SOURCE[0]}")/verify-native-tree-contract.sh" "$tree_guard"
 for tool in cmake ctest g++ clang++ git mktemp; do
   command -v "$tool" >/dev/null || { echo "missing tool: $tool" >&2; exit 69; }
 done
@@ -13,6 +17,7 @@ trap 'rm -rf "$work"' EXIT
 repo="$work/mock-repo"
 mkdir -p "$repo/scripts"
 cp "$verifier" "$repo/scripts/verify-durable-native.sh"
+cp "$tree_guard" "$repo/scripts/verify-native-tree.sh"
 cat > "$repo/CMakeLists.txt" <<'CMAKE'
 cmake_minimum_required(VERSION 3.20)
 project(source_free_verifier_contract LANGUAGES CXX)
