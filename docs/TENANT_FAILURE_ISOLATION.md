@@ -256,3 +256,34 @@ distinguish a failed last-close syscall from an otherwise clean handoff
 after process restart. Similarly, if both marker directory sync and its
 compensating re-arm fail, the local filesystem cannot certify a durable
 incident. These remain P0 design/review gates, not runtime tests passed.
+
+
+## Durable retirement witness — interruption-safe admission
+
+The explicit close path now pre-arms and directory-fsyncs a private
+`tenant-*.sqlite.retiring` witness **before** unlinking the durable
+`.incident` marker. The singleton flock remains held during both
+retirements. A subsequent ordinary `open_tenant` rejects a remaining
+witness even when `.incident` was already unlinked; a failed incident
+directory fsync or compensating re-arm cannot erase the previously
+synchronized witness.
+
+Trusted `recover_tenant` under the singleton flock validates an existing
+witness as owner-only regular storage, ensures a durable `.incident`
+marker exists, and only then retires the witness. Recovery additionally
+requires an existing tenant database, an SQLite integrity check, and
+persisted lease-fence advancement. Normal clean close removes and fsyncs
+both markers before releasing the final guard. A deterministic fixture
+models a lost process after witness creation and incident removal; the
+expected outcome is fail-closed ordinary admission and controlled recovery.
+
+**Residual limits:** This is a same-filesystem two-phase recovery protocol,
+not an independent fault domain. Its durability depends on successful
+marker/witness fsync and normal POSIX filesystem semantics. If the
+underlying filesystem corrupts or loses already synchronized data, an
+independent supervisor authority is required. A final guard `close(2)`
+error remains ambiguous after clean retirements; the new
+`IncidentGuardRelease` fault seam operates *before* that syscall and is
+not proof of an actual close-error outcome. Native build, exact-head
+CTest/sanitizer results, real fault injection, independent security
+approval and protected `main` are still required.
