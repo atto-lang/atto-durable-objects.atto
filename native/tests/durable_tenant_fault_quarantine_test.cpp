@@ -126,14 +126,16 @@ static void ack_fault(const char* label, StorageFaultPoint point, int sqlite_cod
 // The contender must exec a fresh process image. A fork-only child inherits
 // the parent's locked open-file-description; that could make this test pass
 // for the wrong reason. The lock fd is O_CLOEXEC, so exec drops that copy.
-static void assert_other_process_cannot_open(const std::filesystem::path& root) {
+static void assert_fresh_process_owner_result(const std::filesystem::path& root,
+                                              bool expect_refusal) {
     const pid_t child=::fork();
     if (child<0) throw std::runtime_error("fork competing-owner probe failed");
     if (child==0) {
         const auto path=root.string();
         ::execl("/proc/self/exe","durable_tenant_fault_quarantine_test",
-                "--probe-singleton-lock",path.c_str(),static_cast<char*>(nullptr));
-        _exit(84); // exec failed: never count this as a lock refusal
+                expect_refusal ? "--probe-singleton-lock" : "--probe-clean-reopen",
+                path.c_str(),static_cast<char*>(nullptr));
+        _exit(84); // exec failed: never count this as a lock result
     }
     int status=0;
     if (::waitpid(child,&status,0)!=child)
@@ -155,7 +157,7 @@ static void dispose_fault(const char* label, StorageFaultPoint point, unsigned b
         assert(rejects([&] { runtime.enqueue(a,"obj","lock","req","x"); }));
         TenantRuntime contender(root);
         assert(rejects([&] { (void)contender.open_tenant("A"); }));
-        assert_other_process_cannot_open(root);
+        assert_fresh_process_owner_result(root,true);
         assert(runtime.enqueue(b,"obj","lock","req","ok").status==EnqueueStatus::Accepted);
         auto claim=runtime.try_claim(b,"lock");
         assert(claim);
@@ -171,6 +173,9 @@ static void dispose_fault(const char* label, StorageFaultPoint point, unsigned b
         assert(restarted.enqueue(a,"obj","lock","req","new").status==EnqueueStatus::Accepted);
         restarted.close_tenant(a);
     }
+    // After explicit clean retirement, a genuinely independent process
+    // must be able to open and close the same tenant (no leaked guard).
+    assert_fresh_process_owner_result(root,false);
     std::filesystem::remove_all(root);
 }
 static void shutdown_with_outstanding_lease() {
@@ -327,13 +332,18 @@ static void read_failure_quarantines_tenant(const char* label, StorageFaultPoint
 }
 
 int main(int argc, char** argv) {
-    if (argc==3 && std::string(argv[1])=="--probe-singleton-lock") {
-        // This is a new process after exec, with no inherited tenant lock fd.
+    if (argc==3 && (std::string(argv[1])=="--probe-singleton-lock" ||
+                    std::string(argv[1])=="--probe-clean-reopen")) {
+        // A new process after exec: no inherited O_CLOEXEC tenant lock.
+        const bool expect_refusal=std::string(argv[1])=="--probe-singleton-lock";
         try {
             TenantRuntime contender(argv[2]);
-            (void)contender.open_tenant("A");
-            return 81; // lock lost: a second owner was incorrectly admitted
+            auto handle=contender.open_tenant("A");
+            if (expect_refusal) return 81; // second owner incorrectly admitted
+            contender.close_tenant(handle);
+            return 0; // clean handoff to a second process is permitted
         } catch (const std::logic_error& e) {
+            if (!expect_refusal) return 82;
             return std::string(e.what())=="tenant already has an active process owner"
                       ? 0 : 82; // unrelated validation error is not a pass
         } catch (...) {
