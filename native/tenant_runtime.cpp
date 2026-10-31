@@ -135,7 +135,8 @@ void require_incident_marker(const std::string& path) {
     const int closed=::close(fd);
     if(!valid||closed!=0) throw std::logic_error("unsafe or malformed incident marker");
 }
-void schema(sqlite3* db, std::atomic<unsigned>* incidents, StorageFaultPoint* pending_fault) {
+void schema(sqlite3* db, std::atomic<unsigned>* incidents, StorageFaultPoint* pending_fault,
+            std::size_t max_lock_queues) {
     // A successful PRAGMA statement is not proof that SQLite entered WAL.
     // Refuse an engine silently operating under another journal mode.
     {
@@ -203,6 +204,12 @@ void schema(sqlite3* db, std::atomic<unsigned>* incidents, StorageFaultPoint* pe
                   "OR d.lock_id<>j.lock_id OR d.payload<>j.payload") != 0)
         throw std::runtime_error("persisted durable receipt aliases another job");
 
+    // Refuse a persisted tenant that already exceeds the configured isolate
+    // lock-queue budget BEFORE requeueing in-flight jobs or advancing fences.
+    // The later in-memory index check remains defense in depth.
+    if (static_cast<std::uint64_t>(
+            scalar(db,"SELECT COUNT(DISTINCT lock_id) FROM objects")) > max_lock_queues)
+        throw std::logic_error("persisted lock queues exceed tenant quota");
     // Recovery must not overflow the persistent fencing counter. SQLite can
     // promote an overflowing INTEGER expression to REAL; such a fence would
     // make stale leases impossible to distinguish reliably.
@@ -382,7 +389,8 @@ TenantRuntime::TenantHandle TenantRuntime::open_impl(const std::string& id,
             || integrity.step()!=SQLITE_DONE)
             throw std::runtime_error("supervised recovery refused SQLite integrity check");
     }
-    schema(t->db, &t->incidents, &t->fault_point);
+    schema(t->db, &t->incidents, &t->fault_point,
+           core_->limits.max_lock_queues);
     { Statement q(t->db,"SELECT DISTINCT lock_id FROM objects");
       while(q.step()==SQLITE_ROW) t->active.emplace(q.str(0),0); }
     if (t->active.size()>core_->limits.max_lock_queues)
