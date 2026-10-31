@@ -10,6 +10,24 @@ on:
 permissions:
   contents: read
 jobs:
+  # This job has NO checkout, secrets, private source or repository token.
+  # Use its executed-step receipt only to establish hosted-runner admission.
+  runner-admission:
+    name: No-checkout runner admission
+    runs-on: ubuntu-24.04
+    permissions: {}
+    timeout-minutes: 2
+    steps:
+      - name: Verify hosted runner started
+        shell: bash
+        env:
+          EXPECTED_RUN_ID: ${{ github.run_id }}
+          EXPECTED_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_RUN_ID"
+          test -n "$EXPECTED_ATTEMPT"
+          printf 'RUNNER_ADMISSION_STEP_EXECUTED run=%s attempt=%s\n' "$EXPECTED_RUN_ID" "$EXPECTED_ATTEMPT"
   # This runs a disposable five-test CMake project, never the native runtime.
   # Its success certifies only the verification harness, not the private code.
   verifier-contract:
