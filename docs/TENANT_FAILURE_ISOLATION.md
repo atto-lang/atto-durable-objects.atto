@@ -211,3 +211,25 @@ after a successfully fsynced unlink is durably recorded across process death.
 This still requires a reviewed lifecycle protocol and executable fault
 receipts. Do not treat source-only tests, POSIX standalone probes, or zero-step
 GitHub Actions as completed native integration verification.
+
+
+## Effective SQLite durability policy is now fail-closed
+
+At every new tenant admission and supervised recovery, schema initialization
+reads and verifies the **actual** `PRAGMA journal_mode=WAL` result before any
+schema or queue mutations. It also reads the effective, connection-local
+`PRAGMA synchronous` value (must be `2`, SQLite FULL) and
+`PRAGMA foreign_keys` (must be `1`). A successful PRAGMA command alone
+does not establish that SQLite applied the requested setting; unexpected
+values throw before admitting any guest queue work.
+
+`durable_tenant_fault_quarantine_test` independently opens the newly
+created tenant database and verifies that the persisted journal mode is
+`wal`. The separate connection is intentionally **not** used to test
+synchronous FULL, because that setting is connection-local.
+
+A standalone SQLite 3.46.1 C++ smoke probe compiled and ran using GCC 14.2
+and Clang 17 with ASan+UBSan and confirmed journal-mode row handling,
+synchronous=2, foreign_keys=1, and the second-connection WAL readback.
+This is *not* exact-head native-runtime execution; the full CTest and
+sanitizer gates remain blocked by GitHub Actions runner admission.
