@@ -289,3 +289,32 @@ error remains ambiguous after clean retirements; the new
 not proof of an actual close-error outcome. Native build, exact-head
 CTest/sanitizer results, real fault injection, independent security
 approval and protected `main` are still required.
+
+## Transactional persisted-metadata recovery gate (2026-10-31)
+
+The queue substrate previously recovered `status=1` rows and advanced fences
+outside an atomic schema/recovery transaction. It also lacked the stricter
+persisted-job, object-lock and idempotency-receipt validation present in the
+separate draft PR #3. The source-only hardening now makes recovery a single
+`BEGIN IMMEDIATE` / `COMMIT` transaction after verifying effective SQLite
+WAL/FULL/foreign-key settings, and validates persisted counter storage classes,
+nonnegative versions/attempts/fences, legal job statuses, object-to-lock binding,
+job-to-receipt identity, historical-receipt aliasing and near-overflow fences
+**before** applying recovery updates. A failed validation must roll back without
+partially requeuing an unrelated in-flight job.
+
+The `durable_persisted_fence_guard` fixture now contains the malformed-record
+regressions from draft PR #3 plus a two-job atomic-recovery refusal case: one
+in-flight job at fence 7 and another with a missing receipt. The test requires
+startup to reject corruption and verifies the first job retains status 1 and
+fence 7 after that failed admission. This is a **source-only test addition**;
+no native execution is claimed. The transferred validation/test logic should
+be reconciled with PR #3 before merging either draft.
+
+New workflow runs were triggered for the preceding commit
+`13a29cadcc76f6560e5bcfba62a456771f8403aa` (runs 41231714631,
+41231714636 and 41231714554); sampled no-checkout, SQLite, Debug and verifier
+jobs returned `steps=[]`. They are runner-admission failures, not evidence
+that any source test ran. The final commit after this document update requires
+a fresh exact-head, executed-step CI receipt, sanitizer coverage, and independent
+review before promotion.
