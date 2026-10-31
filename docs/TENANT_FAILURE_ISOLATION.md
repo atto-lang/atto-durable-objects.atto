@@ -238,11 +238,13 @@ sanitizer gates remain blocked by GitHub Actions runner admission.
 ## Final guard release fault seam and remaining durability boundary
 
 The host-only fault point `IncidentGuardRelease` interrupts explicit close
-**before** the final duplicated `flock` guard is closed. At this point the
-SQLite connection is already closed and the original incident marker has
-been removed and directory-fsynced. The runtime quarantines the tenant,
+**before** the final duplicated `flock` guard is closed, and **before**
+retirement of the already-fsynced `.retiring` witness. At this point the
+SQLite connection is closed and the original incident marker has been
+unlinked and directory-fsynced. The runtime quarantines the tenant,
 attempts to recreate and fsync the incident marker while the singleton
-flock is still held, then rejects the close. The existing fork-plus-exec
+flock is still held, then rejects the close. The witness remains durable
+even if this optional marker re-arm also fails. The existing fork-plus-exec
 contender checks the exact singleton lock refusal, while tenant B continues;
 recovery after host teardown requires the persistent marker and the
 integrity/fence checks.
