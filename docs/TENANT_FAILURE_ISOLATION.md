@@ -393,3 +393,49 @@ test, **not** a full CTest/native/guest proof for PR #7. Exact-tree CI in the
 source organization remains blocked before runner execution. No private
 source was exported to another GitHub organization, pending independent
 resolution of the private-CI security incidents.
+
+
+## Bounded restart admission for persisted queues and keys (2026-10-31)
+
+The restored tenant is now validated against **every** configured durable
+limit before abandoned in-flight turns are requeued: total jobs, per-lock
+backlog, retained idempotency receipts, object state bytes, request bytes in
+pending jobs, and request bytes in historical receipts. A legitimate database
+written under larger limits must not be silently admitted under smaller
+configured limits; the supervisor must instead explicitly resolve the
+configuration or storage condition. All rejection occurs inside the single
+startup transaction, before any recovery fence/status mutation commits.
+The persisted lock-queue cap is still separately enforced.
+
+SQLite BLOB-affinity columns may physically contain TEXT values. Since
+`length(TEXT)` counts characters rather than bytes, startup now rejects
+non-BLOB persisted object state, job payloads, and deduplication payloads,
+and checks byte length explicitly with `length(CAST(value AS BLOB))`.
+Persisted object IDs, lock IDs and request IDs must also be TEXT, between
+one and 128 **bytes**, and free of ASCII control bytes/DEL, matching
+`require_key()` semantics. Key scans occur **after** total record count
+quota gates to avoid unbounded scanning during recovery.
+
+Authored native regressions add six tightened-limit cases, a failed-quota
+atomicity case preserving an in-flight status=1/fence=7 row, three
+noncanonical BLOB-storage-class cases, and five historical key-encoding
+corruptions after a completed ACK. These have **not yet executed on the
+private PR head** because source-hosted Actions still fails before running
+steps.
+
+Independent **source-free** validation (not the private runtime):
+- Local SQLite 3.46.1 standalone C++ contract with GCC and Clang
+  ASan+UBSan passed quota assertions, transaction rollback, and BLOB/TEXT
+  byte-length differences (separate 5-case malformed-key fixtures also
+  passed under both compilers).
+- Verified-private `usa-acc/usa-acc-e2e` source-free run
+  [#41236390181](https://github.com/usa-acc/usa-acc-e2e/actions/runs/41236390181)
+  executed **5 successful jobs and 22 successful steps**, including six
+  synthetic quota/rollback scenarios and three synthetic BLOB/TEXT class
+  tests. The workflow did not check out or execute private Oreslang source.
+
+Independent private-source transfer approval is still blocked by
+platform-conformance incidents #22/#77/#252 and related governance;
+no cross-organization source mirror was performed. PR #7 stays draft and
+unmerged pending exact-head native CTest, VFS fault-injection, sanitizers,
+and independent review on a trusted runner.
