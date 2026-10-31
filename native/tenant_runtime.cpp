@@ -138,12 +138,9 @@ TenantRuntime::Tenant::~Tenant() noexcept {
         db = nullptr;
     }
     if (lock_fd >= 0) {
-        if (flock(lock_fd, LOCK_UN) != 0) {
-            quarantine(LockUnlockFailure);
-            // close(fd) would implicitly release a possibly still-held flock.
-            // Retain it through process exit rather than enable a second owner.
-            return;
-        }
+        // Closing the last descriptor releases the process flock. A separate
+        // LOCK_UN before close would create an owner-admission race if close
+        // then failed while leaving the descriptor open.
         const int fd = lock_fd;
         lock_fd = -1; // Linux close EINTR may leave descriptor status ambiguous.
         if (::close(fd) != 0) {
@@ -285,10 +282,8 @@ void TenantRuntime::close_tenant(const TenantHandle& h) {
             t->quarantine(LockUnlockFailure);
             throw std::runtime_error("injected tenant flock unlock failure");
         }
-        if (flock(t->lock_fd, LOCK_UN) != 0) {
-            t->quarantine(LockUnlockFailure);
-            throw std::system_error(errno,std::generic_category(),"tenant flock unlock");
-        }
+        // Do not release flock separately before fd disposal. The old
+        // injected LockUnlock fault above remains a pre-release failure seam.
         if (t->fault_point == StorageFaultPoint::FileClose) {
             t->fault_point = StorageFaultPoint::None;
             t->quarantine(FileCloseFailure);
