@@ -1,0 +1,150 @@
+#include "ores/durable/tenant_runtime.hpp"
+
+#include <atomic>
+#include <cassert>
+#include <chrono>
+#include <filesystem>
+#include <stdexcept>
+#include <string>
+#include <thread>
+
+using namespace ores::durable;
+
+template <class F> bool rejects(F&& work) {
+    try { work(); } catch (const std::exception&) { return true; }
+    return false;
+}
+static std::filesystem::path root_for(const char* label) {
+    const auto root = std::filesystem::temp_directory_path() /
+        (std::string("ores-durable-fault-") + label + "-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directory(root);
+    std::filesystem::permissions(root, std::filesystem::perms::owner_all,
+                                 std::filesystem::perm_options::replace);
+    return root;
+}
+static void retry_fault(const char* label, StorageFaultPoint point, int sqlite_code,
+                        unsigned expected) {
+    const auto root = root_for(label);
+    std::int64_t first_fence = 0;
+    {
+        TenantRuntime runtime(root);
+        const auto a = runtime.open_tenant("tenant-A");
+        const auto b = runtime.open_tenant("tenant-B");
+        assert(runtime.enqueue(a,"object-A","lock-A","request-A","a").status == EnqueueStatus::Accepted);
+        assert(runtime.enqueue(b,"object-B","lock-B","request-B","b").status == EnqueueStatus::Accepted);
+        auto claim = runtime.try_claim(a,"lock-A");
+        assert(claim);
+        first_fence = claim->fence();
+        runtime.inject_fault_for_test(a,point,sqlite_code);
+        std::atomic<bool> good{false};
+        // B progresses in a different thread while A is being disposed.
+        std::thread healthy([&] {
+            try {
+                auto lease = runtime.try_claim(b,"lock-B");
+                if (lease && lease->payload()=="b") {
+                    runtime.complete(*lease,"healthy");
+                    good.store(true);
+                }
+            } catch (...) { /* assert in parent thread */ }
+        });
+        claim.reset(); // must NEVER terminate the host on retry failure
+        healthy.join();
+        assert(good.load());
+        assert((a.incident_flags() & expected) == expected);
+        assert(rejects([&] { (void)runtime.try_claim(a,"lock-A"); }));
+        assert(rejects([&] { (void)runtime.enqueue(a,"object-A","lock-A","new","x"); }));
+        assert(rejects([&] { runtime.close_tenant(a); }));
+        assert(runtime.pending(b,"lock-B")==0);
+        runtime.close_tenant(b);
+    }
+    // No assumed success after a simulated SQLite failure. The old turn
+    // is recovered as pending with a STRICTLY HIGHER persistent fence.
+    {
+        TenantRuntime restarted(root);
+        const auto a = restarted.open_tenant("tenant-A");
+        auto recovered = restarted.try_claim(a,"lock-A");
+        assert(recovered && recovered->fence()>first_fence);
+        assert(restarted.read_state(*recovered).version==0);
+        assert(restarted.read_state(*recovered).bytes.empty());
+        restarted.complete(*recovered,"recovered");
+        recovered.reset();
+        restarted.close_tenant(a);
+        auto b = restarted.open_tenant("tenant-B");
+        assert(restarted.enqueue(b,"object-B","lock-B","request-B","b").status == EnqueueStatus::Duplicate);
+        restarted.close_tenant(b);
+    }
+    std::filesystem::remove_all(root);
+}
+static void ack_fault() {
+    const auto root=root_for("ack");
+    std::int64_t fence=0;
+    {
+        TenantRuntime runtime(root);
+        auto a=runtime.open_tenant("A");
+        auto b=runtime.open_tenant("B");
+        assert(runtime.enqueue(a,"obj","lock","req","payload").status==EnqueueStatus::Accepted);
+        assert(runtime.enqueue(b,"obj","lock","req","payload").status==EnqueueStatus::Accepted);
+        auto claim=runtime.try_claim(a,"lock");
+        auto healthy=runtime.try_claim(b,"lock");
+        assert(claim && healthy);
+        fence=claim->fence();
+        runtime.inject_fault_for_test(a,StorageFaultPoint::AckBeforeCommit,SQLITE_FULL);
+        assert(rejects([&] { runtime.complete(*claim,"must-not-be-silent"); }));
+        assert((a.incident_flags() & AckStorageFailure)!=0);
+        assert(rejects([&] { (void)runtime.pending(a,"lock"); }));
+        assert(rejects([&] { runtime.retry(*claim); }));
+        runtime.complete(*healthy,"healthy");
+        healthy.reset();
+        claim.reset(); // quarantine must make unwind nonfatal
+        runtime.close_tenant(b);
+    }
+    {
+        TenantRuntime restarted(root);
+        auto a=restarted.open_tenant("A");
+        auto recovered=restarted.try_claim(a,"lock");
+        assert(recovered && recovered->fence()>fence);
+        assert(restarted.read_state(*recovered).bytes.empty());
+        assert(restarted.read_state(*recovered).version==0);
+        restarted.complete(*recovered,"safe");
+        recovered.reset();
+        restarted.close_tenant(a);
+    }
+    std::filesystem::remove_all(root);
+}
+static void dispose_fault(const char* label, StorageFaultPoint point, unsigned bit) {
+    const auto root=root_for(label);
+    {
+        TenantRuntime runtime(root);
+        auto a=runtime.open_tenant("A");
+        auto b=runtime.open_tenant("B");
+        runtime.inject_fault_for_test(a,point);
+        assert(rejects([&] { runtime.close_tenant(a); }));
+        assert((a.incident_flags() & bit)!=0);
+        assert(rejects([&] { runtime.enqueue(a,"obj","lock","req","x"); }));
+        assert(runtime.enqueue(b,"obj","lock","req","ok").status==EnqueueStatus::Accepted);
+        auto claim=runtime.try_claim(b,"lock");
+        assert(claim);
+        runtime.complete(*claim,"healthy");
+        claim.reset();
+        runtime.close_tenant(b);
+    }
+    // The tenant data remains recoverable when the host is safely restarted.
+    {
+        TenantRuntime restarted(root);
+        auto a=restarted.open_tenant("A");
+        assert(restarted.enqueue(a,"obj","lock","req","new").status==EnqueueStatus::Accepted);
+        restarted.close_tenant(a);
+    }
+    std::filesystem::remove_all(root);
+}
+int main() {
+    retry_fault("retry-ioerr",StorageFaultPoint::RetryBeforeWrite,SQLITE_IOERR,RetryStorageFailure);
+    retry_fault("retry-full",StorageFaultPoint::RetryBeforeCommit,SQLITE_FULL,RetryStorageFailure);
+    retry_fault("rollback",StorageFaultPoint::Rollback,SQLITE_IOERR,
+                RetryStorageFailure | RollbackStorageFailure);
+    ack_fault();
+    dispose_fault("sqlite-close",StorageFaultPoint::SqliteClose,SqliteCloseFailure);
+    dispose_fault("flock-unlock",StorageFaultPoint::LockUnlock,LockUnlockFailure);
+    dispose_fault("fd-close",StorageFaultPoint::FileClose,FileCloseFailure);
+}
