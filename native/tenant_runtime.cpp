@@ -234,6 +234,32 @@ void schema(sqlite3* db, std::atomic<unsigned>* incidents, StorageFaultPoint* pe
                   "GROUP BY seq HAVING COUNT(*)>1)") != 0)
         throw std::runtime_error("two durable receipts alias one historical sequence");
 
+    // Persisted TEXT keys must satisfy the same length and control-byte
+    // contract as newly submitted keys. Otherwise a historical receipt can
+    // become unreachable or a restored lock queue can never be claimed.
+    // Check storage class and byte length before allocating std::strings.
+    const char* key_queries[] = {
+        "SELECT object_id,lock_id FROM objects",
+        "SELECT object_id,lock_id,request_id FROM jobs",
+        "SELECT request_id,object_id,lock_id FROM dedupe"
+    };
+    const int key_counts[] = {2,3,3};
+    for (int table=0;table<3;++table) {
+        Statement keys(db,key_queries[table]);
+        while (keys.step()==SQLITE_ROW) {
+            for (int field=0;field<key_counts[table];++field) {
+                if (sqlite3_column_type(keys.s,field)!=SQLITE_TEXT ||
+                    sqlite3_column_bytes(keys.s,field)<=0 ||
+                    sqlite3_column_bytes(keys.s,field)>128)
+                    throw std::runtime_error("invalid persisted durable key storage or length");
+                try { require_key(keys.str(field)); }
+                catch (const std::invalid_argument&) {
+                    throw std::runtime_error("invalid persisted durable key control byte");
+                }
+            }
+        }
+    }
+
     // SQLite BLOB affinity permits a corrupt database to store TEXT values.
     // TEXT length() counts characters, not bytes, and silently changes the
     // runtime's byte-oriented quota/receipt identity contract. Refuse such
