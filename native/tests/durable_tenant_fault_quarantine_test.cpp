@@ -135,6 +135,8 @@ static void dispose_fault(const char* label, StorageFaultPoint point, unsigned b
         assert(incidents.size()==1 && incidents[0].first=="A");
         assert((incidents[0].second & bit)!=0);
         assert(rejects([&] { runtime.enqueue(a,"obj","lock","req","x"); }));
+        TenantRuntime contender(root);
+        assert(rejects([&] { (void)contender.open_tenant("A"); }));
         assert(runtime.enqueue(b,"obj","lock","req","ok").status==EnqueueStatus::Accepted);
         auto claim=runtime.try_claim(b,"lock");
         assert(claim);
