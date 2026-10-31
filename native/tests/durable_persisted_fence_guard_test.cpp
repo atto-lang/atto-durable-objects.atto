@@ -101,6 +101,46 @@ int main() {
         reject_corrupt("receipt-aliases-another-job",
                        "INSERT INTO dedupe(request_id,seq,object_id,lock_id,payload) "
                        "VALUES('forged',1,'obj','lock',X'00')");
+
+        // A damaged second receipt must prevent recovery from advancing a
+        // different in-flight row. Validate everything before any requeue.
+        {
+            const auto isolated = root / "atomic-recovery-refusal";
+            {
+                TenantRuntime seeded(isolated);
+                const auto tenant = seeded.open_tenant("t");
+                assert(seeded.enqueue(tenant,"obj","lock","good","first").status
+                       == EnqueueStatus::Accepted);
+                assert(seeded.enqueue(tenant,"obj","lock","bad","second").status
+                       == EnqueueStatus::Accepted);
+                seeded.close_tenant(tenant);
+            }
+            const auto db_file = isolated / "tenant-74.sqlite";
+            sqlite3* db = nullptr;
+            assert(sqlite3_open_v2(db_file.c_str(), &db, SQLITE_OPEN_READWRITE,
+                                   nullptr) == SQLITE_OK);
+            assert(sqlite3_exec(db,
+                "UPDATE jobs SET status=1,fence=7 WHERE request_id='good';"
+                "DELETE FROM dedupe WHERE request_id='bad'",
+                nullptr,nullptr,nullptr) == SQLITE_OK);
+            assert(sqlite3_close(db) == SQLITE_OK);
+            TenantRuntime restarted_case(isolated);
+            bool refused = false;
+            try { (void)restarted_case.open_tenant("t"); }
+            catch (const std::runtime_error&) { refused = true; }
+            assert(refused);
+            assert(sqlite3_open_v2(db_file.c_str(), &db, SQLITE_OPEN_READWRITE,
+                                   nullptr) == SQLITE_OK);
+            sqlite3_stmt* query = nullptr;
+            assert(sqlite3_prepare_v2(db,
+                "SELECT status,fence FROM jobs WHERE request_id='good'",
+                -1,&query,nullptr) == SQLITE_OK);
+            assert(sqlite3_step(query) == SQLITE_ROW);
+            assert(sqlite3_column_int(query,0) == 1);
+            assert(sqlite3_column_int64(query,1) == 7);
+            assert(sqlite3_finalize(query) == SQLITE_OK);
+            assert(sqlite3_close(db) == SQLITE_OK);
+        }
     } catch (...) {
         std::filesystem::remove_all(root);
         throw;
