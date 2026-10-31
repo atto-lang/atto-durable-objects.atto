@@ -6,7 +6,11 @@ root="$(git -C "$(dirname "${BASH_SOURCE[0]}")/.." rev-parse --show-toplevel)"
 cd "$root"
 actual="$(git rev-parse HEAD)"
 [[ "$actual" == "$EXPECTED_HEAD_SHA" ]] || { echo "Wrong HEAD: $actual" >&2; exit 65; }
-[[ -z "$(git status --porcelain --untracked-files=all)" ]] || { echo 'Refusing dirty checkout' >&2; exit 66; }
+# Verify raw HEAD/index/worktree without executing configured Git clean filters.
+# The guard rejects ignored/untracked additions and unsupported symlinks.
+bash "$root/scripts/verify-native-tree.sh" "$root" || {
+  echo 'Refusing non-identical raw Git source tree/index/worktree' >&2; exit 66;
+}
 actual_tree="$(git rev-parse 'HEAD^{tree}')"
 # A vetted cross-repository mirror has a different commit SHA but must keep
 # the source tree bit-for-bit identical. This is a separate, fail-closed gate:
