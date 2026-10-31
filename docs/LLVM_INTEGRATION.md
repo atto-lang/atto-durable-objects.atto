@@ -58,7 +58,15 @@ tenant retirement:
 3. Require the stopped phase, then close the durable tenant store. If an
    in-flight durable lease prevents this step, retain registration and reject
    new queue admission; the existing lease can still complete/retry.
-4. Destroy the stopped VM and retire the adapter handle.
+4. Persist the **in-memory** per-tenant lifecycle stage `StoreRetired` only
+   after a successful storage close. If VM destruction later fails, retry
+   that step **without touching the retired store**. After successful VM
+   destruction, mark `VmDestroyed` and invalidate the adapter handle.
+
+The lifecycle stages are process-local only; this is not durable supervisor
+incident delivery. A host crash between steps must be reconciled against
+the filesystem lease, WAL recovery state, and VM generation on restart.
+Do not interpret `StoreRetired` as proof that external effects completed.
 
 On activation failure, preserve copies of both generation-fenced handles
 until insertion succeeds, then attempt store and VM cleanup independently.
@@ -83,8 +91,9 @@ ctest --test-dir build-llvm -R durable_llvm_adapter_lifecycle --output-on-failur
 
 The opt-in native test checks retained stores after a rejected close with
 an active lease, queue-admission refusal after shutdown begins, independent
-tenant progress, reopening after a storage-open failure, and stale handle
-rejection. It does **not** prove fail-injected OresVM start/create/destroy
+tenant progress, an injected interruption **after store close and before VM
+destroy**, idempotent retry without a second SQLite close, reopening after a
+storage-open failure, and stale handle rejection. It does **not** prove fail-injected OresVM start/create/destroy
 exceptions, resource-pin shutdown races, actual Oreslang guest code, worker
 sandboxing, or native AOT. Add those tests and record the LLVM header SHA,
 adapter SHA, compiler binary, full job steps, and sanitizer outputs before
