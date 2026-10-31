@@ -117,6 +117,14 @@ void prearm_incident_marker(const std::filesystem::path& root, const std::string
     if(closed!=0) throw std::system_error(errno,std::generic_category(),"incident marker close");
     sync_incident_dir(root); // mark is durable BEFORE SQLite admission
 }
+// lstat, not exists(): malformed symlinks and I/O errors must not be
+// interpreted as an absent incident/retirement witness.
+bool incident_entry_exists(const std::string& path) {
+    struct stat st={};
+    if(::lstat(path.c_str(),&st)==0) return true;
+    if(errno==ENOENT) return false;
+    throw std::system_error(errno,std::generic_category(),"incident witness lstat");
+}
 void require_incident_marker(const std::string& path) {
     // Never block on a forged FIFO or device while validating a marker.
     const int fd=::open(path.c_str(),O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_NOFOLLOW);
@@ -293,8 +301,27 @@ TenantRuntime::TenantHandle TenantRuntime::open_impl(const std::string& id,
     // Refuse unresolved incidents on ordinary admission, and never recreate
     // missing tenant data during controlled recovery.
     const auto marker_path=path.string()+".incident";
-    if(supervised_recovery) require_incident_marker(marker_path);
-    else prearm_incident_marker(core_->root,marker_path);
+    const auto retiring_path=path.string()+".retiring";
+    const bool interrupted_retirement=incident_entry_exists(retiring_path);
+    if(supervised_recovery) {
+        // A durably pre-armed .retiring witness survives failed .incident
+        // unlink/fsync. Never treat its presence as clean admission.
+        if(interrupted_retirement) {
+            require_incident_marker(retiring_path);
+            if(!incident_entry_exists(marker_path))
+                prearm_incident_marker(core_->root,marker_path);
+        }
+        require_incident_marker(marker_path);
+        if(interrupted_retirement) {
+            if(::unlink(retiring_path.c_str())!=0)
+                throw std::system_error(errno,std::generic_category(),"retirement witness unlink");
+            sync_incident_dir(core_->root); // .incident already durable
+        }
+    } else {
+        if(interrupted_retirement)
+            throw std::logic_error("unfinished tenant retirement requires supervisor recovery");
+        prearm_incident_marker(core_->root,marker_path);
+    }
     const int dbflags=O_RDWR|O_CLOEXEC|O_NOFOLLOW
         |(supervised_recovery ? 0 : O_CREAT);
     const int dbfd=::open(path.c_str(),dbflags,0600);
@@ -374,6 +401,12 @@ void TenantRuntime::close_tenant(const TenantHandle& h) {
     // Without the duplicate, supervised recovery could race between closing
     // the primary fd and removing .incident and lose the new session marker.
     const auto marker_path=(core_->root/filename(t->id)).string()+".incident";
+    const auto retiring_path=(core_->root/filename(t->id)).string()+".retiring";
+    // Write and fsync the witness BEFORE attempting to remove .incident.
+    // A failure of the first directory fsync may leave .incident absent;
+    // the already-durable witness still blocks ordinary cross-process open.
+    try { prearm_incident_marker(core_->root,retiring_path); }
+    catch (...) { t->quarantine(FileCloseFailure); throw; }
     if(t->fault_point==StorageFaultPoint::IncidentUnlink) {
         t->fault_point=StorageFaultPoint::None;
         t->quarantine(FileCloseFailure);
@@ -399,6 +432,15 @@ void TenantRuntime::close_tenant(const TenantHandle& h) {
         catch (...) { /* original error propagates; durability is unverified */ }
         throw;
     }
+    // The SQLite connection is shut down and .incident removal is durable.
+    // Retire the witness last. If its fsync fails, a stale witness may
+    // require supervised recovery, but cannot make dirty data look clean.
+    if(::unlink(retiring_path.c_str())!=0) {
+        t->quarantine(FileCloseFailure);
+        throw std::system_error(errno,std::generic_category(),"retirement witness unlink");
+    }
+    try { sync_incident_dir(core_->root); }
+    catch (...) { t->quarantine(FileCloseFailure); throw; }
     if(t->lock_fd>=0) {
         // Failure immediately before releasing the final guard is handled
         // while its flock is STILL held. Restore a durable supervisor marker
