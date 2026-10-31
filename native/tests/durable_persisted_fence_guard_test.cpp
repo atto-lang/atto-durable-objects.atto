@@ -75,6 +75,14 @@ int main() {
         reject_corrupt("real-fence", "UPDATE jobs SET fence=1e100");
         reject_corrupt("real-attempt", "UPDATE jobs SET attempt=1e100");
         reject_corrupt("real-version", "UPDATE objects SET version=1e100");
+        // SQLite accepts TEXT in BLOB-affinity columns. Refuse alternate
+        // storage classes even when the byte string happens to compare equal:
+        // length(TEXT) counts Unicode characters, not raw payload bytes.
+        reject_corrupt("text-object-state", "UPDATE objects SET state='text'");
+        reject_corrupt("text-job-payload", "UPDATE jobs SET payload='text'");
+        reject_corrupt("text-receipt-payload",
+                       "UPDATE dedupe SET payload='text'");
+
         reject_corrupt("real-dedupe-sequence", "UPDATE dedupe SET seq=1e100");
         // A recovered active claim needs a further increment for the
         // next claim; refuse values that would create a permanently
