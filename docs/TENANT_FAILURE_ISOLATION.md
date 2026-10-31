@@ -233,3 +233,26 @@ and Clang 17 with ASan+UBSan and confirmed journal-mode row handling,
 synchronous=2, foreign_keys=1, and the second-connection WAL readback.
 This is *not* exact-head native-runtime execution; the full CTest and
 sanitizer gates remain blocked by GitHub Actions runner admission.
+
+
+## Final guard release fault seam and remaining durability boundary
+
+The host-only fault point `IncidentGuardRelease` interrupts explicit close
+**before** the final duplicated `flock` guard is closed. At this point the
+SQLite connection is already closed and the original incident marker has
+been removed and directory-fsynced. The runtime quarantines the tenant,
+attempts to recreate and fsync the incident marker while the singleton
+flock is still held, then rejects the close. The existing fork-plus-exec
+contender checks the exact singleton lock refusal, while tenant B continues;
+recovery after host teardown requires the persistent marker and the
+integrity/fence checks.
+
+This is intentionally a *pre-close* failure seam. A real error returned
+from the final `close(2)` is ambiguous: the descriptor may already be
+closed, and recreating a marker after that point could race another owner.
+No claim of durable error logging or hard isolation is made for this edge.
+An independent supervisor admission authority is required if policy must
+distinguish a failed last-close syscall from an otherwise clean handoff
+after process restart. Similarly, if both marker directory sync and its
+compensating re-arm fail, the local filesystem cannot certify a durable
+incident. These remain P0 design/review gates, not runtime tests passed.
