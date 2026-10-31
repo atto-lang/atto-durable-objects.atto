@@ -257,6 +257,53 @@ static void admission_or_claim_commit_failure(
     }
     std::filesystem::remove_all(root);
 }
+
+static void read_failure_quarantines_tenant(const char* label, StorageFaultPoint point) {
+    const auto root=root_for(label);
+    std::int64_t first_fence=0;
+    {
+        TenantRuntime runtime(root);
+        auto a=runtime.open_tenant("tenant-A");
+        auto b=runtime.open_tenant("tenant-B");
+        assert(runtime.enqueue(a,"obj","lock","req-A","a").status==EnqueueStatus::Accepted);
+        assert(runtime.enqueue(b,"obj","lock","req-B","b").status==EnqueueStatus::Accepted);
+        auto lease_a=runtime.try_claim(a,"lock");
+        assert(lease_a);
+        first_fence=lease_a->fence();
+        runtime.inject_fault_for_test(a,point,SQLITE_IOERR);
+        if (point==StorageFaultPoint::ReadState)
+            assert(rejects([&] { (void)runtime.read_state(*lease_a); }));
+        else
+            assert(rejects([&] { (void)runtime.pending(a,"lock"); }));
+        assert((a.incident_flags() & ReadStorageFailure)!=0);
+        assert(rejects([&] { (void)runtime.enqueue(a,"obj","lock","new","x"); }));
+        assert(rejects([&] { (void)runtime.try_claim(a,"lock"); }));
+        assert(rejects([&] { runtime.complete(*lease_a,"should-not-commit"); }));
+        assert(rejects([&] { runtime.close_tenant(a); }));
+        auto healthy=runtime.try_claim(b,"lock");
+        assert(healthy && runtime.read_state(*healthy).version==0);
+        runtime.complete(*healthy,"healthy");
+        healthy.reset();
+        runtime.close_tenant(b);
+        lease_a.reset(); // destructor must be noexcept, even when quarantined
+    }
+    {
+        TenantRuntime restarted(root);
+        auto a=restarted.open_tenant("tenant-A");
+        auto recovered=restarted.try_claim(a,"lock");
+        assert(recovered && recovered->fence()>first_fence);
+        auto state=restarted.read_state(*recovered);
+        assert(state.version==0 && state.bytes.empty());
+        restarted.complete(*recovered,"recovered");
+        recovered.reset();
+        restarted.close_tenant(a);
+        auto b=restarted.open_tenant("tenant-B");
+        assert(restarted.enqueue(b,"obj","lock","req-B","b").status==EnqueueStatus::Duplicate);
+        restarted.close_tenant(b);
+    }
+    std::filesystem::remove_all(root);
+}
+
 int main() {
     retry_fault("retry-ioerr",StorageFaultPoint::RetryBeforeWrite,SQLITE_IOERR,RetryStorageFailure);
     retry_fault("retry-full",StorageFaultPoint::RetryBeforeCommit,SQLITE_FULL,RetryStorageFailure);
@@ -273,4 +320,6 @@ int main() {
                                       AdmissionStorageFailure);
     admission_or_claim_commit_failure("claim-commit",StorageFaultPoint::ClaimBeforeCommit,
                                       ClaimStorageFailure);
+    read_failure_quarantines_tenant("read-state",StorageFaultPoint::ReadState);
+    read_failure_quarantines_tenant("pending-count",StorageFaultPoint::PendingQuery);
 }

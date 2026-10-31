@@ -457,10 +457,18 @@ std::optional<TenantRuntime::Lease> TenantRuntime::try_claim(
 StateSnapshot TenantRuntime::read_state(const Lease& lease) const {
     std::lock_guard<std::mutex> lock(core_->mu);
     const auto t=check_lease(*core_,lease);
-    Statement q(t->db,"SELECT version,state FROM objects WHERE object_id=? AND lock_id=?");
-    q.text(1,lease.object_id_);q.text(2,lease.lock_id_);
-    if(q.step()!=SQLITE_ROW)throw std::logic_error("durable object lost binding");
-    return {q.bytes(1),q.number(0)};
+    try {
+        // A read-side SQLite failure invalidates the actor's state snapshot.
+        // Never permit a subsequent ACK built from an uncertain read.
+        inject_sqlite_fault(*t, StorageFaultPoint::ReadState);
+        Statement q(t->db,"SELECT version,state FROM objects WHERE object_id=? AND lock_id=?");
+        q.text(1,lease.object_id_);q.text(2,lease.lock_id_);
+        if(q.step()!=SQLITE_ROW)throw std::logic_error("durable object lost binding");
+        return {q.bytes(1),q.number(0)};
+    } catch (const std::runtime_error&) {
+        t->quarantine(ReadStorageFailure);
+        throw;
+    }
 }
 void TenantRuntime::complete(Lease& lease, const std::string& next_state) {
     if(next_state.size()>core_->limits.max_state_bytes)
@@ -531,7 +539,13 @@ std::size_t TenantRuntime::pending(const TenantHandle& h, const std::string& loc
     require_key(lock_id);
     std::lock_guard<std::mutex> lock(core_->mu);
     const auto t=check_tenant(*core_,h);
-    return static_cast<std::size_t>(scalar(t->db,
-        "SELECT COUNT(*) FROM jobs WHERE lock_id=?",&lock_id));
+    try {
+        inject_sqlite_fault(*t, StorageFaultPoint::PendingQuery);
+        return static_cast<std::size_t>(scalar(t->db,
+            "SELECT COUNT(*) FROM jobs WHERE lock_id=?",&lock_id));
+    } catch (const std::runtime_error&) {
+        t->quarantine(ReadStorageFailure);
+        throw;
+    }
 }
 } // namespace ores::durable
