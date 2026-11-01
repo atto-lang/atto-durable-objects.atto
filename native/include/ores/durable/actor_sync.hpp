@@ -1,6 +1,7 @@
 #pragma once
 
 #include <sqlite3.h>
+#include <cstddef>
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -50,6 +51,8 @@ struct SyncLimits {
     std::size_t feed_entries = 64;
     std::size_t outbox_entries_per_actor = 4096;
     std::size_t dedupe_entries_per_actor = 8192;
+    std::size_t actor_keys_per_database = 4096;
+    std::size_t projection_consumers_per_actor = 1024;
 };
 
 class SqliteActorSync final {
@@ -60,6 +63,7 @@ public:
             limits_.feed_bytes < limits_.state_bytes + 2 * max_label ||
             limits_.feed_entries == 0 || limits_.feed_entries > 256 ||
             limits_.outbox_entries_per_actor == 0 || limits_.dedupe_entries_per_actor == 0 ||
+            limits_.actor_keys_per_database == 0 || limits_.projection_consumers_per_actor == 0 ||
             limits_.state_bytes > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
             limits_.command_bytes > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
             limits_.reply_bytes > static_cast<std::size_t>(std::numeric_limits<int>::max()))
@@ -121,6 +125,12 @@ public:
         s.i64(5, epoch);
         s.done();
         if (sqlite3_changes(db_) != 1) throw std::logic_error("stale activation epoch");
+        {
+            Statement count(db_, "SELECT COUNT(*) FROM sync_objects");
+            if (count.step()!=SQLITE_ROW) throw std::runtime_error("actor count failed");
+            if (static_cast<std::size_t>(count.number(0)) > limits_.actor_keys_per_database)
+                throw std::length_error("actor key storage quota exhausted");
+        }
         tx.commit();
     }
 
@@ -257,7 +267,11 @@ public:
         Statement s(db_, "INSERT INTO sync_projection VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING");
         s.text(1,consumer); bind_key(s,key,2); s.i64(6,ss.epoch);
         s.i64(7,ss.revision); s.text(8, ""); s.text(9,ss.schema); s.blob(10,ss.bytes); s.done();
-        if (sqlite3_changes(db_) != 1) {
+        const int inserted=sqlite3_changes(db_);
+        if (inserted == 1 &&
+            count_for(key, "sync_projection") > limits_.projection_consumers_per_actor)
+            throw std::length_error("projection consumer quota exhausted");
+        if (inserted != 1) {
             auto prior = projection_locked(consumer,key);
             if (!prior || prior->epoch != ss.epoch || prior->revision != ss.revision ||
                 prior->schema != ss.schema || prior->bytes != ss.bytes)
@@ -353,6 +367,8 @@ private:
             sql = "SELECT COUNT(*) FROM sync_operations WHERE tenant=? AND space=? AND actor_type=? AND id=?";
         else if (std::string_view(table) == "sync_outbox")
             sql = "SELECT COUNT(*) FROM sync_outbox WHERE tenant=? AND space=? AND actor_type=? AND id=?";
+        else if (std::string_view(table) == "sync_projection")
+            sql = "SELECT COUNT(*) FROM sync_projection WHERE tenant=? AND space=? AND actor_type=? AND id=?";
         else throw std::invalid_argument("invalid quota table");
         Statement s(db_, sql);
         bind_key(s, key);
