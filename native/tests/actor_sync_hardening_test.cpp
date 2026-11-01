@@ -26,11 +26,13 @@ int main() {
     limits.state_bytes = 8;
     limits.command_bytes = 8;
     limits.reply_bytes = 8;
-    limits.feed_bytes = 8; // one full snapshot plus op/schema labels
+    limits.feed_bytes = 520; // fits max state + two 256-byte identity labels
+    limits.feed_entries = 1; // force paging for deterministic tests
     limits.outbox_entries_per_actor = 2;
     limits.dedupe_entries_per_actor = 3;
     rejects<std::invalid_argument>([&]{ auto invalid=limits; invalid.state_bytes=0; SqliteActorSync bad(primary,invalid); });
-    rejects<std::invalid_argument>([&]{ auto invalid=limits; invalid.feed_bytes=7; SqliteActorSync bad(primary,invalid); });
+    rejects<std::invalid_argument>([&]{ auto invalid=limits; invalid.feed_bytes=519; SqliteActorSync bad(primary,invalid); });
+    rejects<std::invalid_argument>([&]{ auto invalid=limits; invalid.feed_entries=0; SqliteActorSync bad(primary,invalid); });
     {
         SqliteActorSync source(primary,limits);
         SqliteActorSync replica(secondary,limits);
