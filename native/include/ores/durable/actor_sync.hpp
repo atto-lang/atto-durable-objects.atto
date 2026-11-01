@@ -66,7 +66,7 @@ public:
                  "PRIMARY KEY(tenant,space,actor_type,id)) WITHOUT ROWID");
             exec("CREATE TABLE IF NOT EXISTS sync_operations("
                  "tenant TEXT NOT NULL, space TEXT NOT NULL, actor_type TEXT NOT NULL, id TEXT NOT NULL,"
-                 "op_id TEXT NOT NULL, command BLOB NOT NULL, revision INTEGER NOT NULL, reply BLOB NOT NULL,"
+                 "op_id TEXT NOT NULL, command BLOB NOT NULL, schema_fp TEXT NOT NULL, revision INTEGER NOT NULL, reply BLOB NOT NULL,"
                  "PRIMARY KEY(tenant,space,actor_type,id,op_id),"
                  "FOREIGN KEY(tenant,space,actor_type,id) REFERENCES sync_objects(tenant,space,actor_type,id)) WITHOUT ROWID");
             exec("CREATE TABLE IF NOT EXISTS sync_outbox("
@@ -77,7 +77,8 @@ public:
                  "FOREIGN KEY(tenant,space,actor_type,id) REFERENCES sync_objects(tenant,space,actor_type,id)) WITHOUT ROWID");
             exec("CREATE TABLE IF NOT EXISTS sync_projection("
                  "consumer TEXT NOT NULL, tenant TEXT NOT NULL, space TEXT NOT NULL,"
-                 "actor_type TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL,"
+                 "actor_type TEXT NOT NULL, id TEXT NOT NULL, epoch INTEGER NOT NULL,"
+                 "revision INTEGER NOT NULL, op_id TEXT NOT NULL DEFAULT '',"
                  "schema_fp TEXT NOT NULL, snapshot BLOB NOT NULL,"
                  "PRIMARY KEY(consumer,tenant,space,actor_type,id)) WITHOUT ROWID");
         } catch (...) { sqlite3_close(db_); db_ = nullptr; throw; }
@@ -125,12 +126,13 @@ public:
         const auto old = snapshot_locked(key);
         if (old.epoch != epoch) throw std::logic_error("stale writer epoch");
         {
-            Statement s(db_, "SELECT command,revision,reply FROM sync_operations WHERE "
+            Statement s(db_, "SELECT command,schema_fp,revision,reply FROM sync_operations WHERE "
                              "tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?");
             bind_key(s, key); s.text(5, operation_id);
             if (s.step() == SQLITE_ROW) {
-                if (s.blob(0) != command) throw std::logic_error("operation id reused with different command");
-                const auto result = SyncCommit{s.number(1), s.blob(2), true};
+                if (s.blob(0) != command || s.str(1) != schema_fp)
+                    throw std::logic_error("operation id reused with different command/schema");
+                const auto result = SyncCommit{s.number(2), s.blob(3), true};
                 tx.commit();
                 return result;
             }
@@ -147,9 +149,9 @@ public:
             if (sqlite3_changes(db_) != 1) throw std::logic_error("lost writer fencing/revision");
         }
         {
-            Statement s(db_, "INSERT INTO sync_operations VALUES(?,?,?,?,?,?,?,?)");
+            Statement s(db_, "INSERT INTO sync_operations VALUES(?,?,?,?,?,?,?,?,?)");
             bind_key(s, key); s.text(5, operation_id); s.blob(6, command);
-            s.i64(7, revision); s.blob(8, reply); s.done();
+            s.text(7, schema_fp); s.i64(8, revision); s.blob(9, reply); s.done();
         }
         {
             Statement s(db_, "INSERT INTO sync_outbox VALUES(?,?,?,?,?,?,?,?,?)");
@@ -219,12 +221,13 @@ public:
         if (ss.revision < 0) throw std::invalid_argument("negative projection revision");
         std::lock_guard<std::mutex> lock(mu_);
         Tx tx(*this);
-        Statement s(db_, "INSERT INTO sync_projection VALUES(?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING");
-        s.text(1,consumer); bind_key(s,key,2); s.i64(6,ss.revision);
-        s.text(7,ss.schema); s.blob(8,ss.bytes); s.done();
+        Statement s(db_, "INSERT INTO sync_projection VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING");
+        s.text(1,consumer); bind_key(s,key,2); s.i64(6,ss.epoch);
+        s.i64(7,ss.revision); s.text(8, ""); s.text(9,ss.schema); s.blob(10,ss.bytes); s.done();
         if (sqlite3_changes(db_) != 1) {
             auto prior = projection_locked(consumer,key);
-            if (!prior || prior->revision != ss.revision || prior->schema != ss.schema || prior->bytes != ss.bytes)
+            if (!prior || prior->epoch != ss.epoch || prior->revision != ss.revision ||
+                prior->schema != ss.schema || prior->bytes != ss.bytes)
                 throw std::logic_error("projection already initialized with different state");
         }
         tx.commit();
@@ -237,17 +240,23 @@ public:
         const auto prior = projection_locked(consumer,key);
         if (!prior) throw ResyncRequired();
         if (change.revision == prior->revision) {
-            if (prior->schema != change.schema || prior->bytes != change.bytes)
+            Statement op(db_, "SELECT op_id FROM sync_projection WHERE consumer=? AND tenant=? "
+                              "AND space=? AND actor_type=? AND id=?");
+            op.text(1,consumer); bind_key(op,key,2);
+            if (op.step()!=SQLITE_ROW || prior->epoch != change.epoch ||
+                prior->schema != change.schema || prior->bytes != change.bytes ||
+                (!op.str(0).empty() && op.str(0) != change.operation_id))
                 throw std::logic_error("conflicting duplicate event");
             tx.commit(); return false;
         }
-        if (change.revision <= prior->revision ||
+        if (change.epoch < prior->epoch || change.revision <= prior->revision ||
             prior->revision == std::numeric_limits<std::int64_t>::max() ||
             change.revision != prior->revision + 1) throw ResyncRequired();
-        Statement s(db_, "UPDATE sync_projection SET revision=?,schema_fp=?,snapshot=? WHERE "
+        Statement s(db_, "UPDATE sync_projection SET epoch=?,revision=?,op_id=?,schema_fp=?,snapshot=? WHERE "
                          "consumer=? AND tenant=? AND space=? AND actor_type=? AND id=? AND revision=?");
-        s.i64(1,change.revision); s.text(2,change.schema); s.blob(3,change.bytes);
-        s.text(4,consumer); bind_key(s,key,5); s.i64(9,prior->revision); s.done();
+        s.i64(1,change.epoch); s.i64(2,change.revision); s.text(3,change.operation_id);
+        s.text(4,change.schema); s.blob(5,change.bytes);
+        s.text(6,consumer); bind_key(s,key,7); s.i64(11,prior->revision); s.done();
         if (sqlite3_changes(db_) != 1) throw std::logic_error("projection CAS failed");
         tx.commit(); return true;
     }
@@ -332,11 +341,11 @@ private:
         return {s.number(0),s.number(1),s.str(2),s.blob(3)};
     }
     std::optional<SyncSnapshot> projection_locked(std::string_view consumer, const SyncKey& key) {
-        Statement s(db_, "SELECT revision,schema_fp,snapshot FROM sync_projection WHERE "
+        Statement s(db_, "SELECT epoch,revision,schema_fp,snapshot FROM sync_projection WHERE "
                          "consumer=? AND tenant=? AND space=? AND actor_type=? AND id=?");
         s.text(1,consumer); bind_key(s,key,2);
         if (s.step()!=SQLITE_ROW) return std::nullopt;
-        return SyncSnapshot{0,s.number(0),s.str(1),s.blob(2)};
+        return SyncSnapshot{s.number(0),s.number(1),s.str(2),s.blob(3)};
     }
 };
 
