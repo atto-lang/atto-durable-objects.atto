@@ -31,6 +31,8 @@ int main() {
     limits.feed_entries = 1; // force paging for deterministic tests
     limits.outbox_entries_per_actor = 2;
     limits.dedupe_entries_per_actor = 3;
+    limits.actor_keys_per_database = 2;
+    limits.projection_consumers_per_actor = 1;
     rejects<std::invalid_argument>([&]{ auto invalid=limits; invalid.state_bytes=0; SqliteActorSync bad(primary,invalid); });
     rejects<std::invalid_argument>([&]{ auto invalid=limits; invalid.feed_bytes=519; SqliteActorSync bad(primary,invalid); });
     rejects<std::invalid_argument>([&]{ auto invalid=limits; invalid.feed_entries=0; SqliteActorSync bad(primary,invalid); });
@@ -39,7 +41,12 @@ int main() {
         SqliteActorSync replica(secondary,limits);
         source.activate(actor,1);
         source.activate(other,1);
+        rejects<std::length_error>([&]{source.activate({"tenant1","session","Actor","a3"},1);});
         replica.bootstrap_projection("worker",actor,source.snapshot(actor));
+        replica.bootstrap_projection("worker",actor,source.snapshot(actor));
+        rejects<std::length_error>([&]{
+            replica.bootstrap_projection("second-reader",actor,source.snapshot(actor));
+        });
         rejects<std::logic_error>([&]{replica.resync_projection("uninitialized",actor,source.snapshot(actor));});
         assert(source.commit(actor,1,0,"o1","c1","s1","aa","ok").revision==1);
         assert(source.commit(actor,1,1,"o2","c2","s1","bb","ok").revision==2);
