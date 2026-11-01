@@ -105,6 +105,7 @@ public:
                  "revision INTEGER NOT NULL, op_id TEXT NOT NULL DEFAULT '',"
                  "schema_fp TEXT NOT NULL, snapshot BLOB NOT NULL,"
                  "PRIMARY KEY(consumer,tenant,space,actor_type,id)) WITHOUT ROWID");
+            validate_existing_database_quotas();
         } catch (...) { sqlite3_close(db_); db_ = nullptr; throw; }
     }
     ~SqliteActorSync() { if (db_) sqlite3_close(db_); }
@@ -377,6 +378,32 @@ private:
     static void label_or_empty(std::string_view s) { if (!s.empty()) label(s); }
     static void bounded(std::string_view s, std::size_t limit) {
         if (s.size() > limit) throw std::length_error("sync payload too large");
+    }
+    // A process may reopen a database written with different quotas or a
+    // previous binary. Fail before exposing handles when persisted rows would
+    // violate the newly configured admission limits. These aggregate checks
+    // use fixed SQL, not caller-controlled table names.
+    void validate_existing_database_quotas() {
+        auto validate = [&](const char* sql, std::size_t maximum) {
+            Statement s(db_,sql);
+            if (s.step()!=SQLITE_ROW)
+                throw std::runtime_error("persisted quota inspection failed");
+            const auto value=s.number(0);
+            if (value<0 || static_cast<std::uint64_t>(value)>maximum)
+                throw std::length_error("persisted actor sync database exceeds configured limits");
+        };
+        validate("SELECT COUNT(*) FROM sync_objects",limits_.actor_keys_per_database);
+        validate("SELECT COALESCE(MAX(n),0) FROM (SELECT COUNT(*) AS n FROM sync_outbox "
+                 "GROUP BY tenant,space,actor_type,id)",limits_.outbox_entries_per_actor);
+        validate("SELECT COALESCE(MAX(n),0) FROM (SELECT COUNT(*) AS n FROM sync_operations "
+                 "GROUP BY tenant,space,actor_type,id)",limits_.dedupe_entries_per_actor);
+        validate("SELECT COALESCE(MAX(n),0) FROM (SELECT COUNT(*) AS n FROM sync_projection "
+                 "GROUP BY tenant,space,actor_type,id)",limits_.projection_consumers_per_actor);
+        validate("SELECT COALESCE(MAX(LENGTH(snapshot)),0) FROM sync_objects",limits_.state_bytes);
+        validate("SELECT COALESCE(MAX(LENGTH(snapshot)),0) FROM sync_outbox",limits_.state_bytes);
+        validate("SELECT COALESCE(MAX(LENGTH(snapshot)),0) FROM sync_projection",limits_.state_bytes);
+        validate("SELECT COALESCE(MAX(LENGTH(command)),0) FROM sync_operations",limits_.command_bytes);
+        validate("SELECT COALESCE(MAX(LENGTH(reply)),0) FROM sync_operations",limits_.reply_bytes);
     }
     std::size_t count_for(const SyncKey& key, const char* table) {
         // Fixed compile-time table allowlist only: no caller-controlled SQL identifiers.
