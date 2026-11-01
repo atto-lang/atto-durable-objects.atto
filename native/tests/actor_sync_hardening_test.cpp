@@ -94,6 +94,24 @@ int main() {
         assert(source.commit(actor,2,0,"o1","c1","s1","ignored","ok").duplicate);
         rejects<std::logic_error>([&]{source.commit(actor,2,0,"o1","forged","s1","ignored","ok");});
     }
+    // Reopen with stricter quotas must fail before exposing even a read
+    // handle; an existing database cannot silently bypass new admission.
+    {
+        auto smaller=limits;
+        smaller.actor_keys_per_database=1;
+        rejects<std::length_error>([&]{SqliteActorSync reject(primary,smaller);});
+        smaller=limits;
+        smaller.outbox_entries_per_actor=1;
+        rejects<std::length_error>([&]{SqliteActorSync reject(primary,smaller);});
+        smaller=limits;
+        smaller.dedupe_entries_per_actor=2;
+        rejects<std::length_error>([&]{SqliteActorSync reject(primary,smaller);});
+        smaller=limits;
+        smaller.state_bytes=1;
+        rejects<std::length_error>([&]{SqliteActorSync reject(primary,smaller);});
+        SqliteActorSync valid(primary,limits);
+        assert(valid.snapshot(actor).revision==3);
+    }
     // Exact-byte budget pagination leaves the second event unread, even
     // though the SQL LIMIT is larger than one. The unfinished SELECT must be
     // finalized before COMMIT; a following page must remain accessible.
