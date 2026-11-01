@@ -215,23 +215,28 @@ public:
         if (cutoff.step() != SQLITE_ROW) throw std::logic_error("missing sync object");
         if (after > info.revision || after < cutoff.number(0)) throw ResyncRequired();
         std::vector<SyncChange> changes;
-        Statement s(db_, "SELECT epoch,revision,op_id,schema_fp,snapshot FROM sync_outbox "
-                         "WHERE tenant=? AND space=? AND actor_type=? AND id=? AND revision>? "
-                         "ORDER BY revision LIMIT ?");
-        bind_key(s, key); s.i64(5, after); s.i64(6, static_cast<std::int64_t>(limit));
-        std::int64_t previous = after;
-        std::size_t used = 0;
-        while (s.step() == SQLITE_ROW) {
-            const auto revision = s.number(1);
-            if (previous == std::numeric_limits<std::int64_t>::max() || revision != previous + 1)
-                throw ResyncRequired();
-            SyncChange change{s.number(0), revision, s.str(2), s.str(3), s.blob(4)};
-            const auto amount = change.bytes.size() + change.schema.size() + change.operation_id.size();
-            if (amount > limits_.feed_bytes) throw std::length_error("one sync event exceeds total feed budget");
-            if (used > limits_.feed_bytes - amount) break; // page boundary; cursor remains previous
-            used += amount;
-            changes.push_back(std::move(change));
-            previous = revision;
+        {
+            // Finalize the potentially unfinished SELECT (including a byte-budget
+            // page break) before committing the WAL read transaction. Otherwise
+            // SQLite may retain a live statement/cursor across COMMIT.
+            Statement s(db_, "SELECT epoch,revision,op_id,schema_fp,snapshot FROM sync_outbox "
+                             "WHERE tenant=? AND space=? AND actor_type=? AND id=? AND revision>? "
+                             "ORDER BY revision LIMIT ?");
+            bind_key(s, key); s.i64(5, after); s.i64(6, static_cast<std::int64_t>(limit));
+            std::int64_t previous = after;
+            std::size_t used = 0;
+            while (s.step() == SQLITE_ROW) {
+                const auto revision = s.number(1);
+                if (previous == std::numeric_limits<std::int64_t>::max() || revision != previous + 1)
+                    throw ResyncRequired();
+                SyncChange change{s.number(0), revision, s.str(2), s.str(3), s.blob(4)};
+                const auto amount = change.bytes.size() + change.schema.size() + change.operation_id.size();
+                if (amount > limits_.feed_bytes) throw std::length_error("one sync event exceeds total feed budget");
+                if (used > limits_.feed_bytes - amount) break;
+                used += amount;
+                changes.push_back(std::move(change));
+                previous = revision;
+            }
         }
         if (changes.empty() && after != info.revision) throw ResyncRequired();
         tx.commit();
@@ -324,7 +329,7 @@ public:
             op.text(1,consumer); bind_key(op,key,2);
             if (op.step()!=SQLITE_ROW || prior->epoch != change.epoch ||
                 prior->schema != change.schema || prior->bytes != change.bytes ||
-                (!op.str(0).empty() && op.str(0) != change.operation_id))
+                (op.str(0).empty() || op.str(0) != change.operation_id))
                 throw std::logic_error("conflicting duplicate event");
             tx.commit(); return false;
         }
