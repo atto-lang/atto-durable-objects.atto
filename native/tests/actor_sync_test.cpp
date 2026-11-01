@@ -79,6 +79,7 @@ int main() {
         auto dup=source.commit(key,1,0,"op-1","add one","cart.v1","bad","no");
         assert(dup.duplicate && dup.revision==1 && dup.reply=="reply-one");
         rejects<std::logic_error>([&]{source.commit(key,1,1,"op-1","different","cart.v1","bad","no");});
+        rejects<std::logic_error>([&]{source.commit(key,1,1,"op-1","add one","cart.v2","bad","no");});
         rejects<std::logic_error>([&]{source.commit(key,1,0,"op-2","add two","cart.v1","two","r2");});
         assert(source.commit(key,1,1,"op-2","add two","cart.v1","two","reply-two").revision==2);
         assert(source.snapshot(foreign).revision==0);
@@ -101,6 +102,7 @@ int main() {
         rejects<ResyncRequired>([&]{replica.apply_projection("replica1",key,{2,5,"op-5","cart.v1","five"});});
         assert(replica.apply_projection("replica1",key,events[0]));
         assert(!replica.apply_projection("replica1",key,events[0]));
+        rejects<std::logic_error>([&]{replica.apply_projection("replica1",key,{2,3,"forged","cart.v1","three"});});
         rejects<std::logic_error>([&]{replica.apply_projection("replica1",key,{2,3,"op-3","cart.v1","conflict"});});
         source.compact(key,2,2);
         rejects<ResyncRequired>([&]{source.changes_after(key,1);});
