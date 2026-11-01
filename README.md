@@ -63,3 +63,13 @@ require execution on the merged tree before CI/merge readiness can be claimed.
 See [native API proposal](docs/API_V0.md) and
 [LLVM integration gates](docs/LLVM_INTEGRATION.md). The optional LLVM adapter
 has not been compiled against the private LLVM integration branch.
+
+## Orleans-inspired state sync (host reference)
+
+The draft [two-process sync reference](docs/ORLEANS_ACTOR_SYNC_REFERENCE.md) adds
+WAL-committed actor snapshots, version/epoch fencing, immutable operation-key
+replay, a revisioned outbox, snapshot+cursor catchup, and durable reader
+projections. A test uses two OS processes and separate replica SQLite storage.
+It is **trusted C++ host-only**, not a compiled Oreslang actor, network transport,
+distributed leader election, or production guest ABI. [Issue #10](https://github.com/ores-truffle-oreslang/oreslang-durable-objects.ores/issues/10)
+tracks the missing Oreslang guest integration and cross-backend parity.
