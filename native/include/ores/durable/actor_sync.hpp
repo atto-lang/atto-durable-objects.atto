@@ -197,7 +197,7 @@ public:
         if (after < 0 || limit == 0 || limit > 256) throw std::invalid_argument("invalid feed cursor/limit");
         limit = std::min(limit, limits_.feed_entries);
         std::lock_guard<std::mutex> lock(mu_);
-        Tx tx(*this);
+        Tx tx(*this, false); // WAL read snapshot: do not acquire SQLite writer reservation
         const auto info = snapshot_locked(key);
         Statement cutoff(db_, "SELECT pruned_through FROM sync_objects WHERE "
                               "tenant=? AND space=? AND actor_type=? AND id=?");
@@ -406,7 +406,9 @@ private:
         SqliteActorSync& store_;
         bool committed_=false;
     public:
-        explicit Tx(SqliteActorSync& store):store_(store) { store_.exec("BEGIN IMMEDIATE"); }
+        explicit Tx(SqliteActorSync& store, bool write=true):store_(store) {
+            store_.exec(write ? "BEGIN IMMEDIATE" : "BEGIN DEFERRED");
+        }
         ~Tx() { if (!committed_) sqlite3_exec(store_.db_,"ROLLBACK",nullptr,nullptr,nullptr); }
         void commit() { store_.exec("COMMIT"); committed_=true; }
     };
