@@ -41,9 +41,25 @@ public:
     ResyncRequired() : std::logic_error("sync cursor requires a fresh snapshot") {}
 };
 
+struct SyncLimits {
+    std::size_t state_bytes = 1 << 20;
+    std::size_t command_bytes = 1 << 20;
+    std::size_t reply_bytes = 1 << 20;
+    std::size_t feed_bytes = 4 << 20;
+    std::size_t outbox_entries_per_actor = 4096;
+    std::size_t dedupe_entries_per_actor = 8192;
+};
+
 class SqliteActorSync final {
 public:
-    explicit SqliteActorSync(const std::string& path) {
+    explicit SqliteActorSync(const std::string& path, SyncLimits limits = {}) : limits_(limits) {
+        if (limits_.state_bytes == 0 || limits_.command_bytes == 0 ||
+            limits_.reply_bytes == 0 || limits_.feed_bytes < limits_.state_bytes ||
+            limits_.outbox_entries_per_actor == 0 || limits_.dedupe_entries_per_actor == 0 ||
+            limits_.state_bytes > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            limits_.command_bytes > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            limits_.reply_bytes > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            throw std::invalid_argument("invalid actor sync resource limits");
         if (path.empty()) throw std::invalid_argument("empty sync store path");
         const int rc = sqlite3_open_v2(path.c_str(), &db_,
             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nullptr);
@@ -119,7 +135,8 @@ public:
                       std::string_view next_state, std::string_view reply,
                       bool inject_precommit_failure = false) {
         validate_key(key); label(operation_id); label(schema_fp);
-        bounded(command); bounded(next_state); bounded(reply);
+        bounded(command, limits_.command_bytes); bounded(next_state, limits_.state_bytes);
+        bounded(reply, limits_.reply_bytes);
         if (expected_revision < 0 || epoch <= 0) throw std::invalid_argument("invalid expected revision / epoch");
         std::lock_guard<std::mutex> lock(mu_);
         Tx tx(*this);
@@ -138,6 +155,10 @@ public:
             }
         }
         if (old.revision != expected_revision) throw std::logic_error("revision conflict");
+        if (count_for(key, "sync_operations") >= limits_.dedupe_entries_per_actor)
+            throw std::length_error("durable operation retention quota exhausted");
+        if (count_for(key, "sync_outbox") >= limits_.outbox_entries_per_actor)
+            throw std::length_error("durable outbox retention quota exhausted");
         if (old.revision == std::numeric_limits<std::int64_t>::max())
             throw std::overflow_error("revision exhausted");
         const auto revision = old.revision + 1;
@@ -184,11 +205,17 @@ public:
                          "ORDER BY revision LIMIT ?");
         bind_key(s, key); s.i64(5, after); s.i64(6, static_cast<std::int64_t>(limit));
         std::int64_t previous = after;
+        std::size_t used = 0;
         while (s.step() == SQLITE_ROW) {
             const auto revision = s.number(1);
             if (previous == std::numeric_limits<std::int64_t>::max() || revision != previous + 1)
                 throw ResyncRequired();
-            changes.push_back({s.number(0), revision, s.str(2), s.str(3), s.blob(4)});
+            SyncChange change{s.number(0), revision, s.str(2), s.str(3), s.blob(4)};
+            const auto amount = change.bytes.size() + change.schema.size() + change.operation_id.size();
+            if (amount > limits_.feed_bytes) throw std::length_error("one sync event exceeds total feed budget");
+            if (used > limits_.feed_bytes - amount) break; // page boundary; cursor remains previous
+            used += amount;
+            changes.push_back(std::move(change));
             previous = revision;
         }
         if (changes.empty() && after != info.revision) throw ResyncRequired();
@@ -217,7 +244,7 @@ public:
     // Projection operations are *trusted host adapters*, not guest-authorized
     // feeds. The projection DB may be physically separate from the source DB.
     void bootstrap_projection(std::string_view consumer, const SyncKey& key, const SyncSnapshot& ss) {
-        label(consumer); validate_key(key); label_or_empty(ss.schema); bounded(ss.bytes);
+        label(consumer); validate_key(key); label_or_empty(ss.schema); bounded(ss.bytes, limits_.state_bytes);
         if (ss.revision < 0) throw std::invalid_argument("negative projection revision");
         std::lock_guard<std::mutex> lock(mu_);
         Tx tx(*this);
@@ -233,7 +260,8 @@ public:
         tx.commit();
     }
     bool apply_projection(std::string_view consumer, const SyncKey& key, const SyncChange& change) {
-        label(consumer); validate_key(key); label(change.schema); label(change.operation_id); bounded(change.bytes);
+        label(consumer); validate_key(key); label(change.schema); label(change.operation_id);
+        bounded(change.bytes, limits_.state_bytes);
         if (change.revision <= 0 || change.epoch <= 0) throw std::invalid_argument("invalid change");
         std::lock_guard<std::mutex> lock(mu_);
         Tx tx(*this);
@@ -270,7 +298,7 @@ public:
 
 private:
     static constexpr std::size_t max_label = 256;
-    static constexpr std::size_t max_bytes = 1 << 20;
+    const SyncLimits limits_;
     sqlite3* db_ = nullptr;
     std::mutex mu_;
     static void label(std::string_view s) {
@@ -278,7 +306,22 @@ private:
             throw std::invalid_argument("invalid sync key");
     }
     static void label_or_empty(std::string_view s) { if (!s.empty()) label(s); }
-    static void bounded(std::string_view s) { if (s.size() > max_bytes) throw std::length_error("sync payload too large"); }
+    static void bounded(std::string_view s, std::size_t limit) {
+        if (s.size() > limit) throw std::length_error("sync payload too large");
+    }
+    std::size_t count_for(const SyncKey& key, const char* table) {
+        // Fixed compile-time table allowlist only: no caller-controlled SQL identifiers.
+        const char* sql = nullptr;
+        if (std::string_view(table) == "sync_operations")
+            sql = "SELECT COUNT(*) FROM sync_operations WHERE tenant=? AND space=? AND actor_type=? AND id=?";
+        else if (std::string_view(table) == "sync_outbox")
+            sql = "SELECT COUNT(*) FROM sync_outbox WHERE tenant=? AND space=? AND actor_type=? AND id=?";
+        else throw std::invalid_argument("invalid quota table");
+        Statement s(db_, sql);
+        bind_key(s, key);
+        if (s.step() != SQLITE_ROW) throw std::runtime_error("quota query failed");
+        return static_cast<std::size_t>(s.number(0));
+    }
     static void validate_key(const SyncKey& k) { label(k.tenant); label(k.name_space); label(k.actor_type); label(k.object_id); }
     void exec(const char* sql) {
         char* err = nullptr;
