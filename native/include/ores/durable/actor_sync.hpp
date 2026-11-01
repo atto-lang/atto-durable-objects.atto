@@ -156,6 +156,7 @@ public:
         Tx tx(*this);
         const auto old = snapshot_locked(key);
         if (old.epoch != epoch) throw std::logic_error("stale writer epoch");
+        std::optional<SyncCommit> replay;
         {
             Statement s(db_, "SELECT command,schema_fp,revision,reply FROM sync_operations WHERE "
                              "tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?");
@@ -163,11 +164,10 @@ public:
             if (s.step() == SQLITE_ROW) {
                 if (s.blob(0) != command || s.str(1) != schema_fp)
                     throw std::logic_error("operation id reused with different command/schema");
-                const auto result = SyncCommit{s.number(2), s.blob(3), true};
-                tx.commit();
-                return result;
+                replay = SyncCommit{s.number(2), s.blob(3), true};
             }
         }
+        if (replay) { tx.commit(); return *replay; }
         if (old.revision != expected_revision) throw std::logic_error("revision conflict");
         if (count_for(key, "sync_operations") >= limits_.dedupe_entries_per_actor)
             throw std::length_error("durable operation retention quota exhausted");
@@ -209,11 +209,15 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         Tx tx(*this, false); // WAL read snapshot: do not acquire SQLite writer reservation
         const auto info = snapshot_locked(key);
-        Statement cutoff(db_, "SELECT pruned_through FROM sync_objects WHERE "
-                              "tenant=? AND space=? AND actor_type=? AND id=?");
-        bind_key(cutoff, key);
-        if (cutoff.step() != SQLITE_ROW) throw std::logic_error("missing sync object");
-        if (after > info.revision || after < cutoff.number(0)) throw ResyncRequired();
+        std::int64_t pruned_through = -1;
+        {
+            Statement cutoff(db_, "SELECT pruned_through FROM sync_objects WHERE "
+                                  "tenant=? AND space=? AND actor_type=? AND id=?");
+            bind_key(cutoff, key);
+            if (cutoff.step() != SQLITE_ROW) throw std::logic_error("missing sync object");
+            pruned_through = cutoff.number(0);
+        }
+        if (after > info.revision || after < pruned_through) throw ResyncRequired();
         std::vector<SyncChange> changes;
         {
             // Finalize the potentially unfinished SELECT (including a byte-budget
@@ -324,13 +328,20 @@ public:
         const auto prior = projection_locked(consumer,key);
         if (!prior) throw ResyncRequired();
         if (change.revision == prior->revision) {
-            Statement op(db_, "SELECT op_id FROM sync_projection WHERE consumer=? AND tenant=? "
-                              "AND space=? AND actor_type=? AND id=?");
-            op.text(1,consumer); bind_key(op,key,2);
-            if (op.step()!=SQLITE_ROW || prior->epoch != change.epoch ||
-                prior->schema != change.schema || prior->bytes != change.bytes ||
-                (op.str(0).empty() || op.str(0) != change.operation_id))
-                throw std::logic_error("conflicting duplicate event");
+            std::string previous_op;
+            {
+                Statement op(db_, "SELECT op_id FROM sync_projection WHERE consumer=? AND tenant=? "
+                                  "AND space=? AND actor_type=? AND id=?");
+                op.text(1,consumer); bind_key(op,key,2);
+                if (op.step()!=SQLITE_ROW) throw std::logic_error("projection lost identity");
+                previous_op = op.str(0);
+            }
+            // A snapshot checkpoint has no verifiable event ID. It may never
+            // impersonate an authenticated previously-applied event.
+            if (prior->epoch != change.epoch || prior->schema != change.schema ||
+                prior->bytes != change.bytes || previous_op.empty() ||
+                previous_op != change.operation_id)
+                throw std::logic_error("conflicting or unproven duplicate event");
             tx.commit(); return false;
         }
         if (change.epoch < prior->epoch || change.revision <= prior->revision ||
