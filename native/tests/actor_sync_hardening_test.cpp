@@ -1,5 +1,6 @@
 #include "ores/durable/actor_sync.hpp"
 #include <atomic>
+#include <chrono>
 #include <cassert>
 #include <cstdlib>
 #include <filesystem>
@@ -98,6 +99,38 @@ int main() {
         assert(accepted==1 && conflicts==1);
         assert(a.snapshot(race).revision==1);
         assert(a.changes_after(race,0).size()==1);
+    }
+    // Separate SQLite connections: polling uses a read-only WAL snapshot
+    // while 100 bounded commits progress. No sleeps or unbounded waits.
+    {
+        const SyncKey stream{"tenant3","session","Updates","clock"};
+        SqliteActorSync writer(primary), reader(primary);
+        writer.activate(stream,1);
+        std::atomic<bool> finished{false};
+        std::atomic<int> writer_errors{0};
+        std::thread producer([&]{
+            try {
+                for (std::int64_t i=1;i<=100;++i) {
+                    const auto id=std::to_string(i);
+                    writer.commit(stream,1,i-1,id,id,"tick.v1",id,"ok");
+                }
+            } catch(...) { ++writer_errors; }
+            finished=true;
+        });
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(15);
+        std::int64_t seen=0;
+        while(seen<100 && std::chrono::steady_clock::now()<deadline) {
+            const auto changes=reader.changes_after(stream,seen,16);
+            for(const auto& change:changes) {
+                assert(change.revision==seen+1);
+                assert(change.bytes==std::to_string(change.revision));
+                seen=change.revision;
+            }
+            if(changes.empty()) std::this_thread::yield();
+            if(finished && writer_errors) break;
+        }
+        producer.join();
+        assert(writer_errors==0 && seen==100 && reader.snapshot(stream).revision==100);
     }
     std::filesystem::remove_all(dir);
 }
