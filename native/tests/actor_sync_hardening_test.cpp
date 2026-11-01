@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -49,7 +50,7 @@ int main() {
         rejects<ResyncRequired>([&]{replica.apply_projection("worker",actor,{1,3,"o3","s1","cc"});});
         rejects<std::length_error>([&]{source.commit(actor,1,2,"o3","c3","s1","cc","ok");});
         assert(source.snapshot(actor).revision==2);
-        assert(!source.commit(actor,1,2,"o2","c2","s1","bad","bad").duplicate==false);
+        assert(source.commit(actor,1,2,"o2","c2","s1","bad","bad").duplicate);
         rejects<std::logic_error>([&]{source.commit(actor,1,2,"o2","c2","s2","bad","bad");});
         source.compact(actor,1,1);
         rejects<ResyncRequired>([&]{source.changes_after(actor,0);});
