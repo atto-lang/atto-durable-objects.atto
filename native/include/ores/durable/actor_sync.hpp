@@ -254,10 +254,12 @@ public:
         Tx tx(*this);
         const auto s = snapshot_locked(key);
         if (s.epoch != epoch || through > s.revision) throw std::logic_error("stale epoch / invalid compaction");
-        Statement read(db_, "SELECT pruned_through FROM sync_objects WHERE tenant=? AND space=? AND actor_type=? AND id=?");
-        bind_key(read, key);
-        if (read.step() != SQLITE_ROW || through < read.number(0))
-            throw std::logic_error("compaction watermark regression");
+        {
+            Statement read(db_, "SELECT pruned_through FROM sync_objects WHERE tenant=? AND space=? AND actor_type=? AND id=?");
+            bind_key(read, key);
+            if (read.step() != SQLITE_ROW || through < read.number(0))
+                throw std::logic_error("compaction watermark regression");
+        }
         Statement del(db_, "DELETE FROM sync_outbox WHERE tenant=? AND space=? AND actor_type=? AND id=? AND revision<=?");
         bind_key(del, key); del.i64(5, through); del.done();
         Statement set(db_, "UPDATE sync_objects SET pruned_through=? WHERE tenant=? AND space=? AND actor_type=? AND id=?");
