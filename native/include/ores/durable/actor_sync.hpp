@@ -1,6 +1,7 @@
 #pragma once
 
 #include <sqlite3.h>
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <mutex>
@@ -46,6 +47,7 @@ struct SyncLimits {
     std::size_t command_bytes = 1 << 20;
     std::size_t reply_bytes = 1 << 20;
     std::size_t feed_bytes = 4 << 20;
+    std::size_t feed_entries = 64;
     std::size_t outbox_entries_per_actor = 4096;
     std::size_t dedupe_entries_per_actor = 8192;
 };
@@ -54,7 +56,9 @@ class SqliteActorSync final {
 public:
     explicit SqliteActorSync(const std::string& path, SyncLimits limits = {}) : limits_(limits) {
         if (limits_.state_bytes == 0 || limits_.command_bytes == 0 ||
-            limits_.reply_bytes == 0 || limits_.feed_bytes < limits_.state_bytes ||
+            limits_.reply_bytes == 0 ||
+            limits_.feed_bytes < limits_.state_bytes + 2 * max_label ||
+            limits_.feed_entries == 0 || limits_.feed_entries > 256 ||
             limits_.outbox_entries_per_actor == 0 || limits_.dedupe_entries_per_actor == 0 ||
             limits_.state_bytes > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
             limits_.command_bytes > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
@@ -191,6 +195,7 @@ public:
                                            std::size_t limit = 64) {
         validate_key(key);
         if (after < 0 || limit == 0 || limit > 256) throw std::invalid_argument("invalid feed cursor/limit");
+        limit = std::min(limit, limits_.feed_entries);
         std::lock_guard<std::mutex> lock(mu_);
         Tx tx(*this);
         const auto info = snapshot_locked(key);
