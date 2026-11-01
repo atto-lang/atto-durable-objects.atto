@@ -74,6 +74,11 @@ int main() {
         rejects<std::logic_error>([&]{replica.resync_projection("worker",actor,{1,2,"s1","bb"});});
         rejects<std::logic_error>([&]{replica.resync_projection("worker",actor,{1,3,"s1","evil"});});
         assert(replica.projection("worker",actor).revision==3);
+        // A checkpoint has no recorded event ID. It must not accept a forged
+        // same-revision event merely because its snapshot bytes match.
+        rejects<std::logic_error>([&]{
+            replica.apply_projection("worker",actor,{1,3,"fabricated","s1","cc"});
+        });
         source.activate(actor,2);
         rejects<std::logic_error>([&]{source.commit(actor,1,3,"late","cmd","s1","dd","ok");});
         assert(replica.resync_projection("worker",actor,source.snapshot(actor)));
@@ -88,6 +93,31 @@ int main() {
         assert(replica.projection("worker",actor).bytes=="cc");
         assert(source.commit(actor,2,0,"o1","c1","s1","ignored","ok").duplicate);
         rejects<std::logic_error>([&]{source.commit(actor,2,0,"o1","forged","s1","ignored","ok");});
+    }
+    // Exact-byte budget pagination leaves the second event unread, even
+    // though the SQL LIMIT is larger than one. The unfinished SELECT must be
+    // finalized before COMMIT; a following page must remain accessible.
+    {
+        SyncLimits byte_limits;
+        byte_limits.state_bytes=8;
+        byte_limits.command_bytes=8;
+        byte_limits.reply_bytes=8;
+        byte_limits.feed_bytes=520;
+        byte_limits.feed_entries=8;
+        byte_limits.outbox_entries_per_actor=2;
+        const std::string db=std::string(dir)+"/byte-pages.db";
+        SqliteActorSync source(db,byte_limits);
+        const SyncKey key{"tenant","space","Actor","big-labels"};
+        source.activate(key,1);
+        const std::string label(250,'q');
+        const std::string schema(250,'s');
+        source.commit(key,1,0,label+"1","command",schema,"one","ok");
+        source.commit(key,1,1,label+"2","command",schema,"two","ok");
+        auto first=source.changes_after(key,0,8);
+        assert(first.size()==1 && first.front().revision==1);
+        auto second=source.changes_after(key,first.back().revision,8);
+        assert(second.size()==1 && second.front().revision==2);
+        assert(source.changes_after(key,2,8).empty());
     }
     // Two independent DB connections racing on the exact same actor/revision.
     {
