@@ -90,11 +90,37 @@ int main() {
     int status=0;
     assert(waitpid(pid,&status,0)==pid);
     assert(WIFEXITED(status) && WEXITSTATUS(status)==0);
+    // A second writer process opens its *own* connection before a takeover.
+    // After trusted controller rotates epoch, its stale commit must be denied.
+    int stale_ready[2], stale_go[2];
+    assert(pipe(stale_ready)==0 && pipe(stale_go)==0);
+    pid_t stale_writer=fork();
+    assert(stale_writer>=0);
+    if(stale_writer==0) {
+        close(stale_ready[0]); close(stale_go[1]);
+        try {
+            SqliteActorSync stale(primary);
+            const auto old=stale.snapshot(key);
+            if(old.epoch!=1 || old.revision!=2) _exit(9);
+            byte(stale_ready[1],'S');
+            if(byte(stale_go[0])!='T') _exit(10);
+            try { stale.commit(key,1,2,"stale-process","old","cart.v1","bad","bad"); }
+            catch(const std::logic_error&) { _exit(0); }
+        } catch(...) { _exit(11); }
+        _exit(12);
+    }
+    close(stale_ready[1]); close(stale_go[0]);
+    assert(byte(stale_ready[0])=='S');
     {
         SqliteActorSync source(primary), replica(secondary);
         const auto end=replica.projection("replica1",key);
         assert(end.revision==2 && end.bytes=="two");
         source.activate(key,2);
+        byte(stale_go[1],'T');
+        close(stale_go[1]); close(stale_ready[0]);
+        int stale_status=0;
+        assert(waitpid(stale_writer,&stale_status,0)==stale_writer);
+        assert(WIFEXITED(stale_status) && WEXITSTATUS(stale_status)==0);
         rejects<std::logic_error>([&]{source.commit(key,1,2,"stale","x","cart.v1","three","r3");});
         assert(source.commit(key,2,2,"op-3","three","cart.v1","three","ok").revision==3);
         auto events=source.changes_after(key,2);
