@@ -245,7 +245,8 @@ public:
     // feeds. The projection DB may be physically separate from the source DB.
     void bootstrap_projection(std::string_view consumer, const SyncKey& key, const SyncSnapshot& ss) {
         label(consumer); validate_key(key); label_or_empty(ss.schema); bounded(ss.bytes, limits_.state_bytes);
-        if (ss.revision < 0) throw std::invalid_argument("negative projection revision");
+        if (ss.epoch <= 0 || ss.revision < 0)
+            throw std::invalid_argument("invalid projection snapshot epoch/revision");
         std::lock_guard<std::mutex> lock(mu_);
         Tx tx(*this);
         Statement s(db_, "INSERT INTO sync_projection VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING");
@@ -259,6 +260,37 @@ public:
         }
         tx.commit();
     }
+    // Trusted resync after the source explicitly reports a compacted/gapped
+    // cursor. The trusted broker must supply an authenticated, consistent
+    // snapshot from the source; a network client cannot invoke this directly.
+    // Never downgrade a stored cursor or silently rewrite an equal revision.
+    bool resync_projection(std::string_view consumer, const SyncKey& key,
+                           const SyncSnapshot& ss) {
+        label(consumer); validate_key(key); label_or_empty(ss.schema);
+        bounded(ss.bytes, limits_.state_bytes);
+        if (ss.epoch <= 0 || ss.revision < 0)
+            throw std::invalid_argument("invalid resync epoch/revision");
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this);
+        const auto prior = projection_locked(consumer,key);
+        if (!prior) throw std::logic_error("projection must be bootstrapped before resync");
+        if (ss.epoch < prior->epoch || ss.revision < prior->revision)
+            throw std::logic_error("projection resync cannot move backward");
+        if (ss.revision == prior->revision) {
+            if (ss.bytes != prior->bytes || ss.schema != prior->schema)
+                throw std::logic_error("same-revision resync conflicts with projection");
+            if (ss.epoch == prior->epoch) { tx.commit(); return false; }
+        }
+        Statement update(db_, "UPDATE sync_projection SET epoch=?,revision=?,op_id='',schema_fp=?,snapshot=? "
+                              "WHERE consumer=? AND tenant=? AND space=? AND actor_type=? AND id=? AND revision=?");
+        update.i64(1,ss.epoch); update.i64(2,ss.revision);
+        update.text(3,ss.schema); update.blob(4,ss.bytes);
+        update.text(5,consumer); bind_key(update,key,6); update.i64(10,prior->revision);
+        update.done();
+        if (sqlite3_changes(db_) != 1) throw std::logic_error("projection resync CAS lost");
+        tx.commit(); return true;
+    }
+
     bool apply_projection(std::string_view consumer, const SyncKey& key, const SyncChange& change) {
         label(consumer); validate_key(key); label(change.schema); label(change.operation_id);
         bounded(change.bytes, limits_.state_bytes);
