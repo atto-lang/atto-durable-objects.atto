@@ -75,3 +75,13 @@ The repository's `native-ci.yml` additionally builds the test under GCC and Clan
 - Multi-host owner fencing and source-compiled Java, LLVM, Wasm, Cranelift, .NET Native AOT parity are still not implemented. Source-guest conformance inventory: [platform-conformance PR #300](https://github.com/ores-truffle-oreslang/oreslang-platform-conformance/pull/300), AS01–AS24.
 
 **Latest CI status:** attempted GitHub workflows may show `failure` with no runner admission and `steps=null`. Such a run cannot establish a compiled test outcome, positive or negative. Verify exact PR head, nonzero steps, raw sanitizer output and native Oreslang guest receipts before promotion.
+
+## Recovery and reopened-store audit (2026-11-01 follow-up)
+
+- SQLite SELECT statements for duplicate operation lookup, changefeed watermark, paginated stream, duplicate projection recognition and compaction watermark are finalized **before** transactions commit. A partial page may end while SQLite still has rows; release its cursor before COMMIT.
+- A projection bootstrapped from a snapshot lacks a verifiable previous operation ID. A same-revision event with matching bytes is **not** sufficient to establish a deduplicated event; an exact previously recorded operation ID is required.
+- Reopening existing storage with stricter limits now checks persisted actor count, per-actor outbox/dedup/consumer cardinality, and stored state/command/reply maximum blob sizes. An incompatible database is rejected during construction.
+- The new fork-based crash/recovery test commits then exits before sending an application reply, and verifies stable deduplication and changefeed state after reopening. It also tests pre-COMMIT **exception rollback followed by process exit**. It does **not** simulate a hard process kill in the middle of an internal SQLite COMMIT.
+- Additional tests cover exact-byte pagination, a forged equal-revision checkpoint, and persisted quota downgrades.
+
+These are **authored host tests**; they cannot be claimed to pass the amended commit until exact-head CI executes. Compiler-backed native Oreslang guest persistence, async transport, distributed lease authority and five-backend parity remain pending. [Java source-progress PR #2442](https://github.com/ores-truffle-oreslang/oreslang-source.java/pull/2442) supplies only the native Oreslang cursor/uncertain-operation metadata slice.
