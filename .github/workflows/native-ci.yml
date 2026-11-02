@@ -59,6 +59,11 @@ jobs:
             -Inative/include native/tests/actor_sync_crash_recovery_test.cpp -lsqlite3 \
             -o "$RUNNER_TEMP/actor-sync-crash-test"
           "$RUNNER_TEMP/actor-sync-crash-test"
+          "$CXX" -std=c++17 -pthread -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG \
+            -fno-omit-frame-pointer -fsanitize=address,undefined \
+            -Inative/include native/tests/actor_sync_cart_e2e_test.cpp -lsqlite3 \
+            -o "$RUNNER_TEMP/actor-sync-cart-test"
+          "$RUNNER_TEMP/actor-sync-cart-test"
           echo "ACTOR_SYNC_TWO_PROCESS_ASAN_UBSAN_PASS=$EXPECTED_SHA"
           echo "ACTOR_SYNC_HARDENING_ASAN_UBSAN_PASS=$EXPECTED_SHA"
           echo "EXACT_HEAD_NATIVE_ASAN_UBSAN_PASS=${{ github.event.pull_request.head.sha || github.sha }}"
