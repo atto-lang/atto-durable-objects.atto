@@ -85,3 +85,9 @@ The repository's `native-ci.yml` additionally builds the test under GCC and Clan
 - Additional tests cover exact-byte pagination, a forged equal-revision checkpoint, and persisted quota downgrades.
 
 These are **authored host tests**; they cannot be claimed to pass the amended commit until exact-head CI executes. Compiler-backed native Oreslang guest persistence, async transport, distributed lease authority and five-backend parity remain pending. [Java source-progress PR #2442](https://github.com/ores-truffle-oreslang/oreslang-source.java/pull/2442) supplies only the native Oreslang cursor/uncertain-operation metadata slice.
+
+## Cart host reference milestone
+
+The new `native/tests/actor_sync_cart_e2e_test.cpp` exercises one named tenant-scoped Cart identity with source and replica **on separate SQLite WAL databases**: activation, two committed state transitions, source handle teardown/reopening, exactly-once replay of the previously committed command, source outbox compaction, explicit consumer snapshot resync, subsequent changefeed delivery, equal-revision forgery rejection, stale epoch fencing, and independence from the same object ID under another tenant. Registered through CMake/CTest and GCC/Clang ASan+UBSan.
+
+This is **not** a compiled `.ores` actor or asynchronous guest I/O integration. No process-level SIGKILL test, scheduler suspension, distributed lease, or authenticated tenant capability is proven by this C++ host reference. The separately authored Java source module `stdlib/actor_sync.ores` and its guest fixture remain subject to exact-head compiled execution.
