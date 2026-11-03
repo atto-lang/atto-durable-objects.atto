@@ -3,6 +3,7 @@
 #include <sqlite3.h>
 #include <cstddef>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <mutex>
@@ -10,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -79,7 +81,7 @@ public:
         }
         try {
             sqlite3_busy_timeout(db_, 5000);
-            exec("PRAGMA journal_mode=WAL");
+            ensure_wal_mode();
             exec("PRAGMA synchronous=FULL");
             exec("PRAGMA foreign_keys=ON");
             // Serialize the first-open schema bootstrap/migration across
@@ -491,6 +493,39 @@ private:
         return static_cast<std::size_t>(s.number(0));
     }
     static void validate_key(const SyncKey& k) { label(k.tenant); label(k.name_space); label(k.actor_type); label(k.object_id); }
+    void ensure_wal_mode() {
+        // Journal mode changes must occur outside a transaction. Two host
+        // processes can race while upgrading an old DELETE-mode database to
+        // WAL, before our BEGIN IMMEDIATE migration gate is acquired.
+        // Retry ONLY SQLite contention errors within a fixed time budget;
+        // do not silently continue in DELETE mode or block a guest carrier.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        for (;;) {
+            bool confirmed_wal = false;
+            char* error = nullptr;
+            const int result = sqlite3_exec(
+                db_, "PRAGMA journal_mode=WAL",
+                [](void* output, int count, char** values, char**) -> int {
+                    if (count > 0 && values && values[0]
+                        && std::string_view(values[0]) == "wal")
+                        *static_cast<bool*>(output) = true;
+                    return 0;
+                }, &confirmed_wal, &error);
+            const std::string why = error ? error : sqlite3_errmsg(db_);
+            sqlite3_free(error);
+            if (result == SQLITE_OK) {
+                if (!confirmed_wal)
+                    throw std::runtime_error("actor sync requires SQLite WAL journal mode");
+                return;
+            }
+            if ((result == SQLITE_BUSY || result == SQLITE_LOCKED)
+                && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+            throw std::runtime_error("actor sync WAL admission failed: " + why);
+        }
+    }
     void exec(const char* sql) {
         char* err = nullptr;
         if (sqlite3_exec(db_,sql,nullptr,nullptr,&err) != SQLITE_OK) {
