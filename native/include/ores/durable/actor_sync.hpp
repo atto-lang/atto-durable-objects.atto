@@ -399,6 +399,10 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         const auto ss = projection_locked(consumer,key);
         if (!ss) throw std::logic_error("projection missing");
+        // Do not expose a checkpoint as an authoritative, usable replica
+        // after we have observed a newer writer incarnation. The trusted
+        // broker must first authenticate and install a full resync snapshot.
+        if (projection_needs_resync_locked(consumer,key)) throw ResyncRequired();
         return *ss;
     }
 
