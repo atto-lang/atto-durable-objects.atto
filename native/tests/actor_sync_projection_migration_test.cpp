@@ -1,5 +1,7 @@
 #include "ores/durable/actor_sync.hpp"
+#include <atomic>
 #include <cassert>
+#include <thread>
 #include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
@@ -99,6 +101,55 @@ int main() {
         assert(rc==SQLITE_OK);
         assert(sqlite3_close(legacy_db)==SQLITE_OK);
         rejects<std::logic_error>([&]{SqliteActorSync unsafe(unsafe_db);});
+    }
+    // Two separate SQLite connections discover the same legacy schema at
+    // approximately the same time. BEGIN IMMEDIATE must serialize the full
+    // inspection/ALTER sequence: neither opener may lose a column-add race.
+    {
+        const std::string race_db=std::string(dir)+"/concurrent-open.db";
+        sqlite3* raw_db=nullptr;
+        assert(sqlite3_open(race_db.c_str(),&raw_db)==SQLITE_OK);
+        char* error=nullptr;
+        const int rc=sqlite3_exec(raw_db,legacy,nullptr,nullptr,&error);
+        sqlite3_free(error);
+        assert(rc==SQLITE_OK);
+        assert(sqlite3_close(raw_db)==SQLITE_OK);
+        std::atomic<int> success{0}, rejected{0};
+        auto opener=[&] {
+            try {
+                SqliteActorSync migrated(race_db);
+                if (migrated.projection("reader",key).revision==7) ++success;
+                else ++rejected;
+            } catch (...) { ++rejected; }
+        };
+        std::thread a(opener), b(opener);
+        a.join(); b.join();
+        assert(success==2 && rejected==0);
+        SqliteActorSync reopened(race_db);
+        assert(reopened.projection("reader",key).epoch==1);
+    }
+    // A refused migration cannot leave newly created reference tables or
+    // half of a two-column schema upgrade visible to another connection.
+    {
+        const std::string refused=std::string(dir)+"/unknown-fence.db";
+        sqlite3* db=nullptr;
+        assert(sqlite3_open(refused.c_str(),&db)==SQLITE_OK);
+        sqlite3_stmt* query=nullptr;
+        assert(sqlite3_prepare_v2(db,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_objects'",
+            -1,&query,nullptr)==SQLITE_OK);
+        assert(sqlite3_step(query)==SQLITE_ROW);
+        assert(sqlite3_column_int(query,0)==0);
+        assert(sqlite3_finalize(query)==SQLITE_OK);
+        bool has_epoch=false;
+        assert(sqlite3_prepare_v2(db,"PRAGMA table_info(sync_projection)",-1,&query,nullptr)==SQLITE_OK);
+        while (sqlite3_step(query)==SQLITE_ROW) {
+            const char* name=reinterpret_cast<const char*>(sqlite3_column_text(query,1));
+            if (name && std::string(name)=="resync_epoch") has_epoch=true;
+        }
+        assert(sqlite3_finalize(query)==SQLITE_OK);
+        assert(!has_epoch);
+        assert(sqlite3_close(db)==SQLITE_OK);
     }
     std::filesystem::remove_all(dir);
 }
