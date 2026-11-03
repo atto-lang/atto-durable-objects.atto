@@ -82,6 +82,13 @@ public:
             exec("PRAGMA journal_mode=WAL");
             exec("PRAGMA synchronous=FULL");
             exec("PRAGMA foreign_keys=ON");
+            // Serialize the first-open schema bootstrap/migration across
+            // connections and processes. Without one BEGIN IMMEDIATE around
+            // inspection and ALTER TABLE, two openers may both observe a
+            // missing column and race into a duplicate-column error.
+            // Roll back every DDL change if a later quota or schema check
+            // rejects this database; never expose a partially migrated handle.
+            Tx migration(*this);
             exec("CREATE TABLE IF NOT EXISTS sync_objects("
                  "tenant TEXT NOT NULL, space TEXT NOT NULL, actor_type TEXT NOT NULL, id TEXT NOT NULL,"
                  "epoch INTEGER NOT NULL CHECK(epoch>0), revision INTEGER NOT NULL DEFAULT 0 CHECK(revision>=0),"
@@ -138,6 +145,7 @@ public:
                 exec("ALTER TABLE sync_projection ADD COLUMN resync_epoch "
                      "INTEGER NOT NULL DEFAULT 0 CHECK(resync_epoch>=0)");
             validate_existing_database_quotas();
+            migration.commit();
         } catch (...) { sqlite3_close(db_); db_ = nullptr; throw; }
     }
     ~SqliteActorSync() { if (db_) sqlite3_close(db_); }
