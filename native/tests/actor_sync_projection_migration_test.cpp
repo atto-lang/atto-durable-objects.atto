@@ -76,5 +76,29 @@ int main() {
         assert(!reopened.apply_projection("reader",key,{4,8,"new-op","cart.v1","eight"}));
         assert(reopened.projection("reader",key).bytes=="eight");
     }
+    // A partially upgraded database may have a boolean poison flag
+    // without recording the newer generation. No secure migration can
+    // invent that missing epoch; reject instead of clearing the flag.
+    {
+        const std::string unsafe_db=std::string(dir)+"/unknown-fence.db";
+        sqlite3* legacy_db=nullptr;
+        assert(sqlite3_open(unsafe_db.c_str(),&legacy_db)==SQLITE_OK);
+        const char* flagged=
+            "CREATE TABLE sync_projection("
+            "consumer TEXT NOT NULL, tenant TEXT NOT NULL, space TEXT NOT NULL,"
+            "actor_type TEXT NOT NULL, id TEXT NOT NULL, epoch INTEGER NOT NULL,"
+            "revision INTEGER NOT NULL, op_id TEXT NOT NULL DEFAULT '',"
+            "schema_fp TEXT NOT NULL, snapshot BLOB NOT NULL,"
+            "resync_required INTEGER NOT NULL DEFAULT 0,"
+            "PRIMARY KEY(consumer,tenant,space,actor_type,id)) WITHOUT ROWID;"
+            "INSERT INTO sync_projection VALUES("
+            "'reader','tenant','space','Cart','42',1,7,'','cart.v1','seven',1);";
+        char* message=nullptr;
+        const int rc=sqlite3_exec(legacy_db,flagged,nullptr,nullptr,&message);
+        sqlite3_free(message);
+        assert(rc==SQLITE_OK);
+        assert(sqlite3_close(legacy_db)==SQLITE_OK);
+        rejects<std::logic_error>([&]{SqliteActorSync unsafe(unsafe_db);});
+    }
     std::filesystem::remove_all(dir);
 }
