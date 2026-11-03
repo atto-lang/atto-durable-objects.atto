@@ -347,7 +347,11 @@ public:
                 throw std::logic_error("conflicting or unproven duplicate event");
             tx.commit(); return false;
         }
-        if (change.epoch < prior->epoch || change.revision <= prior->revision ||
+        // An event from a different owner epoch is never sufficient evidence
+        // for activation takeover, even when its revision is contiguous.
+        // An authenticated *full* source snapshot must establish the new
+        // generation via resync_projection before any delta can be applied.
+        if (change.epoch != prior->epoch || change.revision <= prior->revision ||
             prior->revision == std::numeric_limits<std::int64_t>::max() ||
             change.revision != prior->revision + 1) throw ResyncRequired();
         Statement s(db_, "UPDATE sync_projection SET epoch=?,revision=?,op_id=?,schema_fp=?,snapshot=? WHERE "
