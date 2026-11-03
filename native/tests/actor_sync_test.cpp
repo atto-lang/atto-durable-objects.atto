@@ -126,6 +126,11 @@ int main() {
         auto events=source.changes_after(key,2);
         assert(events.size()==1 && events[0].revision==3);
         rejects<ResyncRequired>([&]{replica.apply_projection("replica1",key,{2,5,"op-5","cart.v1","five"});});
+        // Contiguous revision is NOT evidence that a newer activation is
+        // authorized. Snapshot resync under the trusted broker is required.
+        rejects<ResyncRequired>([&]{replica.apply_projection("replica1",key,events[0]);});
+        assert(replica.projection("replica1",key).epoch==1);
+        assert(replica.resync_projection("replica1",key,{2,2,"cart.v1","two"}));
         assert(replica.apply_projection("replica1",key,events[0]));
         assert(!replica.apply_projection("replica1",key,events[0]));
         rejects<std::logic_error>([&]{replica.apply_projection("replica1",key,{2,3,"forged","cart.v1","three"});});
