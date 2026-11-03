@@ -129,7 +129,7 @@ int main() {
         // Contiguous revision is NOT evidence that a newer activation is
         // authorized. Snapshot resync under the trusted broker is required.
         rejects<ResyncRequired>([&]{replica.apply_projection("replica1",key,events[0]);});
-        assert(replica.projection("replica1",key).epoch==1);
+        rejects<ResyncRequired>([&]{replica.projection("replica1",key);});
         // Once a higher epoch is observed, the old incarnation cannot
         // continue writing even a contiguous delta. The fence persists
         // across a separate host connection and storage reopening.
@@ -141,7 +141,7 @@ int main() {
             rejects<ResyncRequired>([&]{
                 reopened.apply_projection("replica1",key,{1,3,"old-after-restart","cart.v1","old"});
             });
-            assert(reopened.projection("replica1",key).revision==2);
+            rejects<ResyncRequired>([&]{reopened.projection("replica1",key);});
         }
         assert(replica.resync_projection("replica1",key,{2,2,"cart.v1","two"}));
         assert(replica.apply_projection("replica1",key,events[0]));
