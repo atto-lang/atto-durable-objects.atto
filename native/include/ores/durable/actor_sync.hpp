@@ -352,9 +352,11 @@ public:
             // Persist the observed new incarnation before asking for a
             // trusted snapshot. After this point, even an old-epoch delta
             // with the expected revision must not advance the projection.
-            Statement mark(db_, "UPDATE sync_projection SET resync_required=1 "
-                                "WHERE consumer=? AND tenant=? AND space=? AND actor_type=? AND id=?");
-            mark.text(1,consumer); bind_key(mark,key,2); mark.done();
+            {
+                Statement mark(db_, "UPDATE sync_projection SET resync_required=1 "
+                                    "WHERE consumer=? AND tenant=? AND space=? AND actor_type=? AND id=?");
+                mark.text(1,consumer); bind_key(mark,key,2); mark.done();
+            }
             tx.commit();
             throw ResyncRequired();
         }
