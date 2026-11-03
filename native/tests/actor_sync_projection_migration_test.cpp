@@ -50,6 +50,10 @@ int main() {
         rejects<ResyncRequired>([&]{
             upgraded.apply_projection("reader",key,{1,8,"stale","cart.v1","stale"});
         });
+        rejects<ResyncRequired>([&]{upgraded.projection("reader",key);});
+        // Identical bootstrap cannot be used as a backdoor to clear a fence.
+        upgraded.bootstrap_projection("reader",key,{1,7,"cart.v1","seven"});
+        rejects<ResyncRequired>([&]{upgraded.projection("reader",key);});
     }
     {
         SqliteActorSync reopened(path);
