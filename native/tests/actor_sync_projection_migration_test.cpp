@@ -50,6 +50,10 @@ int main() {
         rejects<ResyncRequired>([&]{
             upgraded.apply_projection("reader",key,{1,8,"stale","cart.v1","stale"});
         });
+        // Repeated announcements must only raise the minimum required epoch.
+        rejects<ResyncRequired>([&]{
+            upgraded.apply_projection("reader",key,{4,8,"newer","cart.v1","eight"});
+        });
         rejects<ResyncRequired>([&]{upgraded.projection("reader",key);});
         // Identical bootstrap cannot be used as a backdoor to clear a fence.
         upgraded.bootstrap_projection("reader",key,{1,7,"cart.v1","seven"});
@@ -60,10 +64,16 @@ int main() {
         rejects<ResyncRequired>([&]{
             reopened.apply_projection("reader",key,{1,8,"stale-2","cart.v1","stale"});
         });
-        assert(reopened.resync_projection("reader",key,{2,7,"cart.v1","seven"}));
-        assert(!reopened.resync_projection("reader",key,{2,7,"cart.v1","seven"}));
-        assert(reopened.apply_projection("reader",key,{2,8,"new-op","cart.v1","eight"}));
-        assert(!reopened.apply_projection("reader",key,{2,8,"new-op","cart.v1","eight"}));
+        rejects<std::logic_error>([&]{
+            reopened.resync_projection("reader",key,{2,7,"cart.v1","seven"});
+        });
+        rejects<std::logic_error>([&]{
+            reopened.resync_projection("reader",key,{3,7,"cart.v1","seven"});
+        });
+        assert(reopened.resync_projection("reader",key,{4,7,"cart.v1","seven"}));
+        assert(!reopened.resync_projection("reader",key,{4,7,"cart.v1","seven"}));
+        assert(reopened.apply_projection("reader",key,{4,8,"new-op","cart.v1","eight"}));
+        assert(!reopened.apply_projection("reader",key,{4,8,"new-op","cart.v1","eight"}));
         assert(reopened.projection("reader",key).bytes=="eight");
     }
     std::filesystem::remove_all(dir);
