@@ -104,7 +104,20 @@ public:
                  "actor_type TEXT NOT NULL, id TEXT NOT NULL, epoch INTEGER NOT NULL,"
                  "revision INTEGER NOT NULL, op_id TEXT NOT NULL DEFAULT '',"
                  "schema_fp TEXT NOT NULL, snapshot BLOB NOT NULL,"
+                 "resync_required INTEGER NOT NULL DEFAULT 0 CHECK(resync_required IN (0,1)),"
                  "PRIMARY KEY(consumer,tenant,space,actor_type,id)) WITHOUT ROWID");
+            // Existing reference databases predate the durable resync fence.
+            // Upgrade only the exact known additive column, never interpolate
+            // an untrusted schema/table name.
+            bool has_resync_column=false;
+            {
+                Statement fields(db_, "PRAGMA table_info(sync_projection)");
+                while (fields.step()==SQLITE_ROW)
+                    if (fields.str(1)=="resync_required") has_resync_column=true;
+            }
+            if (!has_resync_column)
+                exec("ALTER TABLE sync_projection ADD COLUMN resync_required "
+                     "INTEGER NOT NULL DEFAULT 0 CHECK(resync_required IN (0,1))");
             validate_existing_database_quotas();
         } catch (...) { sqlite3_close(db_); db_ = nullptr; throw; }
     }
@@ -276,7 +289,9 @@ public:
             throw std::invalid_argument("invalid projection snapshot epoch/revision");
         std::lock_guard<std::mutex> lock(mu_);
         Tx tx(*this);
-        Statement s(db_, "INSERT INTO sync_projection VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING");
+        Statement s(db_, "INSERT INTO sync_projection(consumer,tenant,space,actor_type,id,"
+                         "epoch,revision,op_id,schema_fp,snapshot) "
+                         "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING");
         s.text(1,consumer); bind_key(s,key,2); s.i64(6,ss.epoch);
         s.i64(7,ss.revision); s.text(8, ""); s.text(9,ss.schema); s.blob(10,ss.bytes); s.done();
         const int inserted=sqlite3_changes(db_);
@@ -310,9 +325,12 @@ public:
         if (ss.revision == prior->revision) {
             if (ss.bytes != prior->bytes || ss.schema != prior->schema)
                 throw std::logic_error("same-revision resync conflicts with projection");
-            if (ss.epoch == prior->epoch) { tx.commit(); return false; }
+            if (ss.epoch == prior->epoch && !projection_needs_resync_locked(consumer,key)) {
+                tx.commit(); return false;
+            }
         }
-        Statement update(db_, "UPDATE sync_projection SET epoch=?,revision=?,op_id='',schema_fp=?,snapshot=? "
+        Statement update(db_, "UPDATE sync_projection SET epoch=?,revision=?,op_id='',schema_fp=?,"
+                              "snapshot=?,resync_required=0 "
                               "WHERE consumer=? AND tenant=? AND space=? AND actor_type=? AND id=? AND revision=?");
         update.i64(1,ss.epoch); update.i64(2,ss.revision);
         update.text(3,ss.schema); update.blob(4,ss.bytes);
@@ -330,6 +348,18 @@ public:
         Tx tx(*this);
         const auto prior = projection_locked(consumer,key);
         if (!prior) throw ResyncRequired();
+        if (change.epoch > prior->epoch) {
+            // Persist the observed new incarnation before asking for a
+            // trusted snapshot. After this point, even an old-epoch delta
+            // with the expected revision must not advance the projection.
+            Statement mark(db_, "UPDATE sync_projection SET resync_required=1 "
+                                "WHERE consumer=? AND tenant=? AND space=? AND actor_type=? AND id=?");
+            mark.text(1,consumer); bind_key(mark,key,2); mark.done();
+            tx.commit();
+            throw ResyncRequired();
+        }
+        if (projection_needs_resync_locked(consumer,key))
+            throw ResyncRequired();
         if (change.revision == prior->revision) {
             std::string previous_op;
             {
@@ -486,6 +516,13 @@ private:
         bind_key(s,key);
         if (s.step()!=SQLITE_ROW) throw std::logic_error("sync actor missing");
         return {s.number(0),s.number(1),s.str(2),s.blob(3)};
+    }
+    bool projection_needs_resync_locked(std::string_view consumer, const SyncKey& key) {
+        Statement s(db_, "SELECT resync_required FROM sync_projection WHERE "
+                         "consumer=? AND tenant=? AND space=? AND actor_type=? AND id=?");
+        s.text(1,consumer); bind_key(s,key,2);
+        if (s.step()!=SQLITE_ROW) throw std::logic_error("projection missing");
+        return s.number(0)!=0;
     }
     std::optional<SyncSnapshot> projection_locked(std::string_view consumer, const SyncKey& key) {
         Statement s(db_, "SELECT epoch,revision,schema_fp,snapshot FROM sync_projection WHERE "
