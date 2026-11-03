@@ -120,6 +120,17 @@ public:
                     if (column=="resync_epoch") has_required_epoch_column=true;
                 }
             }
+            if (has_resync_column && !has_required_epoch_column) {
+                // Older candidate binaries persisted a boolean poison but
+                // not the observed writer epoch. Never auto-clear or guess
+                // that unknown generation: explicit offline recovery is
+                // required for these flagged rows.
+                Statement unresolved(db_, "SELECT COUNT(*) FROM sync_projection "
+                                          "WHERE resync_required<>0");
+                if (unresolved.step()!=SQLITE_ROW || unresolved.number(0)!=0)
+                    throw std::logic_error("legacy projection fence lacks observed epoch; "
+                                           "manual authenticated recovery required");
+            }
             if (!has_resync_column)
                 exec("ALTER TABLE sync_projection ADD COLUMN resync_required "
                      "INTEGER NOT NULL DEFAULT 0 CHECK(resync_required IN (0,1))");
