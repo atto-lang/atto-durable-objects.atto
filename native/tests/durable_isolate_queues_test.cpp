@@ -121,6 +121,38 @@ int main(int argc, char** argv) {
             auto a2=p2.open_tenant("tenant-A");
             p2.close_tenant(a2);
         }
+        // Independent tenant quota fixture: rejected admission must not
+        // consume a queue slot, and exact idempotent replay survives saturation.
+        {
+            Limits tiny;
+            tiny.max_tenants=1;
+            tiny.max_lock_queues=1;
+            tiny.max_jobs_per_lock=1;
+            tiny.max_jobs_per_tenant=1;
+            tiny.max_request_bytes=4;
+            tiny.max_state_bytes=16;
+            tiny.max_dedupe_keys=2;
+            TenantRuntime runtime(root/"quota-fixture",tiny);
+            auto tenant=runtime.open_tenant("quota-tenant");
+            const auto accepted=runtime.enqueue(tenant,"obj","lock","req-1","four");
+            assert(accepted.status==EnqueueStatus::Accepted && accepted.sequence>0);
+            assert(rejects([&] {
+                runtime.enqueue(tenant,"obj","lock","too-large","fiver");
+            }));
+            assert(runtime.pending(tenant,"lock")==1);
+            const auto replay=runtime.enqueue(tenant,"obj","lock","req-1","four");
+            assert(replay.status==EnqueueStatus::Duplicate);
+            assert(replay.sequence==accepted.sequence);
+            assert(runtime.enqueue(tenant,"obj","lock","req-2","two")
+                   .status==EnqueueStatus::TenantFull);
+            assert(runtime.pending(tenant,"lock")==1);
+            auto lease=runtime.try_claim(tenant,"lock");
+            assert(lease && lease->payload()=="four");
+            runtime.complete(*lease,"done");
+            lease.reset();
+            assert(runtime.pending(tenant,"lock")==0);
+            runtime.close_tenant(tenant);
+        }
     } catch (...) {std::filesystem::remove_all(root);throw;}
     std::filesystem::remove_all(root);
 }
