@@ -69,6 +69,12 @@ jobs:
             -Inative/include native/tests/actor_sync_projection_migration_test.cpp -lsqlite3 \
             -o "$RUNNER_TEMP/actor-sync-migration-test"
           "$RUNNER_TEMP/actor-sync-migration-test"
+          "$CXX" -std=c++17 -pthread -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG \
+            -fno-omit-frame-pointer -fsanitize=address,undefined \
+            -Inative/include native/tests/workflow_effect_replay_test.cpp -lsqlite3 \
+            -o "$RUNNER_TEMP/workflow-effect-replay-test"
+          "$RUNNER_TEMP/workflow-effect-replay-test"
+          echo "WORKFLOW_EFFECT_HOST_REPLAY_PASS=$EXPECTED_SHA"
           echo "ACTOR_SYNC_TWO_PROCESS_ASAN_UBSAN_PASS=$EXPECTED_SHA"
           echo "ACTOR_SYNC_HARDENING_ASAN_UBSAN_PASS=$EXPECTED_SHA"
           echo "EXACT_HEAD_NATIVE_ASAN_UBSAN_PASS=${{ github.event.pull_request.head.sha || github.sha }}"
