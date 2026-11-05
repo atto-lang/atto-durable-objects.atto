@@ -22,9 +22,11 @@ int main() {
     const WorkflowEffect timer{2,WorkflowEffectKind::timer,"retry","wait=10"};
     const WorkflowEffect cancel{3,WorkflowEffectKind::cancel,"stop","reason=user"};
     assert(charge.canonical()==charge.canonical());
-    assert(charge.canonical()!=WorkflowEffect{1,WorkflowEffectKind::activity,"charge","amount=11"}.canonical());
-    assert(WorkflowEffect{1,WorkflowEffectKind::activity,"a","x|2:y"}.canonical()!=
-           WorkflowEffect{1,WorkflowEffectKind::activity,"a","x|"}.canonical());
+    const WorkflowEffect modified{1,WorkflowEffectKind::activity,"charge","amount=11"};
+    const WorkflowEffect ambiguous_a{1,WorkflowEffectKind::activity,"a","x|2:y"};
+    const WorkflowEffect ambiguous_b{1,WorkflowEffectKind::activity,"a","x|"};
+    assert(charge.canonical()!=modified.canonical());
+    assert(ambiguous_a.canonical()!=ambiguous_b.canonical());
     rejects<std::invalid_argument>([]{ WorkflowEffect{0,WorkflowEffectKind::activity,"ok",""}.canonical(); });
     rejects<std::invalid_argument>([]{ WorkflowEffect{1,static_cast<WorkflowEffectKind>(9),"ok",""}.canonical(); });
     rejects<std::invalid_argument>([]{ WorkflowEffect{1,WorkflowEffectKind::timer,"bad/name",""}.canonical(); });
