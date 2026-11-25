@@ -7,15 +7,24 @@
 using namespace ores::durable;
 using namespace std::chrono_literals;
 int main(int argc,char** argv) {
-    assert(argc==5);
-    CounterProcessGuest runner(argv[1],argv[2],argv[3],argv[4],1500ms);
+    assert(argc==5 || argc==4);
+    const bool fuel=argc==4;
+    auto make_runner=[&](std::string digest){
+        if(fuel) return CounterProcessGuest::fuel_worker(argv[1],argv[2],std::move(digest),5s);
+        return CounterProcessGuest(argv[1],argv[2],argv[3],std::move(digest),1500ms);
+    };
+    auto runner=make_runner(argv[argc-1]);
     assert(runner(0,1,2)==2);
     bool stopped=false;
     const auto start=CounterDirectory::Clock::now();
     try {(void)runner(0,1,7);}
-    catch(const CounterDirectory::RetryableGuestFailure&) {stopped=true;}
-    assert(stopped && CounterDirectory::Clock::now()-start>=1500ms);
-    CounterProcessGuest wrong(argv[1],argv[2],argv[3],std::string(64,'0'),1500ms);
+    catch(const CounterDirectory::RetryableGuestFailure& e) {
+        stopped=true;
+        assert(e.reason==(fuel?CounterDirectory::FailureReason::fuel:CounterDirectory::FailureReason::deadline));
+    }
+    assert(stopped);
+    if(!fuel) assert(CounterDirectory::Clock::now()-start>=1500ms);
+    auto wrong=make_runner(std::string(64,'0'));
     bool invalid=false;
     try {(void)wrong(0,1,2);}
     catch(const CounterDirectory::RetryableGuestFailure&) {assert(false);}
@@ -38,7 +47,10 @@ int main(int argc,char** argv) {
     {
         CounterDirectory directory(db,[&](auto n,auto op,auto d){
             try {return runner(n,op,d);}
-            catch(const CounterDirectory::RetryableGuestFailure&) {++timeouts;throw;}
+            catch(const CounterDirectory::RetryableGuestFailure& e) {
+                assert(e.reason==(fuel?CounterDirectory::FailureReason::fuel:CounterDirectory::FailureReason::deadline));
+                ++timeouts;throw;
+            }
         },auth,16,4,2,10ms,0ms,10ms);
         SqliteActorSync observer(db);
         const auto deadline=CounterDirectory::Clock::now()+25s;
