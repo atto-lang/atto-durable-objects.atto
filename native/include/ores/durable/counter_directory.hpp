@@ -33,9 +33,12 @@ public:
     using Clock = std::chrono::steady_clock;
     // Trusted runner signals a classified failure only after guest execution
     // has physically stopped. Never use for database/ownership/unknown errors.
+    enum class FailureReason { classified, deadline, trap, fuel };
     class RetryableGuestFailure final : public std::runtime_error {
     public:
-        RetryableGuestFailure():std::runtime_error("classified guest failure"){}
+        const FailureReason reason;
+        explicit RetryableGuestFailure(FailureReason why=FailureReason::classified)
+            :std::runtime_error("classified guest failure"),reason(why){}
     };
 private:
     using Key = std::tuple<std::string,std::string,std::string,std::string>;
