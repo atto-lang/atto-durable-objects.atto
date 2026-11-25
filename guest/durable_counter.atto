@@ -6,36 +6,36 @@
 fnc durable_counter_next(int committed, int op, int delta) -> int {
     if (committed < 0 || committed > 1000000000) {
         return -1;
-    }
-    if (op == 2) {
-        if (delta != 0) {
+    } fi
+    if (op eq 2) {
+        if (delta neq 0) {
             return -1;
-        }
+        } fi
         return committed;
-    }
-    if (op != 1 || delta <= 0 || delta > 1000000000) {
+    } fi
+    if (op neq 1 || delta <= 0 || delta > 1000000000) {
         return -1;
-    }
+    } fi
     if (committed > 1000000000 - delta) {
         return -1;
-    }
+    } fi
     return committed + delta;
 }
 
 // Backend harness must execute this function and require 0. Merely compiling
 // it or implementing the same algorithm in a host language is not a pass.
 fnc durable_counter_self_test() -> int {
-    if (durable_counter_next(0, 1, 1) != 1) { return 1; }
-    if (durable_counter_next(1, 1, 2) != 3) { return 2; }
-    if (durable_counter_next(3, 2, 0) != 3) { return 3; }
-    if (durable_counter_next(3, 2, 1) != -1) { return 4; }
-    if (durable_counter_next(3, 9, 0) != -1) { return 5; }
-    if (durable_counter_next(3, 1, 0) != -1) { return 6; }
-    if (durable_counter_next(3, 1, -1) != -1) { return 7; }
-    if (durable_counter_next(999999999, 1, 1) != 1000000000) { return 8; }
-    if (durable_counter_next(1000000000, 1, 1) != -1) { return 9; }
-    if (durable_counter_next(-1, 1, 1) != -1) { return 10; }
-    if (durable_counter_next(1000000001, 2, 0) != -1) { return 11; }
-    if (durable_counter_next(0, 1, 1000000001) != -1) { return 12; }
+    if (durable_counter_next(0, 1, 1) neq 1) { return 1; } fi
+    if (durable_counter_next(1, 1, 2) neq 3) { return 2; } fi
+    if (durable_counter_next(3, 2, 0) neq 3) { return 3; } fi
+    if (durable_counter_next(3, 2, 1) neq -1) { return 4; } fi
+    if (durable_counter_next(3, 9, 0) neq -1) { return 5; } fi
+    if (durable_counter_next(3, 1, 0) neq -1) { return 6; } fi
+    if (durable_counter_next(3, 1, -1) neq -1) { return 7; } fi
+    if (durable_counter_next(999999999, 1, 1) neq 1000000000) { return 8; } fi
+    if (durable_counter_next(1000000000, 1, 1) neq -1) { return 9; } fi
+    if (durable_counter_next(-1, 1, 1) neq -1) { return 10; } fi
+    if (durable_counter_next(1000000001, 2, 0) neq -1) { return 11; } fi
+    if (durable_counter_next(0, 1, 1000000001) neq -1) { return 12; } fi
     return 0;
 }
