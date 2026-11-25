@@ -6,6 +6,8 @@ on:
       - 'native/include/ores/durable/counter_turn.hpp'
       - 'native/tests/counter_turn_test.cpp'
       - 'tests/durable_counter_guest.mjs'
+      - 'tests/durable_counter_process_e2e.mjs'
+      - 'native/tests/counter_guest_driver.cpp'
       - '.github/workflows/durable-counter.yml'
 permissions:
   contents: read
@@ -41,6 +43,24 @@ jobs:
         run: |
           set -euo pipefail
           ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" node tests/durable_counter_guest.mjs
+      - name: Compile host driver and execute real guest-to-SQLite process test
+        env:
+          STORAGE_SHA: 57c15af3b9dfa31c32dbbb459ee824ebb5b06390
+          ATTO_COMPILER_SOURCE_SHA: a4c2497decbb3782a1a6f810e8078bbee094ccbb
+        run: |
+          set -euo pipefail
+          git init "$RUNNER_TEMP/storage"
+          git -C "$RUNNER_TEMP/storage" fetch --depth=1 https://github.com/atto-lang/atto-durable-objects.atto.git "$STORAGE_SHA"
+          git -C "$RUNNER_TEMP/storage" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/storage" rev-parse HEAD)" = "$STORAGE_SHA"
+          git -C "$RUNNER_TEMP/storage" rev-parse HEAD^{tree}
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+          g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
+            -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/counter_guest_driver.cpp \
+            -lsqlite3 -o "$RUNNER_TEMP/counter-guest-driver"
+          ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" \
+            COUNTER_DRIVER="$RUNNER_TEMP/counter-guest-driver" node tests/durable_counter_process_e2e.mjs
   host-seam:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
