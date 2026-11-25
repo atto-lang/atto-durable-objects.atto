@@ -72,6 +72,7 @@ struct SyncLimits {
     std::size_t projection_consumers_per_actor = 1024;
     std::size_t inbox_entries_per_actor = 128;
     std::size_t inbox_entries_per_database = 4096;
+    std::size_t inbox_command_bytes_per_database = 64u << 20;
 };
 
 class SqliteActorSync final {
@@ -85,6 +86,8 @@ public:
             limits_.actor_keys_per_database == 0 || limits_.projection_consumers_per_actor == 0 ||
             limits_.inbox_entries_per_actor == 0 || limits_.inbox_entries_per_database == 0 ||
             limits_.inbox_entries_per_database > 65536 ||
+            limits_.inbox_command_bytes_per_database == 0 ||
+            limits_.inbox_command_bytes_per_database > (1u << 30) ||
             limits_.state_bytes > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
             limits_.command_bytes > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
             limits_.reply_bytes > static_cast<std::size_t>(std::numeric_limits<int>::max()))
@@ -399,8 +402,12 @@ public:
         if(count_for(key,"sync_inbox")>=limits_.inbox_entries_per_actor)
             throw std::length_error("mailbox actor quota exhausted");
         {
-            Statement count(db_,"SELECT COUNT(*) FROM sync_inbox");
-            if(count.step()!=SQLITE_ROW || static_cast<std::uint64_t>(count.number(0))>=limits_.inbox_entries_per_database)
+            Statement count(db_,"SELECT COUNT(*),COALESCE(SUM(LENGTH(command)),0) FROM sync_inbox");
+            if(count.step()!=SQLITE_ROW) throw std::runtime_error("mailbox quota query failed");
+            const auto bytes=count.number(1);
+            if(static_cast<std::uint64_t>(count.number(0))>=limits_.inbox_entries_per_database ||
+               bytes<0 || static_cast<std::uint64_t>(bytes)>limits_.inbox_command_bytes_per_database ||
+               command.size()>limits_.inbox_command_bytes_per_database-static_cast<std::size_t>(bytes))
                 throw std::length_error("mailbox database quota exhausted");
         }
         {
@@ -771,6 +778,7 @@ private:
         };
         validate("SELECT COUNT(*) FROM sync_objects",limits_.actor_keys_per_database);
         validate("SELECT COUNT(*) FROM sync_inbox",limits_.inbox_entries_per_database);
+        validate("SELECT COALESCE(SUM(LENGTH(command)),0) FROM sync_inbox",limits_.inbox_command_bytes_per_database);
         validate("SELECT COALESCE(MAX(n),0) FROM (SELECT COUNT(*) AS n FROM sync_inbox GROUP BY tenant,space,actor_type,id)",limits_.inbox_entries_per_actor);
         validate("SELECT COALESCE(MAX(LENGTH(command)),0) FROM sync_inbox",limits_.command_bytes);
         validate("SELECT COALESCE(MAX(n),0) FROM (SELECT COUNT(*) AS n FROM sync_outbox "
