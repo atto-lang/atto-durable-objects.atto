@@ -196,9 +196,10 @@ private:
                 } catch(const AlarmPolicyDenied&) {
                     (void)store_.deny_principal_alarm(alarm,epoch,unix_ms());return Reply{};
                 }
-            } catch(...) {
-                retire(id);throw;
-            }
+            } catch(const GuestRateExhausted&) {
+                // No durable attempt was marked and no guest started.
+                throw;
+            } catch(...) {retire(id);throw;}
         });
     }
     // At most one alarm future per object and at most worker_count in
@@ -328,6 +329,9 @@ private:
                 if(!mail_authorized(started)) return Reply{};
                 if(store_.snapshot(mail.key).epoch!=epoch) throw std::logic_error("stale mail publication epoch");
                 return r;
+            } catch(const GuestRateExhausted&) {
+                // No durable attempt was marked and no guest started.
+                throw;
             } catch(...) {retire(id);throw;}
         });
     }
@@ -637,9 +641,10 @@ public:
                 validate(k);authorize_request();
                 if(store_.snapshot(k).epoch!=epoch) throw std::logic_error("stale publication epoch");
                 return r;
-            } catch(...) {
-                retire(id);throw;
-            }
+            } catch(const GuestRateExhausted&) {
+                // No durable attempt was marked and no guest started.
+                throw;
+            } catch(...) {retire(id);throw;}
         });
     }
     // An ACK from this separate API is a persisted admission, not completion.
