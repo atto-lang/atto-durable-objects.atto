@@ -1,16 +1,16 @@
-> **AI agent instructions (organization-wide):** Before working on code, issues, or pull requests, read and follow the [organization `AGENTS.md`](https://github.com/ores-truffle-oreslang/.github/blob/main/AGENTS.md), including its **merge-first stealth-development policy**. Honor any repository-local `AGENTS.md`, explicit holds, and GitHub-enforced rules.
+> **AI agent instructions (organization-wide):** Before working on code, issues, or pull requests, read and follow the [organization `AGENTS.md`](https://github.com/atto-lang/.github/blob/main/AGENTS.md), including its **merge-first stealth-development policy**. Honor any repository-local `AGENTS.md`, explicit holds, and GitHub-enforced rules.
 
-# Oreslang Durable Objects (LLVM)
+# AttoLang Durable Objects
 
 ## AttoLang migration and authoritative specification (2026-11-18)
 
-**AttoLang** is the current public name of Oreslang. This `ores-truffle-oreslang/oreslang-durable-objects.ores` repository retains its historical context. **No verified one-to-one successor:** consult [atto-lang](https://github.com/atto-lang) before linking or migrating this project. Legacy source and commands below reflect this checkout; do not automatically substitute new CLI names or claim feature parity. These repositories are not assumed to have identical Git histories, issues, pull requests, or implementation results.
+**AttoLang** is the current public name of Oreslang. This `atto-lang/atto-durable-objects.atto` repository is the current development target for this work. Its predecessor is `ores-truffle-oreslang/oreslang-durable-objects.ores`; migration does not establish identical source history or executable parity. Legacy source and commands below reflect this checkout; do not automatically substitute new CLI names or claim feature parity. These repositories are not assumed to have identical Git histories, issues, pull requests, or implementation results.
 
 **The canonical language specification is [atto-lang/atto-spec](https://github.com/atto-lang/atto-spec)**. Portable `.atto` modules belong in [atto-common-source](https://github.com/atto-lang/atto-common-source) and executed cross-backend positive/negative fixtures in [atto-platform-conformance](https://github.com/atto-lang/atto-platform-conformance). The proposed modern rules include `snake_case` methods, ownership `borrow!`/`take!`/`share!`/`copy!`/`copy!!`, [implicit borrowing](https://github.com/atto-lang/atto-spec/blob/main/language/implicit-argument-borrow-v1.md), [file/module constants including nonthrowing launch-time environment reads](https://github.com/atto-lang/atto-spec/blob/main/language/file-module-const-v1.md), and [separate bitwise-shift and directional-stream operators](https://github.com/atto-lang/atto-spec/blob/main/language/bitwise-and-stream-operators-v1.md). These are contract/design directions, not a claim this legacy implementation supports all syntax.
 
 Preserve historic `.ores` paths, command names, ABI/wire names and pinned fixtures until verified replacements exist. Avoid Python support tooling/tests; prefer Rust. Do not infer successful compilation, actor isolation or cross-backend parity from README examples, host-only tests, or zero-step GitHub Actions. Document exact commit/tree, target, toolchain, executed guest tests and explicit failures/unsupported status.
 
-Status: **draft contract and native LLVM host substrate**, not a production durable-object service.
+Status: **native host substrate plus draft AttoLang guest integration**, not a production durable-object service.
 
 A durable object is a stable `(tenant_id, namespace, object_id)` identity with actor-owned state, persistent transactional storage, and a single logical owner at a time. An **OresVM** host owns one **IsolateVM per tenant incarnation**. Each IsolateVM owns **multiple bounded FIFO queues keyed by a tenant-scoped LockId**. Actors and durable objects live inside that tenant isolate; each actor retains sealed state and its own arena.
 
@@ -23,6 +23,84 @@ OresVM root
   Tenant B -> IsolateVM (generation gB, distinct heaps and queues)
        LockId 7 -> a completely different FIFO and owner
 ```
+
+## Goal: Cloudflare Durable Objects–style computing
+
+Provide stable named virtual actors with colocated computation and transactional
+storage, automatic activation, exclusive turns, durable alarms and idle
+passivation. AttoLang intentionally targets non-reentrant actor turns across
+suspension rather than replicating all JavaScript event-loop semantics.
+
+```text
+authenticated tenant + namespace + object name
+    -> virtual actor directory / fenced activation
+    -> exclusive turn permit
+    -> durable receipt lookup (matching replay returns original reply)
+    -> precompiled AttoLang guest proposes next state
+    -> SQLite WAL atomic state + receipt + outbox commit
+    -> ownership-checked response publication
+```
+
+The directory, scheduler and external publication authority are work in
+progress; epoch checks alone are not an ownership election protocol.
+
+### Implementation progress (2026-11-24)
+
+| Capability | Evidence / status |
+| --- | --- |
+| Tenant FIFO queues and SQLite WAL substrate | Existing host code, not a sandbox |
+| Epoch, revision, exact command/schema receipts and outbox | [Storage PR #9](https://github.com/atto-lang/atto-durable-objects.atto/pull/9), draft |
+| Bounded counter guest and self-tests | [guest/durable_counter.atto](guest/durable_counter.atto), source candidate |
+| Commit-gated counter adapter | [counter_turn.hpp](native/include/ores/durable/counter_turn.hpp), earlier host-only CI passed |
+| Compile-once scalar Wasm entry | [Compiler PR #566](https://github.com/atto-lang/atto-source.rs/pull/566), draft, not executed |
+| Compiled guest to SQLite, hard kill after commit, replay | [Process integration fixture](tests/durable_counter_process_e2e.mjs), not executed |
+| Automatic named activation, exclusive async turns, passivation | Next runtime milestones |
+| Durable alarms, typed RPC and secure transport | Planned |
+| WebSocket hibernation, placement, replication and failover | Planned |
+
+### Compile-once candidate ABI
+
+The opt-in Rust/Wasm compiler mode in PR #566 (not available on all backends)
+keeps the existing browser main ABI unchanged. It requires a checked
+`durable_transition(int,int,int)->int` and exposes
+`atto_durable_transition_v1(i64,i64,i64)->i64`. It rejects heap/state,
+actors, generators and host imports in this restricted scalar profile.
+This is a prototype transition ABI, not a public durable actor API.
+
+```sh
+# Build attoc from the pinned compiler candidate, not an arbitrary installed CLI.
+attoc --durable-scalar-v1 counter.atto -o counter.wasm
+# counter.atto must define durable_transition and a zero-argument main.
+```
+
+The fixture compiles one Wasm artifact and creates a fresh instance per
+evaluation. State is loaded from the fenced store; a guest cannot commit
+or publish replies directly. Guest execution must ultimately be bounded
+by fuel/time and memory quotas, with authenticated artifact admission.
+
+### Security and evidence
+
+- Authenticate tenant/object identity before resolving a capability. No
+  cross-tenant mutable pointer sharing. Reject mismatched request IDs,
+  schemas, stale epochs and revisions.
+- Atomically commit state, immutable receipt and outbox intent before
+  publishing success. External effects are at least once, not exactly once.
+- A lost reply must be resolved before rerunning a guest (including an
+  increment that would now overflow). Ambiguous outcomes require recovery.
+- Use isolated bounded storage workers; never block an actor carrier with
+  SQLite or hold a mutable state borrow across suspension.
+- [Historical exact-head CI](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45519080501):
+  at `b480200054c1ac34a055355b80637247197ea49e`, compiler build and host-only
+  counter integration passed; guest compilation failed with E_FI.
+  The syntax was corrected, but later guest/kill-recovery runs remain
+  unverified. [Compiler candidate CI](https://github.com/atto-lang/atto-source.rs/actions/runs/45520132964)
+  and [wave 4 CI](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45520213102)
+  were queued at this review. Do not promote historical host passes to
+  current-head guest or cross-backend evidence.
+- See [guest parity and implementation notes](docs/ATTO_GUEST_PARITY.md)
+  and [PR #15](https://github.com/atto-lang/atto-durable-objects.atto/pull/15)
+  for exact dependency pins, tests, limits and current work. Java/GraalVM,
+  LLVM, .NET NativeAOT, Wasm and Cranelift durable actor parity remains unverified.
 
 ## Contract
 
