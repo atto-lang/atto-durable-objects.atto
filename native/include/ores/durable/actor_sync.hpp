@@ -51,11 +51,13 @@ struct SyncMail {
     std::int64_t sequence;
     std::string operation_id, command, schema;
     std::int64_t failures=0, retry_at_ms=0, attempt_epoch=0;
+    std::string principal={};
 };
 struct SyncAdmission {
     std::int64_t sequence; // 0 means already completed
     std::optional<SyncCommit> receipt;
     bool dead_letter=false;
+    bool authorization_denied=false;
 };
 class ResyncRequired final : public std::logic_error {
 public:
@@ -157,6 +159,10 @@ public:
                  "schema_fp TEXT NOT NULL, UNIQUE(tenant,space,actor_type,id,op_id),"
                  "FOREIGN KEY(tenant,space,actor_type,id) REFERENCES sync_objects(tenant,space,actor_type,id))");
             exec("CREATE INDEX IF NOT EXISTS sync_inbox_actor_fifo ON sync_inbox(tenant,space,actor_type,id,sequence)");
+            exec("CREATE TABLE IF NOT EXISTS sync_mail_principal("
+                 "sequence INTEGER PRIMARY KEY, principal TEXT NOT NULL,"
+                 "denied INTEGER NOT NULL DEFAULT 0 CHECK(denied IN (0,1)),"
+                 "FOREIGN KEY(sequence) REFERENCES sync_inbox(sequence) ON DELETE CASCADE)");
             // Additive retry metadata; older pending rows start at attempt zero.
             // Dead letters retain their original inbox row and count against
             // its quotas until an explicit future administrative retention API.
@@ -266,6 +272,11 @@ public:
             prior=read.step()==SQLITE_ROW;
         }
         if(prior && !enabled) throw std::logic_error("principal gateway required");
+        if(enabled) {
+            Statement read(db_,"SELECT 1 FROM sync_inbox m LEFT JOIN sync_mail_principal p ON p.sequence=m.sequence "
+                               "WHERE p.sequence IS NULL LIMIT 1");
+            if(read.step()==SQLITE_ROW) throw std::logic_error("unbound legacy mail requires explicit migration");
+        }
         if(enabled && !prior) {
             {
                 Statement read(db_,"SELECT 1 FROM sync_operations WHERE substr(op_id,1,11)='@principal:' LIMIT 1");
@@ -452,14 +463,20 @@ public:
     // Caller must hold authenticated exclusive controller/turn authority.
     SyncAdmission admit_mail(const SyncKey& key,std::int64_t epoch,
                              std::string_view operation_id,std::string_view command,
-                             std::string_view schema_fp) {
-        validate_key(key);label(operation_id);label(schema_fp);
+                             std::string_view schema_fp,std::string_view principal={}) {
+        validate_key(key);label(operation_id);label(schema_fp);label_or_empty(principal);
         bounded(command,limits_.command_bytes);
         if(epoch<=0 || operation_id.substr(0,7)=="@alarm:")
             throw std::invalid_argument("invalid mailbox admission");
         std::lock_guard<std::mutex> lock(mu_);
         Tx tx(*this);
         if(snapshot_locked(key).epoch!=epoch) throw std::logic_error("stale mailbox owner");
+        {
+            Statement mode(db_,"SELECT 1 FROM sync_principal_namespace WHERE singleton=1");
+            const bool bound=mode.step()==SQLITE_ROW;
+            if(bound!=!principal.empty() || (!principal.empty() && operation_id.substr(0,11)!="@principal:"))
+                throw std::logic_error("mail principal namespace mismatch");
+        }
         std::optional<SyncCommit> completed;
         {
             Statement read(db_,"SELECT command,schema_fp,revision,reply FROM sync_operations WHERE tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?");
@@ -483,7 +500,11 @@ public:
                 existing=read.number(0);dead=read.number(3)!=0;
             }
         }
-        if(existing){tx.commit();return {existing,std::nullopt,dead};}
+        if(existing){
+            auto binding=mail_principal_locked(existing);
+            if(binding.first!=principal) throw std::logic_error("pending mail principal mismatch");
+            tx.commit();return {existing,std::nullopt,dead,binding.second};
+        }
         // Reserve one receipt and outbox slot for each live admitted turn.
         const auto live=live_mail_count(key);
         if(live>=limits_.dedupe_entries_per_actor ||
@@ -520,6 +541,10 @@ public:
         }
         const auto seq=sqlite3_last_insert_rowid(db_);
         if(seq<=0) throw std::overflow_error("mail sequence exhausted");
+        if(!principal.empty()) {
+            Statement bind(db_,"INSERT INTO sync_mail_principal(sequence,principal) VALUES(?,?)");
+            bind.i64(1,seq);bind.text(2,principal);bind.done();
+        }
         tx.commit();return {seq,std::nullopt};
     }
 
@@ -542,6 +567,7 @@ public:
         while(read.step()==SQLITE_ROW) {
             SyncMail m{{read.str(0),read.str(1),read.str(2),read.str(3)},read.number(4),read.str(5),read.blob(6),read.str(7),read.number(8),read.number(9),read.number(10)};
             validate_key(m.key);label(m.operation_id);label(m.schema);
+            m.principal=mail_principal_locked(m.sequence).first;label_or_empty(m.principal);
             bounded(m.command,limits_.command_bytes);result.push_back(std::move(m));
         }
         return result;
@@ -572,6 +598,7 @@ public:
         while(read.step()==SQLITE_ROW) {
             SyncMail m{{read.str(0),read.str(1),read.str(2),read.str(3)},read.number(4),read.str(5),read.blob(6),read.str(7),read.number(8),read.number(9),read.number(10)};
             validate_key(m.key);label(m.operation_id);label(m.schema);
+            m.principal=mail_principal_locked(m.sequence).first;label_or_empty(m.principal);
             bounded(m.command,limits_.command_bytes);result.push_back(std::move(m));
         }
         return result;
@@ -634,6 +661,34 @@ public:
             if(sqlite3_changes(db_)!=1) throw std::logic_error("lost mailbox attempt marker");
         }
         tx.commit();return dead;
+    }
+
+    // Policy denial is terminal and distinct from retry exhaustion in
+    // admission responses. The retry table's dead sentinel releases the
+    // completion reservation; no state, receipt or outbox is manufactured.
+    void deny_mail(const SyncMail& mail,std::int64_t epoch) {
+        validate_key(mail.key);label(mail.principal);
+        if(epoch<=0 || mail.attempt_epoch>epoch) throw std::invalid_argument("invalid denied mail envelope");
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this);
+        if(snapshot_locked(mail.key).epoch!=epoch || !mail_matches_locked(mail))
+            throw std::logic_error("stale denied mail token");
+        {
+            Statement write(db_,"UPDATE sync_mail_principal SET denied=1 WHERE sequence=? AND principal=? AND denied=0");
+            write.i64(1,mail.sequence);write.text(2,mail.principal);write.done();
+            if(sqlite3_changes(db_)!=1) throw std::logic_error("missing principal binding");
+        }
+        {
+            Statement write(db_,"INSERT INTO sync_mail_retry VALUES(?,3,0,1) "
+                "ON CONFLICT(sequence) DO UPDATE SET failures=3,retry_at_ms=0,dead=1");
+            write.i64(1,mail.sequence);write.done();
+        }
+        if(mail.attempt_epoch!=0) {
+            Statement clear(db_,"DELETE FROM sync_mail_attempt WHERE sequence=? AND epoch=?");
+            clear.i64(1,mail.sequence);clear.i64(2,mail.attempt_epoch);clear.done();
+            if(sqlite3_changes(db_)!=1) throw std::logic_error("lost denied mail attempt");
+        }
+        tx.commit();
     }
 
     // Atomic state + exact-operation dedup + replay reply + outbox.
@@ -945,6 +1000,12 @@ private:
         if(read.step()!=SQLITE_ROW) throw std::runtime_error("mail reservation count failed");
         return static_cast<std::size_t>(read.number(0));
     }
+    std::pair<std::string,bool> mail_principal_locked(std::int64_t seq) {
+        Statement read(db_,"SELECT principal,denied FROM sync_mail_principal WHERE sequence=?");
+        read.i64(1,seq);
+        if(read.step()!=SQLITE_ROW) return {"",false};
+        return {read.str(0),read.number(1)!=0};
+    }
     bool mail_matches_locked(const SyncMail& mail) {
         Statement read(db_,"SELECT m.sequence,m.op_id,m.command,m.schema_fp,COALESCE(r.failures,0),COALESCE(r.retry_at_ms,0),COALESCE(a.epoch,0) "
             "FROM sync_inbox m LEFT JOIN sync_mail_retry r ON r.sequence=m.sequence "
@@ -953,7 +1014,7 @@ private:
         bind_key(read,mail.key);
         return read.step()==SQLITE_ROW && read.number(0)==mail.sequence &&
             read.str(1)==mail.operation_id && read.blob(2)==mail.command && read.str(3)==mail.schema &&
-            read.number(4)==mail.failures && read.number(5)==mail.retry_at_ms && read.number(6)==mail.attempt_epoch;
+            read.number(4)==mail.failures && read.number(5)==mail.retry_at_ms && read.number(6)==mail.attempt_epoch && mail_principal_locked(mail.sequence).first==mail.principal;
     }
     bool alarm_matches_locked(const SyncAlarm& alarm,std::int64_t now_ms) {
         Statement read(db_,"SELECT 1 FROM sync_alarms WHERE tenant=? AND space=? AND actor_type=? AND id=? "
