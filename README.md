@@ -324,6 +324,49 @@ restart deduplication and pending-mail recovery under identical deployment,
 and rejects changed configuration and legacy fallback. These are authored
 tests, not a Wave 14 execution receipt.
 
+### Shared tenant resource reservations (Wave 27 candidate)
+
+All transient, durable mailbox, alarm and control turns now share a
+per-tenant queued/running limit in the directory scheduler. Limits are
+checked under the same mutex as lane admission/dispatch; a running slot
+is retained until its whole turn returns, including classified or unknown
+failure. A full tenant queue rejects new submissions with backpressure;
+already durable work is retained for subsequent scans. Each supervisor
+also limits its outstanding futures per tenant, while the shared lane
+scheduler enforces the combined running cap across both supervisors.
+No secondary unbounded tenant registry is needed. The trusted generic
+host configuration defaults to the existing global limits.
+
+The signed Linux fuel-worker profile additionally derives its per-tenant
+running slots from the minimum of the address-space, engine fuel and CPU
+reservation ceilings divided by the fixed per-worker envelope (256 MiB
+RLIMIT_AS, 50,000 fuel, 2 CPU seconds). Default budget: 32 queued turns,
+512 MiB address-space reservations, 100,000 in-flight fuel, 4 in-flight
+CPU seconds, at most two running turns, further clamped to global worker
+count. Trusted deployment/gateway constructors accept smaller or larger
+budgets; configurations that cannot reserve even one worker fail closed.
+Every running turn conservatively reserves a full slot, even if it only
+reads a receipt or updates metadata. No guest or request can select its
+budget. Existing signed artifact manifest remains unchanged; the budget
+is trusted runtime configuration, not an attested or persisted policy.
+
+This bounds concurrent reservations under the trusted synchronous
+single-process-per-turn fuel-worker contract, not actual RSS, host memory,
+startup before rlimits, cumulative CPU/fuel per time window, or distributed
+tenant usage. No cgroup or measured resource accounting is claimed.
+Queue and execution caps are per directory, not global across hosts;
+global queue/worker/activation limits still apply. No guarantee of
+progress under arbitrary saturation or nonterminating trusted callbacks.
+
+Host regressions hold one tenant's turn, fill its queue, require another
+tenant to progress, check exception releases the slot, and exercise
+combined mailbox/alarm/transient work under a one-slot tenant cap.
+Budget dimension and invalid-configuration tests are included in the
+process guest suite; an existing compiled alarm test is run with a
+single-slot signed budget. New tests are authored, not yet executed.
+The Wave 26 storage pin is unchanged:
+`878101271489a7167cad807c8f946f28911e65cd`.
+
 ### Concurrent tenant-aware alarm dispatch (Wave 26 candidate)
 
 The alarm poller now submits up to the configured worker count of distinct
