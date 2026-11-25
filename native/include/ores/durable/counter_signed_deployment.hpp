@@ -8,6 +8,23 @@
 #include <openssl/evp.h>
 
 namespace ores::durable {
+// Aggregate reservation envelope for the fixed trusted Linux fuel-worker
+// profile. This is concurrent worst-case capacity, not actual measured RSS,
+// CPU time per window, or a cgroup. Each turn reserves one full slot even
+// if it ends before guest invocation. Never accepted from guest input.
+struct CounterFuelTenantBudget {
+    std::size_t queued=32;
+    std::uint64_t address_space_bytes=512ull*1024*1024;
+    std::uint64_t in_flight_fuel=100000;
+    std::uint64_t in_flight_cpu_seconds=4;
+    CounterTenantLimits limits() const {
+        constexpr std::uint64_t worker_as=256ull*1024*1024,worker_fuel=50000,worker_cpu=2;
+        const auto slots=std::min({address_space_bytes/worker_as,in_flight_fuel/worker_fuel,
+                                   in_flight_cpu_seconds/worker_cpu,std::uint64_t{64}});
+        if(!queued || !slots) throw std::invalid_argument("tenant budget cannot reserve one fuel worker");
+        return {queued,static_cast<std::size_t>(slots)};
+    }
+};
 class SignedCounterDeployment final {
 public:
     using PublicKey=std::array<unsigned char,32>;
@@ -37,13 +54,14 @@ public:
             CounterDirectory::Clock::duration idle=CounterDirectory::Clock::duration::zero(),
             CounterDirectory::Clock::duration alarms=CounterDirectory::Clock::duration::zero(),
             CounterDirectory::Clock::duration mail=CounterDirectory::Clock::duration::zero(),
-            bool principal_mode=false,CounterDirectory::PrincipalPolicy mail_policy={},bool transactional_policy=false) const {
+            bool principal_mode=false,CounterDirectory::PrincipalPolicy mail_policy={},bool transactional_policy=false,
+            CounterFuelTenantBudget tenant_budget={}) const {
         if(!authorize) throw std::invalid_argument("missing trusted principal authorizer");
         auto admission=[registry=registry_,authorize=std::move(authorize)](const SyncKey& key) {
             return registry.contains(key) && authorize(key);
         };
         return std::make_unique<CounterDirectory>(db,CounterDirectory::KeyedGuest(registry_),
-            std::move(admission),capacity,active_limit,workers,idle,alarms,mail,registry_.manifest(),principal_mode,std::move(mail_policy),transactional_policy);
+            std::move(admission),capacity,active_limit,workers,idle,alarms,mail,registry_.manifest(),principal_mode,std::move(mail_policy),transactional_policy,tenant_budget.limits());
     }
 };
 } // namespace ores::durable
