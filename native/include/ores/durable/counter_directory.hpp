@@ -192,30 +192,57 @@ private:
             }
         });
     }
-    // One supervisor poller and at most one outstanding alarm turn. On
-    // unexpected fault stop dispatch and retain the pending durable alarm.
-    // Supervisor must inspect alarm_fault() and repair/reopen the controller.
-    void alarm_loop(Clock::duration interval) noexcept {
+    // At most one alarm future per object and at most worker_count in
+    // flight. The shared lane serializes alarms with mailbox and host turns.
+    // Reap ready futures independently; never wait on an unrelated slow guest.
+    void alarm_loop(Clock::duration interval,std::size_t worker_count) noexcept {
+        std::map<Key,std::future<Reply>> in_flight;
+        std::string last_tenant;
+        std::exception_ptr fault;
+        auto collect=[&](bool drain) {
+            for(auto it=in_flight.begin();it!=in_flight.end();) {
+                if(!drain && it->second.wait_for(Clock::duration::zero())!=std::future_status::ready) {
+                    ++it;continue;
+                }
+                try {(void)it->second.get();}
+                catch(const std::length_error&) {/* durable backpressure */}
+                catch(...) {if(!fault) fault=std::current_exception();}
+                it=in_flight.erase(it);
+            }
+        };
         try {
             for(;;) {
                 {
                     std::unique_lock<std::mutex> lock(alarm_mu_);
-                    if(alarm_wake_.wait_for(lock,interval,[&]{return alarm_stop_;})) return;
+                    if(alarm_wake_.wait_for(lock,interval,[&]{return alarm_stop_;})) break;
                 }
-                for(const auto& alarm:store_.due_alarms(unix_ms(),64)) {
+                collect(false);
+                if(fault) break;
+                if(in_flight.size()>=worker_count) continue;
+                for(const auto& alarm:store_.fair_due_alarms(256,unix_ms(),last_tenant)) {
                     {
                         std::lock_guard<std::mutex> lock(alarm_mu_);
-                        if(alarm_stop_) return;
+                        if(alarm_stop_) break;
                     }
-                    // Saturation and activation quota are backpressure:
-                    // retain deadline and retry after the next interval.
-                    try { (void)enqueue_alarm(alarm).get(); }
-                    catch(const std::length_error&) { break; }
+                    if(in_flight.size()>=worker_count) break;
+                    const auto id=identity(alarm.key);
+                    if(in_flight.find(id)!=in_flight.end()) continue;
+                    last_tenant=alarm.key.tenant;
+                    auto inserted=in_flight.try_emplace(id);
+                    try {inserted.first->second=enqueue_alarm(alarm);}
+                    catch(const std::length_error&) {in_flight.erase(inserted.first);}
+                    catch(...) {in_flight.erase(inserted.first);throw;}
                 }
             }
-        } catch(...) {
+        } catch(...) {if(!fault) fault=std::current_exception();}
+        if(fault) {
             std::lock_guard<std::mutex> lock(alarm_mu_);
-            alarm_fault_=std::current_exception();
+            alarm_fault_=fault;
+        }
+        collect(true);
+        if(fault) {
+            std::lock_guard<std::mutex> lock(alarm_mu_);
+            alarm_fault_=fault;
         }
     }
 
@@ -504,7 +531,7 @@ public:
         try {
             for(std::size_t i=0;i<workers;++i) workers_.emplace_back([this]{loop();});
             if(alarm_interval!=Clock::duration::zero())
-                alarm_worker_=std::thread([this,alarm_interval]{alarm_loop(alarm_interval);});
+                alarm_worker_=std::thread([this,alarm_interval,workers]{alarm_loop(alarm_interval,workers);});
             if(mail_interval!=Clock::duration::zero())
                 mail_worker_=std::thread([this,mail_interval,workers]{mail_loop(mail_interval,workers);});
         } catch(...) {
