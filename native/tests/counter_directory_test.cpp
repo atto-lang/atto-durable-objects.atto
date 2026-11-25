@@ -333,5 +333,38 @@ int main() {
             assert(observer.snapshot(c).bytes=="5");
         }
     }
+    // Single worker: an earlier backlog from many hot-tenant objects
+    // must not hide the quiet tenant's head behind the whole backlog.
+    {
+        using namespace std::chrono_literals;
+        const auto fair_db=std::string(dir)+"/fair-directory.db";
+        const SyncKey quiet{"quiet","counters","Counter","one"};
+        const auto allow=[](const SyncKey&){return true;};
+        {
+            CounterDirectory directory(fair_db,guest,allow,128,32);
+            for(int i=0;i<12;++i) {
+                const SyncKey hot{"hot","counters","Counter",std::to_string(i)};
+                assert(directory.admit(hot,"first",1,1).get().sequence>0);
+            }
+            assert(directory.admit(quiet,"first",1,5).get().sequence>0);
+        }
+        std::vector<std::string> order;
+        std::mutex order_mu;
+        {
+            CounterDirectory directory(fair_db,
+                [&](const SyncKey& k,I n,I op,I d)->I {
+                    std::lock_guard<std::mutex> lock(order_mu);
+                    order.push_back(k.tenant);
+                    return op==2?n:n+d;
+                },allow,128,32,1,10ms,0ms,10ms);
+            SqliteActorSync observer(fair_db);
+            const auto end=CounterDirectory::Clock::now()+5s;
+            while(!observer.pending_mail().empty() && CounterDirectory::Clock::now()<end)
+                std::this_thread::sleep_for(5ms);
+            assert(observer.pending_mail().empty() && !directory.mail_fault());
+            assert(observer.snapshot(quiet).bytes=="5");
+        }
+        assert(order.size()==13 && order[0]=="hot" && order[1]=="quiet");
+    }
     std::filesystem::remove_all(dir);
 }
