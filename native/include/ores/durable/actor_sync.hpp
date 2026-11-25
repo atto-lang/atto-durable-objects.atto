@@ -567,7 +567,7 @@ public:
             "AND p.sequence<m.sequence AND COALESCE(pr.dead,0)=0)) "
             "SELECT tenant,space,actor_type,id,sequence,op_id,command,schema_fp,failures,retry_at,attempt_epoch FROM heads "
             "ORDER BY tenant_rank,CASE WHEN tenant>? THEN 0 ELSE 1 END,tenant LIMIT ?");
-        read.i64(1,now_ms);read.text(2,after_tenant);read.i64(3,static_cast<std::int64_t>(limit));
+        read.i64(1,now_ms);read.text(2,after_tenant.empty()?std::string_view(""):after_tenant);read.i64(3,static_cast<std::int64_t>(limit));
         std::vector<SyncMail> result;
         while(read.step()==SQLITE_ROW) {
             SyncMail m{{read.str(0),read.str(1),read.str(2),read.str(3)},read.number(4),read.str(5),read.blob(6),read.str(7),read.number(8),read.number(9),read.number(10)};
