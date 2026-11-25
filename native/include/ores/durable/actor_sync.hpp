@@ -75,6 +75,8 @@ struct SyncLimits {
     std::size_t inbox_entries_per_actor = 128;
     std::size_t inbox_entries_per_database = 4096;
     std::size_t inbox_command_bytes_per_database = 64u << 20;
+    std::size_t inbox_entries_per_tenant = 1024;
+    std::size_t inbox_command_bytes_per_tenant = 16u << 20;
 };
 
 class SqliteActorSync final {
@@ -88,6 +90,8 @@ public:
             limits_.actor_keys_per_database == 0 || limits_.projection_consumers_per_actor == 0 ||
             limits_.inbox_entries_per_actor == 0 || limits_.inbox_entries_per_database == 0 ||
             limits_.inbox_entries_per_database > 65536 ||
+            limits_.inbox_entries_per_tenant == 0 || limits_.inbox_entries_per_tenant > 65536 ||
+            limits_.inbox_command_bytes_per_tenant == 0 || limits_.inbox_command_bytes_per_tenant > (1u << 30) ||
             limits_.inbox_command_bytes_per_database == 0 ||
             limits_.inbox_command_bytes_per_database > (1u << 30) ||
             limits_.state_bytes > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
@@ -499,6 +503,18 @@ public:
                 throw std::length_error("mailbox database quota exhausted");
         }
         {
+            // Count retained dead letters as well as live mail. Check exact
+            // replay above first, so a full tenant can still recover receipts.
+            Statement count(db_,"SELECT COUNT(*),COALESCE(SUM(LENGTH(command)),0) FROM sync_inbox WHERE tenant=?");
+            count.text(1,key.tenant);
+            if(count.step()!=SQLITE_ROW) throw std::runtime_error("tenant mailbox quota query failed");
+            const auto bytes=count.number(1);
+            if(static_cast<std::uint64_t>(count.number(0))>=limits_.inbox_entries_per_tenant ||
+               bytes<0 || static_cast<std::uint64_t>(bytes)>limits_.inbox_command_bytes_per_tenant ||
+               command.size()>limits_.inbox_command_bytes_per_tenant-static_cast<std::size_t>(bytes))
+                throw std::length_error("mailbox tenant quota exhausted");
+        }
+        {
             Statement write(db_,"INSERT INTO sync_inbox(tenant,space,actor_type,id,op_id,command,schema_fp) VALUES(?,?,?,?,?,?,?)");
             bind_key(write,key);write.text(5,operation_id);write.blob(6,command);write.text(7,schema_fp);write.done();
         }
@@ -522,6 +538,36 @@ public:
             "WHERE p.tenant=m.tenant AND p.space=m.space AND p.actor_type=m.actor_type AND p.id=m.id "
             "AND p.sequence<m.sequence AND COALESCE(pr.dead,0)=0) ORDER BY m.sequence LIMIT ?");
         read.i64(1,now_ms);read.i64(2,static_cast<std::int64_t>(limit));
+        std::vector<SyncMail> result;
+        while(read.step()==SQLITE_ROW) {
+            SyncMail m{{read.str(0),read.str(1),read.str(2),read.str(3)},read.number(4),read.str(5),read.blob(6),read.str(7),read.number(8),read.number(9),read.number(10)};
+            validate_key(m.key);label(m.operation_id);label(m.schema);
+            bounded(m.command,limits_.command_bytes);result.push_back(std::move(m));
+        }
+        return result;
+    }
+
+    // Round-robin candidate discovery across tenants, oldest eligible head
+    // first within each tenant. Rank before LIMIT so an early hot tenant
+    // cannot hide later tenants. Cursor is trusted controller scheduling
+    // state, not authorization, and need not persist across restart.
+    std::vector<SyncMail> fair_pending_mail(std::size_t limit,std::int64_t now_ms,
+                                            std::string_view after_tenant={}) {
+        if(limit==0 || limit>256 || now_ms<0) throw std::invalid_argument("invalid fair mailbox scan");
+        label_or_empty(after_tenant);
+        std::lock_guard<std::mutex> lock(mu_);
+        Statement read(db_,"WITH heads AS (SELECT m.tenant,m.space,m.actor_type,m.id,m.sequence,m.op_id,m.command,m.schema_fp,"
+            "COALESCE(r.failures,0) AS failures,COALESCE(r.retry_at_ms,0) AS retry_at,COALESCE(a.epoch,0) AS attempt_epoch,"
+            "ROW_NUMBER() OVER (PARTITION BY m.tenant ORDER BY m.sequence) AS tenant_rank "
+            "FROM sync_inbox m LEFT JOIN sync_mail_retry r ON r.sequence=m.sequence "
+            "LEFT JOIN sync_mail_attempt a ON a.sequence=m.sequence "
+            "WHERE COALESCE(r.dead,0)=0 AND COALESCE(r.retry_at_ms,0)<=? "
+            "AND NOT EXISTS(SELECT 1 FROM sync_inbox p LEFT JOIN sync_mail_retry pr ON pr.sequence=p.sequence "
+            "WHERE p.tenant=m.tenant AND p.space=m.space AND p.actor_type=m.actor_type AND p.id=m.id "
+            "AND p.sequence<m.sequence AND COALESCE(pr.dead,0)=0)) "
+            "SELECT tenant,space,actor_type,id,sequence,op_id,command,schema_fp,failures,retry_at,attempt_epoch FROM heads "
+            "ORDER BY tenant_rank,CASE WHEN tenant>? THEN 0 ELSE 1 END,tenant LIMIT ?");
+        read.i64(1,now_ms);read.text(2,after_tenant);read.i64(3,static_cast<std::int64_t>(limit));
         std::vector<SyncMail> result;
         while(read.step()==SQLITE_ROW) {
             SyncMail m{{read.str(0),read.str(1),read.str(2),read.str(3)},read.number(4),read.str(5),read.blob(6),read.str(7),read.number(8),read.number(9),read.number(10)};
@@ -953,6 +999,8 @@ private:
             limits_.outbox_entries_per_actor);
 
         validate("SELECT COUNT(*) FROM sync_inbox",limits_.inbox_entries_per_database);
+        validate("SELECT COALESCE(MAX(n),0) FROM (SELECT COUNT(*) AS n FROM sync_inbox GROUP BY tenant)",limits_.inbox_entries_per_tenant);
+        validate("SELECT COALESCE(MAX(n),0) FROM (SELECT SUM(LENGTH(command)) AS n FROM sync_inbox GROUP BY tenant)",limits_.inbox_command_bytes_per_tenant);
         validate("SELECT COALESCE(SUM(LENGTH(command)),0) FROM sync_inbox",limits_.inbox_command_bytes_per_database);
         validate("SELECT COALESCE(MAX(n),0) FROM (SELECT COUNT(*) AS n FROM sync_inbox GROUP BY tenant,space,actor_type,id)",limits_.inbox_entries_per_actor);
         validate("SELECT COALESCE(MAX(LENGTH(command)),0) FROM sync_inbox",limits_.command_bytes);
