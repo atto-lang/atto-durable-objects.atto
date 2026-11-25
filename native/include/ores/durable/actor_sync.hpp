@@ -164,6 +164,11 @@ public:
             exec("CREATE TABLE IF NOT EXISTS sync_mail_attempt("
                  "sequence INTEGER PRIMARY KEY, epoch INTEGER NOT NULL CHECK(epoch>0),"
                  "FOREIGN KEY(sequence) REFERENCES sync_inbox(sequence) ON DELETE CASCADE)");
+            // A managed controller binds its entire canonical deployment
+            // manifest before starting any workers. No implicit adoption.
+            exec("CREATE TABLE IF NOT EXISTS sync_deployment("
+                 "singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
+                 "manifest BLOB NOT NULL CHECK(length(manifest)>0 AND length(manifest)<=4194304))");
             exec("CREATE TABLE IF NOT EXISTS sync_projection("
                  "consumer TEXT NOT NULL, tenant TEXT NOT NULL, space TEXT NOT NULL,"
                  "actor_type TEXT NOT NULL, id TEXT NOT NULL, epoch INTEGER NOT NULL,"
@@ -209,6 +214,39 @@ public:
     ~SqliteActorSync() { if (db_) sqlite3_close(db_); }
     SqliteActorSync(const SqliteActorSync&) = delete;
     SqliteActorSync& operator=(const SqliteActorSync&) = delete;
+
+    // Trusted exclusive controller startup only. Empty manifest denotes the
+    // legacy host-fixture mode, which must not reopen a managed deployment.
+    // Exact bytes (including artifact hashes/profile) are immutable in v1.
+    // Any migration, adoption or rotation requires a separate offline protocol.
+    void bind_deployment(std::string_view manifest) {
+        if(manifest.size()>(4u<<20)) throw std::length_error("deployment manifest too large");
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this);
+        std::optional<std::string> prior;
+        {
+            Statement read(db_,"SELECT manifest FROM sync_deployment WHERE singleton=1");
+            if(read.step()==SQLITE_ROW) prior=read.blob(0);
+        }
+        if(prior) {
+            if(manifest.empty() || *prior!=manifest)
+                throw std::logic_error("deployment identity mismatch; migration required");
+        } else if(!manifest.empty()) {
+            {
+                Statement existing(db_,"SELECT 1 FROM sync_objects LIMIT 1");
+                if(existing.step()==SQLITE_ROW)
+                    throw std::logic_error("legacy actors require explicit deployment adoption");
+            }
+            {
+                Statement existing(db_,"SELECT 1 FROM sync_projection LIMIT 1");
+                if(existing.step()==SQLITE_ROW)
+                    throw std::logic_error("legacy projections require explicit deployment adoption");
+            }
+            Statement insert(db_,"INSERT INTO sync_deployment VALUES(1,?)");
+            insert.blob(1,manifest);insert.done();
+        }
+        tx.commit();
+    }
 
     // Called only by a trusted controller that has already established writer
     // authority. Bumping an epoch is NOT itself distributed leader election.
