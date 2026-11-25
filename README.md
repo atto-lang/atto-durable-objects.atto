@@ -217,7 +217,36 @@ rollback, reopen, auto-activation, consumed receipt replay and terminal
 overflow. See the directory and actor-sync recovery tests; new tests remain
 unexecuted pending exact-head CI. No exactly-once external effect claim.
 
-### Bounded compiled guest process runner (Wave 10 candidate)
+### Deterministic fuel and Linux process limits (Wave 11 candidate)
+
+The optional [Rust fuel worker](guest/fuel-worker/src/main.rs) uses pinned
+Wasmi 0.31.2 and a fresh 50,000-unit budget per scalar evaluation. Fuel
+exhaustion has a distinct status from traps and wall-clock timeouts.
+The scalar profile rejects imports, linear memories, tables and start
+functions, checks artifact SHA-256 and admits one instance. Linux limits
+cap address space at 256 MiB, CPU at two seconds and descriptors at 16;
+core dumps are disabled. Parent-death SIGKILL is installed with an identity
+check. The parent watchdog and physical reap remain mandatory.
+These are engine-specific process limits, not portable AttoLang fuel,
+aggregate tenant quotas or a production sandbox.
+
+The same compiled looping fixture tests both execution engines. The fuel
+case must report fuel exhaustion, retry three times, dead-letter and permit
+healthy mail. Direct versions are pinned; CI resolves a lockfile, records
+its digest and graph, then builds --locked. A reviewed committed transitive
+lock remains required. Local Rust tooling and GitHub DNS are unavailable;
+new tests are not yet execution-verified. Crash-counted durable attempts
+remain outstanding: parent-death signaling is not a persistent attempt record.
+
+### Bounded compiled guest process runner (Wave 10 — executed)
+
+[Exact-head run 45534083712](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45534083712)
+executed commit `60950899a13b6b1a7d407c6bc48eceed58fa6c78`, tree
+`66d1c3039e7a4a6bd47e63399374a71f93bc7ef4`. Both guest and host jobs
+passed. The guest emitted `COMPILED_COUNTER_PROCESS_WATCHDOG_PASS` with
+one compilation, a 1500 ms deadline and four expected reaped timeout
+children. This verifies the previous head, not the new fuel engine.
+
 
 [CounterProcessGuest](native/include/ores/durable/counter_process_guest.hpp)
 is a Linux/glibc host runner compatible with the existing directory's scalar
@@ -266,8 +295,7 @@ an uninterruptible OS process cannot be treated as stopped until actually reaped
   policy gates require independent remediation. No cross-backend parity claim.
 
 These receipts supersede the older pending statuses for Wave 9 and earlier
-features covered by those tests. The new Wave 10 watchdog and integrated
-directory guest tests do not yet have executed receipts.
+features covered by those tests. Wave 10 watchdog evidence is recorded above; Wave 11 remains unverified.
 
 ### Compile-once candidate ABI
 
