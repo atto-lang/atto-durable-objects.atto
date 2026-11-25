@@ -452,6 +452,15 @@ int main() {
             assert(store.snapshot(a).revision==1 && store.snapshot(a).bytes=="2");
             assert(admin.redrive("operator",a,source).duplicate);
             assert(admin.inspect("reader",a)[0].redrive_sequence==replacement.new_sequence);
+            rejects<std::logic_error>([&]{admin.archive("reader",a,source);});
+            assert(!admin.archive("operator",a,source).duplicate);
+            assert(admin.archive("operator",a,source).duplicate);
+            const auto archived=admin.inspect("reader",a);
+            assert(archived.size()==1 && archived[0].archived &&
+                   archived[0].redrive_sequence==replacement.new_sequence);
+            assert(admin.redrive("operator",a,source).duplicate);
+            assert(directory.admit_bound(a,"@principal:failed",1,2,"alice",[]{}).get().dead_letter);
+            assert(store.snapshot(a).revision==1);
         }
     }
     std::filesystem::remove_all(dir);
