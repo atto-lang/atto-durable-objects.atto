@@ -177,6 +177,41 @@ public:
         tx.commit();
     }
 
+    // Trusted single-owner controller only. Allocate the next durable epoch
+    // atomically; this fences previous writers but does not elect a leader.
+    std::int64_t activate_next(const SyncKey& key) {
+        validate_key(key);
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this);
+        std::int64_t epoch = 1;
+        {
+            Statement read(db_, "SELECT epoch FROM sync_objects WHERE "
+                                "tenant=? AND space=? AND actor_type=? AND id=?");
+            bind_key(read, key);
+            if (read.step() == SQLITE_ROW) {
+                const auto old = read.number(0);
+                if (old <= 0 || old == std::numeric_limits<std::int64_t>::max())
+                    throw std::overflow_error("activation epoch exhausted or corrupt");
+                epoch = old + 1;
+            }
+        }
+        {
+            Statement write(db_, "INSERT INTO sync_objects(tenant,space,actor_type,id,epoch) "
+                                 "VALUES(?,?,?,?,?) ON CONFLICT(tenant,space,actor_type,id) "
+                                 "DO UPDATE SET epoch=excluded.epoch WHERE epoch<excluded.epoch");
+            bind_key(write, key); write.i64(5, epoch); write.done();
+            if (sqlite3_changes(db_) != 1) throw std::logic_error("activation lost fence");
+        }
+        {
+            Statement count(db_, "SELECT COUNT(*) FROM sync_objects");
+            if (count.step()!=SQLITE_ROW) throw std::runtime_error("actor count failed");
+            if (static_cast<std::size_t>(count.number(0)) > limits_.actor_keys_per_database)
+                throw std::length_error("actor key storage quota exhausted");
+        }
+        tx.commit();
+        return epoch;
+    }
+
     SyncSnapshot snapshot(const SyncKey& key) {
         validate_key(key);
         std::lock_guard<std::mutex> lock(mu_);
