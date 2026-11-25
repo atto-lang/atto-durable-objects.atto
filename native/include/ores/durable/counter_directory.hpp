@@ -25,6 +25,11 @@ namespace ores::durable {
 // users must honor this policy. No distributed lease election.
 // Guest and authorization callbacks must be thread-safe and terminate.
 // Never invoke directory methods recursively from either callback.
+// Host configuration, never selected by a request. Zero inherits the
+// corresponding global limit for backward-compatible trusted host callers.
+struct CounterTenantLimits {
+    std::size_t queued=0,running=0;
+};
 class CounterDirectory final {
 public:
     using Guest = std::function<std::int64_t(std::int64_t,std::int64_t,std::int64_t)>;
@@ -113,7 +118,7 @@ private:
     const bool principal_mode_,transactional_policy_;
     const PrincipalPolicy mail_policy_;
     struct PolicyDenied {};
-    const std::size_t capacity_,active_limit_;
+    const std::size_t capacity_,active_limit_,tenant_queue_limit_,tenant_running_limit_;
     const Clock::duration idle_timeout_;
     std::map<Key,Lane> lanes_; // protected by mu_; running lanes cannot be erased
     std::size_t queued_=0,active_=0;
@@ -226,7 +231,7 @@ private:
                     }
                     if(in_flight.size()>=worker_count) break;
                     const auto id=identity(alarm.key);
-                    if(in_flight.find(id)!=in_flight.end()) continue;
+                    if(in_flight.find(id)!=in_flight.end() || !poller_tenant_available(in_flight,alarm.key.tenant)) continue;
                     last_tenant=alarm.key.tenant;
                     auto inserted=in_flight.try_emplace(id);
                     try {inserted.first->second=enqueue_alarm(alarm);}
@@ -356,7 +361,7 @@ private:
                     }
                     if(in_flight.size()>=worker_count) break;
                     const auto id=identity(mail.key);
-                    if(in_flight.find(id)!=in_flight.end()) continue;
+                    if(in_flight.find(id)!=in_flight.end() || !poller_tenant_available(in_flight,mail.key.tenant)) continue;
                     // Rotate even on queue/activation saturation; do not
                     // let one tenant monopolize subsequent bounded scans.
                     last_tenant=mail.key.tenant;
@@ -405,9 +410,27 @@ private:
             } else ++it;
         }
     }
+    // Called under mu_. Count exact tenant keys; no unbounded secondary
+    // tenant registry or counter to leak when idle lanes are swept.
+    std::size_t tenant_queued(const std::string& tenant) const {
+        std::size_t n=0;
+        for(const auto& entry:lanes_) if(std::get<0>(entry.first)==tenant) n+=entry.second.queue.size();
+        return n;
+    }
+    std::size_t tenant_running(const std::string& tenant) const {
+        std::size_t n=0;
+        for(const auto& entry:lanes_) if(std::get<0>(entry.first)==tenant && entry.second.running) ++n;
+        return n;
+    }
+    bool poller_tenant_available(const std::map<Key,std::future<Reply>>& futures,const std::string& tenant) const {
+        std::size_t n=0;
+        for(const auto& entry:futures) if(std::get<0>(entry.first)==tenant) ++n;
+        return n<tenant_running_limit_;
+    }
     auto runnable() {
         const auto start=last_scheduled_ ? lanes_.upper_bound(*last_scheduled_) : lanes_.begin();
-        const auto ready=[](const auto& p){return !p.second.running && !p.second.queue.empty();};
+        const auto ready=[this](const auto& p){return !p.second.running && !p.second.queue.empty() &&
+            tenant_running(std::get<0>(p.first))<tenant_running_limit_;};
         auto it=std::find_if(start,lanes_.end(),ready);
         if(it!=lanes_.end()) return it;
         it=std::find_if(lanes_.begin(),start,ready);
@@ -453,6 +476,8 @@ private:
             std::lock_guard<std::mutex> lock(mu_);
             if(closed_) throw std::logic_error("directory closed");
             if(queued_>=capacity_) throw std::length_error("directory queue full");
+            if(tenant_queued(std::get<0>(id))>=tenant_queue_limit_)
+                throw std::length_error("tenant queue full");
             sweep(Clock::now());
             auto [it,inserted]=lanes_.try_emplace(id);
             try {
@@ -503,20 +528,22 @@ public:
                      std::size_t workers=1,
                      Clock::duration idle_timeout=Clock::duration::zero(),
                      Clock::duration alarm_interval=Clock::duration::zero(),
-                     Clock::duration mail_interval=Clock::duration::zero())
+                     Clock::duration mail_interval=Clock::duration::zero(),CounterTenantLimits tenant_limits={})
         : CounterDirectory(db,adapt(std::move(guest)),std::move(authorize),capacity,
-                           active_limit,workers,idle_timeout,alarm_interval,mail_interval) {}
+                           active_limit,workers,idle_timeout,alarm_interval,mail_interval,"",false,{},false,tenant_limits) {}
     CounterDirectory(const std::string& db, KeyedGuest guest, Authorize authorize,
                      std::size_t capacity=128,std::size_t active_limit=128,
                      std::size_t workers=1,
                      Clock::duration idle_timeout=Clock::duration::zero(),
                      Clock::duration alarm_interval=Clock::duration::zero(),
                      Clock::duration mail_interval=Clock::duration::zero(),
-                     std::string deployment_manifest={},bool principal_mode=false,PrincipalPolicy mail_policy={},bool transactional_policy=false)
+                     std::string deployment_manifest={},bool principal_mode=false,PrincipalPolicy mail_policy={},bool transactional_policy=false,CounterTenantLimits tenant_limits={})
         : owner_(db),store_(owner_.path()),guest_(std::move(guest)),
           deployment_manifest_(std::move(deployment_manifest)),authorize_(std::move(authorize)),
           principal_mode_(principal_mode),transactional_policy_(transactional_policy),mail_policy_(std::move(mail_policy)),
-          capacity_(capacity),active_limit_(active_limit),idle_timeout_(idle_timeout) {
+          capacity_(capacity),active_limit_(active_limit),
+          tenant_queue_limit_(tenant_limits.queued?std::min(tenant_limits.queued,capacity):capacity),
+          tenant_running_limit_(tenant_limits.running?std::min(tenant_limits.running,workers):workers),idle_timeout_(idle_timeout) {
         if(!guest_ || !authorize_ || !capacity_ || !active_limit_ ||
            !workers || workers>64 || idle_timeout_<Clock::duration::zero() ||
            alarm_interval<Clock::duration::zero() || mail_interval<Clock::duration::zero() ||
