@@ -78,6 +78,54 @@ int main(int argc,char** argv) {
         assert(directory.admit(a,"after",1,2).get().receipt->reply=="2");
     }
     assert(::waitpid(-1,&status,WNOHANG)==-1 && errno==ECHILD);
+    // Genuine compiled alarm failure: the guest loops on n=11,d=1.
+    // No host callback substitutes a different operation. Both Node
+    // deadline and wasmi fuel paths must exhaust exactly three attempts.
+    {
+        const auto alarm_db=std::string(tmp)+"/compiled-alarm-retry.db";
+        const auto policy=[](std::string_view,const SyncKey&,std::int64_t){return true;};
+        auto keyed=[&](const SyncKey&,std::int64_t n,std::int64_t op,std::int64_t d){return runner(n,op,d);};
+        {
+            CounterDirectory directory(alarm_db,CounterDirectory::KeyedGuest(keyed),auth,
+                16,4,2,10ms,0ms,10ms,"",true,policy,true);
+            SqliteActorSync admin(alarm_db);
+            admin.set_principal_policy(a,"alice",1,0,true);
+            admin.set_principal_policy(b,"bob",1,0,true);
+            assert(directory.admit_bound(a,"@principal:seed",1,11,"alice",[]{}).get().sequence>0);
+            const auto until=CounterDirectory::Clock::now()+5s;
+            while(!admin.pending_mail().empty() && CounterDirectory::Clock::now()<until)
+                std::this_thread::sleep_for(5ms);
+            assert(admin.pending_mail().empty() && !directory.mail_fault());
+            assert(admin.snapshot(a).bytes=="11");
+            assert(directory.schedule_principal_alarm(a,0,0,"alice","operator",[]{}).get()==1);
+            assert(directory.schedule_principal_alarm(b,0,1,"bob","operator",[]{}).get()==1);
+        }
+        std::atomic<int> failures{0};
+        {
+            CounterDirectory directory(alarm_db,CounterDirectory::KeyedGuest(
+                [&](const SyncKey& k,std::int64_t n,std::int64_t op,std::int64_t d){
+                    try {return keyed(k,n,op,d);}
+                    catch(const CounterDirectory::RetryableGuestFailure& e) {
+                        assert(k.object_id==a.object_id && n==11 && op==1 && d==1);
+                        assert(e.reason==(fuel?CounterDirectory::FailureReason::fuel:CounterDirectory::FailureReason::deadline));
+                        ++failures;throw;
+                    }
+                }),auth,16,4,2,10ms,10ms,0ms,"",true,policy,true);
+            SqliteActorSync admin(alarm_db);
+            const auto until=CounterDirectory::Clock::now()+25s;
+            while((admin.principal_alarm_authority(a)->status!=SyncAlarmStatus::failed ||
+                   admin.principal_alarm_authority(b)->status!=SyncAlarmStatus::fired) &&
+                   CounterDirectory::Clock::now()<until)
+                std::this_thread::sleep_for(5ms);
+            assert(failures==3 && !directory.alarm_fault());
+            assert(admin.principal_alarm_authority(a)->status==SyncAlarmStatus::failed);
+            assert(admin.principal_alarm_authority(b)->status==SyncAlarmStatus::fired);
+            assert(admin.snapshot(a).bytes=="11" && admin.snapshot(a).revision==1);
+            assert(admin.snapshot(b).bytes=="1" && admin.snapshot(b).revision==1);
+            assert(admin.due_alarms(1).empty());
+        }
+        assert(::waitpid(-1,&status,WNOHANG)==-1 && errno==ECHILD);
+    }
     // Compile-once scalar guest, atomic host-proposed state/alarm effect.
     // Reopening must replay the receipt without changing the deadline.
     {
