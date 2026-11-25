@@ -58,10 +58,11 @@ public:
     CounterPrincipalGateway(const SignedCounterDeployment& deployment,const std::string& db,
                             CounterDirectory::Authorize scope,Policy policy,
                             std::size_t capacity=128,std::size_t active=128,std::size_t workers=1,
-                            Clock::duration mail_interval=Clock::duration::zero(),bool transactional_policy=false)
+                            Clock::duration mail_interval=Clock::duration::zero(),bool transactional_policy=false,
+                            CounterFuelTenantBudget tenant_budget={})
         :authority_(std::make_shared<const Authority>(std::move(policy))),
          directory_(deployment.open(db,std::move(scope),capacity,active,workers,
-             std::chrono::milliseconds(100),Clock::duration::zero(),mail_interval,true,authority_->policy,transactional_policy)) {}
+             std::chrono::milliseconds(100),Clock::duration::zero(),mail_interval,true,authority_->policy,transactional_policy,tenant_budget)) {}
     // Caller MUST authenticate the principal upstream. Exact object and
     // operation are fixed at issue time; no ambient tenant supplied on send.
     Capability issue(std::string principal,SyncKey key,std::int64_t op,
