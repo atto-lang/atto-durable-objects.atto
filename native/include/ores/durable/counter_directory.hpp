@@ -13,6 +13,7 @@
 #include <future>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -234,6 +235,15 @@ public:
                 retire(id);throw;
             }
         });
+    }
+    // Trusted, authorized diagnostic only. Does not reserve a turn or
+    // grant an ownership capability; the value may change immediately.
+    bool is_active(const SyncKey& k) {
+        validate(k);
+        std::lock_guard<std::mutex> lock(mu_);
+        sweep(Clock::now());
+        const auto it=lanes_.find(identity(k));
+        return it!=lanes_.end() && it->second.epoch!=0;
     }
     std::future<bool> passivate(SyncKey k) {
         validate(k);
