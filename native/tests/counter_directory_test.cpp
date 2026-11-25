@@ -585,5 +585,88 @@ int main() {
             assert(!directory.alarm_fault() && observer.due_alarms(1).empty());
         }
     }
+    // Per-tenant queue capacity cannot be exhausted by a sibling tenant.
+    // A classified or ordinary exception must release the running slot.
+    {
+        using namespace std::chrono_literals;
+        const auto db2=std::string(dir)+"/tenant-queue-limit.db";
+        const SyncKey hot1{"hot","counters","Counter","one"},hot2{"hot","counters","Counter","two"},
+                      hot3{"hot","counters","Counter","three"},quiet{"quiet","counters","Counter","one"};
+        std::promise<void> entered,release;
+        auto ready=entered.get_future();auto gate=release.get_future();
+        CounterDirectory directory(db2,CounterDirectory::KeyedGuest(
+            [&](const SyncKey& k,I n,I,I d)->I{
+                if(k.object_id=="one" && k.tenant=="hot") {
+                    entered.set_value();gate.wait();throw CounterDirectory::RetryableGuestFailure();
+                }
+                return n+d;
+            }),[](const SyncKey&){return true;},8,8,2,10ms,0ms,0ms,"",false,{},false,{1,1});
+        auto first=directory.send(hot1,"held",1,1);
+        const bool began=ready.wait_for(3s)==std::future_status::ready;
+        bool full=false,progressed=false,waiting=false;
+        std::future<CounterDirectory::Reply> next;
+        try {
+            next=directory.send(hot2,"next",1,2);
+            try {(void)directory.send(hot3,"excess",1,1);}
+            catch(const std::length_error&) {full=true;}
+            auto other=directory.send(quiet,"quiet",1,3);
+            progressed=other.wait_for(3s)==std::future_status::ready;
+            if(progressed) assert(other.get()->reply=="3");
+            waiting=next.wait_for(0ms)!=std::future_status::ready;
+        } catch(...) {release.set_value();throw;}
+        release.set_value();
+        assert(began && full && progressed && waiting);
+        rejects<CounterDirectory::RetryableGuestFailure>([&]{(void)first.get();});
+        assert(next.get()->reply=="2");
+        assert(directory.send(hot3,"retry",1,4).get()->reply=="4");
+    }
+    // Mailbox, alarm and ordinary request execution share one tenant slot,
+    // not independently multiplied supervisor limits.
+    {
+        using namespace std::chrono_literals;
+        const auto db2=std::string(dir)+"/tenant-shared-limit.db";
+        const SyncKey alarm{"hot","counters","Counter","alarm"},mail{"hot","counters","Counter","mail"},
+                      direct{"hot","counters","Counter","direct"},quiet{"quiet","counters","Counter","one"};
+        const auto scope=[](const SyncKey&){return true;};
+        {
+            CounterDirectory directory(db2,[](I n,I,I d){return n+d;},scope);
+            directory.set_alarm(alarm,0,0).get();
+            assert(directory.admit(mail,"mail",1,2).get().sequence>0);
+        }
+        std::promise<void> entered,release;
+        auto ready=entered.get_future();auto gate=release.get_future();
+        std::atomic<int> hot_calls{0},hot_running{0};
+        {
+            CounterDirectory directory(db2,CounterDirectory::KeyedGuest(
+                [&](const SyncKey& k,I n,I,I d)->I{
+                    if(k.tenant=="hot") {
+                        assert(hot_running.fetch_add(1)==0);
+                        if(++hot_calls==1){entered.set_value();gate.wait();}
+                        assert(hot_running.fetch_sub(1)==1);
+                    }
+                    return n+d;
+                }),scope,16,8,3,10ms,10ms,10ms,"",false,{},false,{8,1});
+            const bool began=ready.wait_for(3s)==std::future_status::ready;
+            std::future<CounterDirectory::Reply> successor;
+            bool progressed=false,waiting=false;
+            try {
+                successor=directory.send(direct,"direct",1,4);
+                auto other=directory.send(quiet,"quiet",1,3);
+                progressed=other.wait_for(3s)==std::future_status::ready;
+                if(progressed) assert(other.get()->reply=="3");
+                waiting=successor.wait_for(0ms)!=std::future_status::ready && hot_calls==1;
+            } catch(...) {release.set_value();throw;}
+            release.set_value();
+            assert(began && progressed && waiting);
+            assert(successor.get()->reply=="4");
+            SqliteActorSync observer(db2);
+            const auto until=CounterDirectory::Clock::now()+5s;
+            while((!observer.pending_mail().empty() || !observer.due_alarms(0).empty()) &&
+                   CounterDirectory::Clock::now()<until) std::this_thread::sleep_for(5ms);
+            assert(observer.pending_mail().empty() && observer.due_alarms(0).empty());
+            assert(observer.snapshot(alarm).bytes=="1" && observer.snapshot(mail).bytes=="2");
+            assert(hot_calls==3 && hot_running==0 && !directory.mail_fault() && !directory.alarm_fault());
+        }
+    }
     std::filesystem::remove_all(dir);
 }
