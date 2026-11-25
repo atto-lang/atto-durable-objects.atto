@@ -1,0 +1,72 @@
+name: Durable counter guest and host seam
+on:
+  pull_request:
+    paths:
+      - 'guest/**'
+      - 'native/include/ores/durable/counter_turn.hpp'
+      - 'native/tests/counter_turn_test.cpp'
+      - 'tests/durable_counter_guest.mjs'
+      - '.github/workflows/durable-counter.yml'
+permissions:
+  contents: read
+jobs:
+  guest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Verify guest source and build pinned public Rust compiler
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha }}
+          COMPILER_SHA: a4c2497decbb3782a1a6f810e8078bbee094ccbb
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED"
+          test -z "$(git status --porcelain)"
+          git rev-parse HEAD^{tree}
+          git init "$RUNNER_TEMP/atto-compiler"
+          git -C "$RUNNER_TEMP/atto-compiler" fetch --depth=1 https://github.com/atto-lang/atto-source.rs.git "$COMPILER_SHA"
+          git -C "$RUNNER_TEMP/atto-compiler" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/atto-compiler" rev-parse HEAD)" = "$COMPILER_SHA"
+          git -C "$RUNNER_TEMP/atto-compiler" rev-parse HEAD^{tree}
+          rustup toolchain install 1.85.1 --profile minimal
+          cd "$RUNNER_TEMP/atto-compiler"
+          cargo +1.85.1 build --locked --release --bin attoc
+      - name: Execute compiled counter Wasm and compiler negative
+        env:
+          ATTO_COMPILER_SOURCE_SHA: a4c2497decbb3782a1a6f810e8078bbee094ccbb
+        run: |
+          set -euo pipefail
+          ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" node tests/durable_counter_guest.mjs
+  host-seam:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Execute host-only storage seam against pinned PR 9
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha }}
+          STORAGE_SHA: 57c15af3b9dfa31c32dbbb459ee824ebb5b06390
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED"
+          test -z "$(git status --porcelain)"
+          git rev-parse HEAD^{tree}
+          git init "$RUNNER_TEMP/storage"
+          git -C "$RUNNER_TEMP/storage" fetch --depth=1 https://github.com/atto-lang/atto-durable-objects.atto.git "$STORAGE_SHA"
+          git -C "$RUNNER_TEMP/storage" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/storage" rev-parse HEAD)" = "$STORAGE_SHA"
+          git -C "$RUNNER_TEMP/storage" rev-parse HEAD^{tree}
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+          g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
+            -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/counter_turn_test.cpp \
+            -lsqlite3 -o "$RUNNER_TEMP/counter-turn-test"
+          "$RUNNER_TEMP/counter-turn-test"
+          echo 'HOST_ONLY_COUNTER_TURN_PASS'
