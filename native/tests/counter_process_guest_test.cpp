@@ -1,5 +1,5 @@
 // Real compiled guest integration, including an intentionally looping turn.
-#include "ores/durable/counter_artifact_registry.hpp"
+#include "ores/durable/counter_signed_deployment.hpp"
 #include <cassert>
 #include <atomic>
 #include <filesystem>
@@ -155,6 +155,60 @@ int main(int argc,char** argv) {
                 std::this_thread::sleep_for(5ms);
             assert(observer.pending_mail().empty() && !replacement.mail_fault());
             assert(observer.snapshot(a).bytes=="5");
+        }
+        // Ephemeral test signing key only; never persisted or logged.
+        using Key=std::unique_ptr<EVP_PKEY,decltype(&EVP_PKEY_free)>;
+        using Keygen=std::unique_ptr<EVP_PKEY_CTX,decltype(&EVP_PKEY_CTX_free)>;
+        using Sign=std::unique_ptr<EVP_MD_CTX,decltype(&EVP_MD_CTX_free)>;
+        Keygen keygen(EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519,nullptr),EVP_PKEY_CTX_free);
+        assert(keygen && EVP_PKEY_keygen_init(keygen.get())==1);
+        EVP_PKEY* raw=nullptr;
+        assert(EVP_PKEY_keygen(keygen.get(),&raw)==1);
+        Key key(raw,EVP_PKEY_free);
+        SignedCounterDeployment::PublicKey public_key{};
+        std::size_t pubsize=public_key.size();
+        assert(EVP_PKEY_get_raw_public_key(key.get(),public_key.data(),&pubsize)==1 &&
+               pubsize==public_key.size());
+        SignedCounterDeployment::Signature signature{};
+        auto sigsize=signature.size();
+        Sign sign(EVP_MD_CTX_new(),EVP_MD_CTX_free);
+        assert(sign && EVP_DigestSignInit(sign.get(),nullptr,nullptr,nullptr,key.get())==1);
+        assert(EVP_DigestSign(sign.get(),signature.data(),&sigsize,
+            reinterpret_cast<const unsigned char*>(registry.manifest().data()),
+            registry.manifest().size())==1 && sigsize==signature.size());
+        const SignedCounterDeployment signed_deployment(same,public_key,signature);
+        auto corrupted=signature;corrupted[0]^=1;
+        denied=false;
+        try {SignedCounterDeployment rejected(same,public_key,corrupted);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        auto wrong_key=public_key;wrong_key[0]^=1;
+        denied=false;
+        try {SignedCounterDeployment rejected(same,wrong_key,signature);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        denied=false;
+        try {SignedCounterDeployment rejected(different,public_key,signature);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        denied=false;
+        try {SignedCounterDeployment rejected(different_budget,public_key,signature);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        const auto signed_db=std::string(tmp)+"/signed.db";
+        {
+            auto directory=signed_deployment.open(signed_db,
+                [&](const SyncKey& k){return k.tenant=="tenant";});
+            assert(directory->send(a,"signed",1,3).get()->reply=="3");
+            denied=false;
+            try {(void)directory->send(other,"signed",1,1);}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+        }
+        {
+            auto directory=signed_deployment.open(signed_db,authorize);
+            auto replay=directory->send(a,"signed",1,3).get();
+            assert(replay && replay->duplicate && replay->reply=="3");
         }
         // A populated legacy store must not be implicitly adopted.
         const auto legacy_db=std::string(tmp)+"/legacy-deployment.db";
