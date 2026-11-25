@@ -408,17 +408,38 @@ public:
         for(auto& t:workers_) t.join(); // drain accepted work
     }
     std::future<Reply> send(SyncKey k,std::string request,std::int64_t op,std::int64_t delta) {
+        if(request.compare(0,11,"@principal:")==0)
+            throw std::invalid_argument("reserved principal request identity");
+        return send_authorized(std::move(k),std::move(request),op,delta,[]{});
+    }
+    // Trusted ingress only. The callback is bound to an authenticated
+    // principal, exact object and operation by the gateway; it is never
+    // guest code. Recheck on admission, worker entry, after guest execution
+    // and before handing a receipt to the host. A policy change racing a
+    // commit cannot undo it; this is not transactional revocation.
+    std::future<Reply> send_authorized(SyncKey k,std::string request,std::int64_t op,
+                                      std::int64_t delta,std::function<void()> authorize_request) {
+        if(!authorize_request) throw std::invalid_argument("missing request authorization");
         validate(k);check(request);
         if(request.compare(0,7,"@alarm:")==0) throw std::invalid_argument("reserved alarm operation identity");
         if((op!=1 && op!=2) || (op==1 && (delta<=0 || delta>CounterTurn::maximum)) ||
            (op==2 && delta!=0)) throw std::invalid_argument("invalid command");
+        authorize_request();
         const auto id=identity(k);
-        return submit(id,[this,id,k=std::move(k),request=std::move(request),op,delta]{
-            validate(k);
+        return submit(id,[this,id,k=std::move(k),request=std::move(request),op,delta,
+                          authorize_request=std::move(authorize_request)]{
+            validate(k);authorize_request();
             const auto epoch=activate(id,k);
             try {
-                auto r=CounterTurn::run(store_,k,epoch,request,op,delta,guarded_guest(k));
-                validate(k);
+                auto invoke=guarded_guest(k);
+                auto checked=[&](auto n,auto operation,auto d){
+                    authorize_request();
+                    auto result=invoke(n,operation,d);
+                    authorize_request();
+                    return result;
+                };
+                auto r=CounterTurn::run(store_,k,epoch,request,op,delta,checked);
+                validate(k);authorize_request();
                 if(store_.snapshot(k).epoch!=epoch) throw std::logic_error("stale publication epoch");
                 return r;
             } catch(...) {
@@ -431,7 +452,7 @@ public:
     // completed receipt. Ordinary send() remains a transient request path.
     std::future<SyncAdmission> admit(SyncKey k,std::string request,std::int64_t op,std::int64_t delta) {
         validate(k);check(request);
-        if(request.compare(0,7,"@alarm:")==0 || (op!=1 && op!=2) ||
+        if(request.compare(0,7,"@alarm:")==0 || request.compare(0,11,"@principal:")==0 || (op!=1 && op!=2) ||
            (op==1 && (delta<=0 || delta>CounterTurn::maximum)) || (op==2 && delta!=0))
             throw std::invalid_argument("invalid mailbox command");
         const auto id=identity(k);
