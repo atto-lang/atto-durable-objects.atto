@@ -29,6 +29,7 @@ namespace ores::durable {
 // corresponding global limit for backward-compatible trusted host callers.
 struct CounterTenantLimits {
     std::size_t queued=0,running=0;
+    SyncGuestRate guest_rate={};
 };
 class CounterDirectory final {
 public:
@@ -104,8 +105,9 @@ private:
         }
         ~GuestGuard(){guest_guard_fd_=previous;guest_deployment_=previous_deployment;}
     };
-    auto guarded_guest(const SyncKey& k) {
-        return [this,&k](std::int64_t n,std::int64_t op,std::int64_t d){
+    auto guarded_guest(const SyncKey& k,bool precharged=false) {
+        return [this,&k,precharged](std::int64_t n,std::int64_t op,std::int64_t d){
+            if(!precharged) store_.reserve_guest_start(k.tenant,unix_ms());
             GuestGuard guard(owner_.fd(),deployment_manifest_);
             return guest_(k,n,op,d);
         };
@@ -162,8 +164,9 @@ private:
                         if(alarm.attempt_epoch>=epoch) throw std::logic_error("unresolved current alarm attempt");
                         (void)store_.fail_alarm(alarm,epoch,now);return Reply{};
                     }
+                    store_.reserve_guest_start(alarm.key.tenant,now);
                     alarm=store_.begin_alarm(alarm,epoch,now);
-                    auto invoke=guarded_guest(alarm.key);
+                    auto invoke=guarded_guest(alarm.key,true);
                     auto checked=[&](auto n,auto op,auto d) {
                         if(!alarm_authorized(alarm)) throw AlarmPolicyDenied{};
                         auto result=invoke(n,op,d);
@@ -291,12 +294,13 @@ private:
                     (void)store_.fail_mail(mail,epoch,unix_ms());
                     return Reply{};
                 }
+                store_.reserve_guest_start(mail.key.tenant,unix_ms());
                 SyncMail started=mail;
                 try {started=store_.begin_mail(mail,epoch,unix_ms());}
                 catch(const PrincipalPolicyChanged&) {store_.deny_mail(mail,epoch);return Reply{};}
                 Reply r;
                 try {
-                    auto invoke=guarded_guest(mail.key);
+                    auto invoke=guarded_guest(mail.key,true);
                     auto checked=[&](auto n,auto op,auto d) {
                         if(!mail_authorized(started)) throw PolicyDenied{};
                         auto result=invoke(n,op,d);
@@ -554,6 +558,7 @@ public:
         store_.bind_deployment(deployment_manifest_);
         store_.bind_principal_namespace(principal_mode);
         store_.bind_transactional_policy(transactional_policy_);
+        store_.bind_guest_rate(tenant_limits.guest_rate);
         workers_.reserve(workers);
         try {
             for(std::size_t i=0;i<workers;++i) workers_.emplace_back([this]{loop();});
