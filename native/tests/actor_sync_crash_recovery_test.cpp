@@ -599,5 +599,70 @@ int main() {
         reopened.bind_transactional_policy(true);
         assert(reopened.snapshot(k).revision==1 && reopened.pending_mail().empty());
     }
+    // Redrive is atomic, creates a new identity and preserves the original
+    // terminal result. A revoked grant or a quota failure cannot create audit.
+    {
+        const auto db2=std::string(dir)+"/redrive.db";
+        const SyncKey key{"tenant","mail","Counter","redrive"};
+        const SyncKey other{"other","mail","Counter","redrive"};
+        std::int64_t original=0,new_sequence=0;
+        {
+            SqliteActorSync store(db2);
+            store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+            const auto epoch=store.activate_next(key);
+            store.activate_next(other);
+            store.set_principal_policy(key,"alice",1,0,true);
+            original=store.admit_mail(key,epoch,"@principal:original","1:2","counter","alice").sequence;
+            for(const auto now:{0,100,300}) {
+                auto heads=store.pending_mail(1,now);
+                assert(heads.size()==1);
+                const auto attempt=store.begin_mail(heads[0],epoch,now);
+                assert(store.fail_mail(attempt,epoch,now)==(now==300));
+            }
+            auto page=store.dead_letters(key,0,1);
+            assert(page.size()==1 && page[0].sequence==original && !page[0].authorization_denied);
+            assert(store.dead_letters(other).empty() && store.dead_letters(key,original).empty());
+            store.set_principal_policy(key,"alice",1,1,false);
+            bool denied=false;
+            try {store.redrive_dead_letter(key,epoch,original,"operator");}
+            catch(const PrincipalPolicyChanged&) {denied=true;}
+            assert(denied && store.pending_mail().empty() && store.dead_letters(key)[0].redrive_sequence==0);
+            store.set_principal_policy(key,"alice",1,2,true);
+            auto fresh=store.redrive_dead_letter(key,epoch,original,"operator");
+            new_sequence=fresh.new_sequence;
+            assert(new_sequence>original && !fresh.duplicate);
+            assert(store.redrive_dead_letter(key,epoch,original,"operator").duplicate);
+            denied=false;
+            try {store.redrive_dead_letter(key,epoch,original,"different");}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            denied=false;
+            try {store.admit_mail(key,epoch,fresh.operation_id,"1:2","counter","alice");}
+            catch(const std::invalid_argument&) {denied=true;}
+            assert(denied);
+            assert(store.admit_mail(key,epoch,"@principal:original","1:2","counter","alice").dead_letter);
+        }
+        {
+            SqliteActorSync store(db2);
+            store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+            auto epoch=store.activate_next(key);
+            auto prior=store.redrive_dead_letter(key,epoch,original,"operator");
+            assert(prior.duplicate && prior.new_sequence==new_sequence);
+            auto heads=store.pending_mail();
+            assert(heads.size()==1 && heads[0].sequence==new_sequence && heads[0].principal=="alice" && heads[0].command=="1:2");
+            auto attempt=store.begin_mail(heads[0],epoch,0);
+            store.commit(key,epoch,0,attempt.operation_id,attempt.command,attempt.schema,"2","2",false,nullptr,0,&attempt);
+            assert(store.pending_mail().empty() && store.snapshot(key).bytes=="2");
+            assert(store.redrive_dead_letter(key,epoch,original,"operator").duplicate);
+            assert(store.dead_letters(key)[0].redrive_sequence==new_sequence);
+            store.admit_mail(key,epoch,"@principal:denied","1:1","counter","alice");
+            auto rejected=store.pending_mail()[0];
+            store.deny_mail(rejected,epoch);
+            bool denied=false;
+            try {store.redrive_dead_letter(key,epoch,rejected.sequence,"operator");}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied && store.snapshot(key).revision==1);
+        }
+    }
     std::filesystem::remove_all(dir);
 }
