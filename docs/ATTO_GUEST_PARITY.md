@@ -103,3 +103,44 @@ required before merge. Keep draft pending compiler execution and review.
 No public ABI is introduced by this fixture. Portable library API belongs
 in atto-common-source and canonical multi-backend execution in
 atto-platform-conformance; backend bindings belong in atto-source.*.
+
+## Wave 2: executable admission and commit adapter (2026-11-24)
+
+- Storage dependency [PR #9](https://github.com/atto-lang/atto-durable-objects.atto/pull/9)
+  at 57c15af3b9dfa31c32dbbb459ee824ebb5b06390 adds read-only fenced
+  receipt lookup before guest execution, including schema/command binding.
+  This is necessary when an already-applied operation would now overflow.
+- `native/include/ores/durable/counter_turn.hpp` connects a scalar guest
+  runner to the existing sync store. It checks canonical state encoding and
+  transition bounds, rejects stale ownership, returns previously committed
+  replies without re-execution, and never returns a success before commit.
+  The host caller must already hold the exclusive per-object turn permit,
+  authenticate tenant/capability and execute blocking SQLite on a privileged
+  isolated IO worker. Recheck the permit at external publication; the
+  adapter alone neither authenticates nor holds the scheduler fence.
+- `native/tests/counter_turn_test.cpp` uses an explicitly HOST_ONLY callback,
+  tests 100 serial turns, malformed returns, rollback, lost reply after process
+  exit, maximum-value dedupe, cross-tenant independence and stale epochs.
+  This is not a concurrency test and is not a compiled actor or end-to-end
+  guest-to-storage test.
+- `tests/durable_counter_guest.mjs` invokes the real Rust attoc CLI,
+  emits and instantiates Wasm, checks results and panic code, requires no
+  host imports, and demands a compiler diagnostic/no artifact for bad types.
+  Run `ATTOC=/absolute/path/to/attoc node tests/durable_counter_guest.mjs`.
+  This remains scalar guest evidence only, even if it passes.
+- Dedicated CI checks out this exact PR head and the public compiler
+  a4c2497decbb3782a1a6f810e8078bbee094ccbb, and independently compiles the
+  host test against the pinned storage dependency. No private source or
+  cross-org credentials. The two lanes are not proof of integrated guest
+  persistence. All results are NOT EXECUTED until actual receipts arrive.
+- Related design: conformance #62 and #66 distinguish persistent user hooks
+  from runtime-owned durable state; reuse their semantics, do not fork
+  syntax. Java #1515 explicitly rejects persistent actor lowering and notes
+  the isolated asynchronous IO-worker requirement. Rust compiler CLI supports
+  a scalar Wasm subset; no durable actor runtime support inferred.
+
+Next: reconcile #9 with main and required safety PRs, execute both CI lanes,
+then connect the real Wasm guest to a fenced turn via a bounded asynchronous
+host adapter and replace the test callback with actual guest execution.
+No distributed ownership, automatic activation, alarm, or passivation
+implementation yet.
