@@ -1,5 +1,7 @@
 #pragma once
 #include "ores/durable/counter_turn.hpp"
+#include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -9,29 +11,38 @@
 #include <thread>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace ores::durable {
-// Single trusted controller prototype. External exclusive process ownership
-// and authentication are prerequisites; not a distributed lease authority.
-// One bounded storage worker, FIFO for all objects; no guest carrier waits.
-// The returned future is a host receipt, NOT the AttoLang susp/await ABI.
+// Trusted single-controller prototype. Exclusive process ownership of the
+// store is an external prerequisite. No distributed lease election.
+// Guest and authorization callbacks must be thread-safe and terminate.
+// Never invoke directory methods recursively from either callback.
 class CounterDirectory final {
 public:
     using Guest = std::function<std::int64_t(std::int64_t,std::int64_t,std::int64_t)>;
     using Reply = std::optional<SyncCommit>;
     using Authorize = std::function<bool(const SyncKey&)>;
+    using Clock = std::chrono::steady_clock;
 private:
     using Key = std::tuple<std::string,std::string,std::string,std::string>;
+    struct Lane {
+        std::deque<std::packaged_task<void()>> queue;
+        bool running=false;
+        std::int64_t epoch=0; // only its executing turn can install an epoch
+        Clock::time_point idle_since=Clock::now();
+    };
     SqliteActorSync store_;
     const Guest guest_;
     const Authorize authorize_;
-    const std::size_t capacity_, active_limit_;
-    std::map<Key,std::int64_t> active_; // only the worker touches this
+    const std::size_t capacity_,active_limit_;
+    const Clock::duration idle_timeout_;
+    std::map<Key,Lane> lanes_; // protected by mu_; running lanes cannot be erased
+    std::size_t queued_=0,active_=0;
     std::mutex mu_;
     std::condition_variable wake_;
-    std::deque<std::packaged_task<void()>> queue_;
     bool closed_=false;
-    std::thread worker_;
+    std::vector<std::thread> workers_;
     static Key identity(const SyncKey& k) {
         return {k.tenant,k.name_space,k.actor_type,k.object_id};
     }
@@ -43,77 +54,150 @@ private:
         check(k.tenant);check(k.name_space);check(k.actor_type);check(k.object_id);
         if(k.actor_type!="Counter" || !authorize_(k)) throw std::logic_error("unauthorized actor");
     }
+    // mu_ held. Only fully quiescent lanes may be retired.
+    void sweep(Clock::time_point now) {
+        for(auto it=lanes_.begin();it!=lanes_.end();) {
+            auto& l=it->second;
+            if(!l.running && l.queue.empty() &&
+               (!l.epoch || (idle_timeout_!=Clock::duration::zero() &&
+                            now-l.idle_since>=idle_timeout_))) {
+                if(l.epoch) --active_;
+                it=lanes_.erase(it);
+            } else ++it;
+        }
+    }
+    auto runnable() {
+        return std::find_if(lanes_.begin(),lanes_.end(),[](const auto& p){
+            return !p.second.running && !p.second.queue.empty();
+        });
+    }
     void loop() {
         for(;;) {
             std::packaged_task<void()> job;
+            Key id;
             {
                 std::unique_lock<std::mutex> lock(mu_);
-                wake_.wait(lock,[&]{return closed_ || !queue_.empty();});
-                if(queue_.empty() && closed_) return;
-                job=std::move(queue_.front()); queue_.pop_front();
+                for(;;) {
+                    sweep(Clock::now());
+                    auto it=runnable();
+                    if(it!=lanes_.end()) {
+                        id=it->first;
+                        auto& l=it->second;
+                        l.running=true;
+                        job=std::move(l.queue.front());l.queue.pop_front();--queued_;
+                        break;
+                    }
+                    if(closed_ && queued_==0) return;
+                    if(idle_timeout_==Clock::duration::zero()) wake_.wait(lock);
+                    else wake_.wait_for(lock,idle_timeout_);
+                }
             }
             job();
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                auto& l=lanes_.at(id);
+                l.running=false;l.idle_since=Clock::now();
+                sweep(l.idle_since);
+            }
+            wake_.notify_all();
         }
     }
-    template<class F> auto submit(F f) -> std::future<decltype(f())> {
+    template<class F> auto submit(const Key& id,F f) -> std::future<decltype(f())> {
         using R=decltype(f());
         std::packaged_task<R()> inner(std::move(f));
         auto result=inner.get_future();
         {
             std::lock_guard<std::mutex> lock(mu_);
             if(closed_) throw std::logic_error("directory closed");
-            if(queue_.size()>=capacity_) throw std::length_error("directory queue full");
-            queue_.emplace_back([job=std::move(inner)]() mutable {job();});
+            if(queued_>=capacity_) throw std::length_error("directory queue full");
+            sweep(Clock::now());
+            auto [it,inserted]=lanes_.try_emplace(id);
+            try {
+                it->second.queue.emplace_back([job=std::move(inner)]() mutable {job();});
+            } catch(...) {
+                if(inserted) lanes_.erase(it);
+                throw;
+            }
+            ++queued_;
         }
-        wake_.notify_one();
+        wake_.notify_all();
         return result;
+    }
+    std::int64_t activate(const Key& id,const SyncKey& k) {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            auto& l=lanes_.at(id);
+            if(l.epoch) return l.epoch;
+            if(active_>=active_limit_) throw std::length_error("activation quota exhausted");
+            ++active_; // reserve before releasing scheduler lock for I/O
+        }
+        try {
+            const auto epoch=store_.activate_next(k);
+            std::lock_guard<std::mutex> lock(mu_);
+            lanes_.at(id).epoch=epoch;
+            return epoch;
+        } catch(...) {
+            std::lock_guard<std::mutex> lock(mu_);
+            --active_;
+            throw;
+        }
+    }
+    bool retire(const Key& id) {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto& l=lanes_.at(id);
+        if(!l.epoch) return false;
+        l.epoch=0;--active_;
+        return true;
     }
 public:
     CounterDirectory(const std::string& db, Guest guest, Authorize authorize,
-                     std::size_t capacity=128,std::size_t active_limit=128)
-        : store_(db), guest_(std::move(guest)), authorize_(std::move(authorize)),
-          capacity_(capacity),active_limit_(active_limit) {
-        if(!guest_ || !authorize_ || !capacity_ || !active_limit_)
+                     std::size_t capacity=128,std::size_t active_limit=128,
+                     std::size_t workers=1,
+                     Clock::duration idle_timeout=Clock::duration::zero())
+        : store_(db),guest_(std::move(guest)),authorize_(std::move(authorize)),
+          capacity_(capacity),active_limit_(active_limit),idle_timeout_(idle_timeout) {
+        if(!guest_ || !authorize_ || !capacity_ || !active_limit_ ||
+           !workers || workers>64 || idle_timeout_<Clock::duration::zero())
             throw std::invalid_argument("invalid directory configuration");
-        worker_=std::thread([this]{loop();});
+        workers_.reserve(workers);
+        try {
+            for(std::size_t i=0;i<workers;++i) workers_.emplace_back([this]{loop();});
+        } catch(...) {
+            {std::lock_guard<std::mutex> lock(mu_);closed_=true;}
+            wake_.notify_all();
+            for(auto& t:workers_) t.join();
+            throw;
+        }
     }
     CounterDirectory(const CounterDirectory&)=delete;
     CounterDirectory& operator=(const CounterDirectory&)=delete;
     ~CounterDirectory() {
         {std::lock_guard<std::mutex> lock(mu_);closed_=true;}
         wake_.notify_all();
-        worker_.join(); // trusted control-plane shutdown only; drains accepted jobs
+        for(auto& t:workers_) t.join(); // drain accepted work
     }
     std::future<Reply> send(SyncKey k,std::string request,std::int64_t op,std::int64_t delta) {
         validate(k);check(request);
         if((op!=1 && op!=2) || (op==1 && (delta<=0 || delta>CounterTurn::maximum)) ||
            (op==2 && delta!=0)) throw std::invalid_argument("invalid command");
-        return submit([this,k=std::move(k),request=std::move(request),op,delta]{
-            validate(k); // authority checked again when the queued turn starts
-            const auto id=identity(k);
-            auto it=active_.find(id);
-            if(it==active_.end()) {
-                if(active_.size()>=active_limit_) throw std::length_error("activation quota exhausted");
-                it=active_.emplace(id,store_.activate_next(k)).first;
-            }
+        const auto id=identity(k);
+        return submit(id,[this,id,k=std::move(k),request=std::move(request),op,delta]{
+            validate(k);
+            const auto epoch=activate(id,k);
             try {
-                auto r=CounterTurn::run(store_,k,it->second,request,op,delta,guest_);
-                // No response for revoked authorization or stale ownership.
+                auto r=CounterTurn::run(store_,k,epoch,request,op,delta,guest_);
                 validate(k);
-                if(store_.snapshot(k).epoch!=it->second) throw std::logic_error("stale publication epoch");
+                if(store_.snapshot(k).epoch!=epoch) throw std::logic_error("stale publication epoch");
                 return r;
             } catch(...) {
-                // Unknown outcome: discard local activation; next authorized
-                // request recovers from authoritative committed receipts.
-                active_.erase(id); throw;
+                retire(id);throw;
             }
         });
     }
-    // Explicit FIFO passivation barrier; never evict an executing turn.
-    // Automatic idle policy is separate. No state is destroyed on disk.
     std::future<bool> passivate(SyncKey k) {
         validate(k);
-        return submit([this,k=std::move(k)]{validate(k);return active_.erase(identity(k))!=0;});
+        const auto id=identity(k);
+        return submit(id,[this,id,k=std::move(k)]{validate(k);return retire(id);});
     }
 };
 } // namespace ores::durable
