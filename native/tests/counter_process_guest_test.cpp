@@ -99,24 +99,73 @@ int main(int argc,char** argv) {
         catch(const std::invalid_argument&) {denied=true;}
         assert(denied);
         const auto registry_db=std::string(tmp)+"/registry.db";
-        CounterDirectory directory(registry_db,CounterDirectory::KeyedGuest(registry),
-            [&](const SyncKey& k){return registry.contains(k);});
-        assert(directory.send(a,"same",1,2).get()->reply=="2");
-        assert(directory.send(other,"same",1,5).get()->reply=="5");
+        const auto authorize=[&](const SyncKey& k){return registry.contains(k);};
+        {
+            CounterDirectory directory(registry_db,CounterDirectory::KeyedGuest(registry),
+                authorize,128,128,1,0ms,0ms,0ms,registry.manifest());
+            assert(directory.send(a,"same",1,2).get()->reply=="2");
+            assert(directory.send(other,"same",1,5).get()->reply=="5");
+            denied=false;
+            try {(void)directory.send(missing,"same",1,1);}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            denied=false;
+            try {(void)directory.send(invalid,"same",1,1).get();}
+            catch(const CounterDirectory::RetryableGuestFailure&) {assert(false);}
+            catch(const std::runtime_error&) {denied=true;}
+            assert(denied);
+            SqliteActorSync observer(registry_db);
+            assert(observer.snapshot(invalid).revision==0);
+            assert(!observer.lookup_receipt(invalid,observer.snapshot(invalid).epoch,
+                                            "same","1:1",CounterTurn::schema));
+            assert(observer.snapshot(a).bytes=="2" && observer.snapshot(other).bytes=="5");
+            assert(directory.admit(a,"pending",1,3).get().sequence>0);
+        }
+        // Reordering bindings must not change the identity; changing even
+        // one digest or the wall budget must reject startup before replay.
+        auto reversed=bindings;
+        std::reverse(reversed.begin(),reversed.end());
+        const CounterArtifactRegistry same(argv[1],5s,reversed);
+        assert(same.manifest()==registry.manifest());
+        auto changed=bindings;
+        changed[0].sha256=std::string(64,'1');
+        const CounterArtifactRegistry different(argv[1],5s,changed);
+        assert(different.manifest()!=registry.manifest());
+        const CounterArtifactRegistry different_budget(argv[1],6s,bindings);
+        for(const auto* candidate:{&different,&different_budget}) {
+            denied=false;
+            try {
+                CounterDirectory replacement(registry_db,CounterDirectory::KeyedGuest(*candidate),
+                    authorize,128,128,1,0ms,0ms,0ms,candidate->manifest());
+            } catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+        }
         denied=false;
-        try {(void)directory.send(missing,"same",1,1);}
+        try {CounterDirectory legacy(registry_db,runner,auth);}
         catch(const std::logic_error&) {denied=true;}
         assert(denied);
+        {
+            CounterDirectory replacement(registry_db,CounterDirectory::KeyedGuest(same),
+                authorize,128,128,1,0ms,0ms,10ms,same.manifest());
+            auto replay=replacement.send(a,"same",1,2).get();
+            assert(replay && replay->duplicate && replay->reply=="2");
+            SqliteActorSync observer(registry_db);
+            const auto until=CounterDirectory::Clock::now()+5s;
+            while(!observer.pending_mail().empty() && CounterDirectory::Clock::now()<until)
+                std::this_thread::sleep_for(5ms);
+            assert(observer.pending_mail().empty() && !replacement.mail_fault());
+            assert(observer.snapshot(a).bytes=="5");
+        }
+        // A populated legacy store must not be implicitly adopted.
+        const auto legacy_db=std::string(tmp)+"/legacy-deployment.db";
+        {CounterDirectory legacy(legacy_db,runner,auth);
+         assert(legacy.send(a,"old",1,1).get()->reply=="1");}
         denied=false;
-        try {(void)directory.send(invalid,"same",1,1).get();}
-        catch(const CounterDirectory::RetryableGuestFailure&) {assert(false);}
-        catch(const std::runtime_error&) {denied=true;}
+        try {
+            CounterDirectory adopt(legacy_db,CounterDirectory::KeyedGuest(registry),
+                authorize,128,128,1,0ms,0ms,0ms,registry.manifest());
+        } catch(const std::logic_error&) {denied=true;}
         assert(denied);
-        SqliteActorSync observer(registry_db);
-        assert(observer.snapshot(invalid).revision==0);
-        assert(!observer.lookup_receipt(invalid,observer.snapshot(invalid).epoch,
-                                        "same","1:1",CounterTurn::schema));
-        assert(observer.snapshot(a).bytes=="2" && observer.snapshot(other).bytes=="5");
     }
     // Host-only orphan test: kill the controller while its trusted worker
     // retains the inherited lock. An independent controller must fail closed
