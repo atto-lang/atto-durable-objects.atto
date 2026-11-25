@@ -467,6 +467,28 @@ int main() {
         assert(denied);
         SqliteActorSync store(quota_db,limits);
         assert(store.fair_pending_mail(2,100).size()==2);
+        // Dead-lettering does not release retained tenant capacity.
+        auto heads=store.fair_pending_mail(2,100);
+        assert(heads[0].operation_id=="one" && heads[0].failures==1);
+        assert(!store.fail_mail(heads[0],1,100));
+        heads=store.fair_pending_mail(2,300);
+        assert(heads[0].operation_id=="one" && heads[0].failures==2);
+        assert(store.fail_mail(heads[0],1,300));
+        assert(store.admit_mail(one,1,"one","1:1","counter").dead_letter);
+        bool full=false;
+        try {store.admit_mail(three,1,"three","1:3","counter");}
+        catch(const std::length_error&) {full=true;}
+        assert(full);
+        heads=store.fair_pending_mail(2,300);
+        assert(heads[0].operation_id=="two");
+        store.commit(two,1,0,"two","1:2","counter","2","2",false,nullptr,0,&heads[0]);
+        // Now the entry budget has space; the byte cap independently denies
+        // a four-byte command (3 retained + 4 > 6).
+        full=false;
+        try {store.admit_mail(three,1,"three","1:33","counter");}
+        catch(const std::length_error&) {full=true;}
+        assert(full);
+        assert(store.admit_mail(three,1,"three","1:3","counter").sequence>0);
     }
     // More hot objects than the scan limit cannot hide a sparse tenant.
     {
