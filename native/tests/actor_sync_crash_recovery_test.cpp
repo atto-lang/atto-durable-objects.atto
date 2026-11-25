@@ -735,5 +735,81 @@ int main() {
         assert(page.size()==1 && page[0].archived && page[0].redrive_sequence==redrive.new_sequence);
         assert(store.pending_mail().size()==1);
     }
+    // Atomic state/receipt/outbox/alarm effect: fail before commit, kill
+    // after commit before acknowledgement, replay without resetting deadline.
+    {
+        const auto alarm_db=std::string(dir)+"/atomic-alarm.db";
+        const SyncKey k{"tenant","mail","Counter","atomic-alarm"};
+        const SyncAlarmChange schedule{0,100};
+        {
+            SqliteActorSync store(alarm_db);
+            auto epoch=store.activate_next(k);
+            bool failed=false;
+            try {store.commit(k,epoch,0,"schedule","1:2","counter","2","2",true,nullptr,0,nullptr,&schedule);}
+            catch(const std::runtime_error&) {failed=true;}
+            assert(failed && store.snapshot(k).revision==0 && store.alarm_generation(k,epoch)==0);
+            assert(store.due_alarms(100).empty() && store.changes_after(k,0).empty());
+            assert(!store.lookup_receipt(k,epoch,"schedule","1:2","counter",&schedule));
+        }
+        const pid_t child=fork();assert(child>=0);
+        if(child==0) {
+            try {
+                SqliteActorSync store(alarm_db);auto epoch=store.activate_next(k);
+                store.commit(k,epoch,0,"schedule","1:2","counter","2","2",false,nullptr,0,nullptr,&schedule);
+                _exit(61);
+            } catch(...) {_exit(62);}
+        }
+        check_exit(child,61);
+        SqliteActorSync store(alarm_db);auto epoch=store.activate_next(k);
+        assert(store.snapshot(k).bytes=="2" && store.snapshot(k).revision==1);
+        assert(store.due_alarms(99).empty() && store.due_alarms(100).size()==1);
+        assert(store.lookup_receipt(k,epoch,"schedule","1:2","counter",&schedule)->duplicate);
+        bool failed=false;
+        try {store.lookup_receipt(k,epoch,"schedule","1:2","counter");}
+        catch(const std::logic_error&) {failed=true;}
+        assert(failed);
+        failed=false;
+        try {store.admit_mail(k,epoch,"schedule","1:2","counter");}
+        catch(const std::logic_error&) {failed=true;}
+        assert(failed);
+        const SyncAlarmChange wrong{0,101};
+        failed=false;
+        try {store.commit(k,epoch,0,"schedule","1:2","counter","2","2",false,nullptr,0,nullptr,&wrong);}
+        catch(const std::logic_error&) {failed=true;}
+        assert(failed);
+        const auto alarm=store.due_alarms(100)[0];
+        const SyncAlarmChange again{1,200};
+        const auto op=SqliteActorSync::alarm_operation_id(alarm.generation);
+        assert(store.commit(k,epoch,1,op,"alarm:100","counter","3","3",false,&alarm,100,nullptr,&again).revision==2);
+        assert(store.due_alarms(199).empty());
+        assert(store.due_alarms(200)[0].generation==2);
+        assert(store.commit(k,epoch,0,"schedule","1:2","counter","2","2",false,nullptr,0,nullptr,&schedule).duplicate);
+        assert(store.alarm_generation(k,epoch)==2);
+        const SyncAlarmChange stale{1,std::nullopt};
+        failed=false;
+        try {store.commit(k,epoch,2,"stale","1:1","counter","4","4",false,nullptr,0,nullptr,&stale);}
+        catch(const std::logic_error&) {failed=true;}
+        assert(failed && store.snapshot(k).revision==2 && store.alarm_generation(k,epoch)==2);
+        const SyncAlarmChange cancel{2,std::nullopt};
+        assert(store.commit(k,epoch,2,"cancel","1:1","counter","4","4",false,nullptr,0,nullptr,&cancel).revision==3);
+        assert(store.due_alarms(200).empty() && store.alarm_generation(k,epoch)==3);
+        assert(store.changes_after(k,0).size()==3);
+        store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+        failed=false;
+        try {store.set_alarm(k,epoch,3,300);}
+        catch(const PrincipalPolicyChanged&) {failed=true;}
+        assert(failed);
+    }
+    {
+        const auto db2=std::string(dir)+"/strict-pending-alarm.db";
+        const SyncKey k{"tenant","mail","Counter","pending"};
+        SqliteActorSync store(db2);
+        auto epoch=store.activate_next(k);store.set_alarm(k,epoch,0,0);
+        store.bind_principal_namespace(true);
+        bool denied=false;
+        try {store.bind_transactional_policy(true);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied && store.due_alarms(0).size()==1);
+    }
     std::filesystem::remove_all(dir);
 }
