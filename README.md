@@ -135,7 +135,7 @@ publication. Only requests admitted through this API have restart-safe
 admission; transient sends, alarms and controls can interleave between
 durable mailbox entries. FIFO is guaranteed within the durable mailbox,
 not across these separate admission domains. Host callbacks are not
-compiled guest execution. Administrative dead-letter retention/requeue, crash-counted attempts, tenant fairness, authentication of persisted principals and unified durable ingress remain open. The
+compiled guest execution. Administrative dead-letter retention/requeue, tenant fairness, authentication of persisted principals and unified durable ingress remain open. The
 regression tests cover process exit after admission, reopen, exact replay,
 stale epochs, head checks, rollback, quota rejection and drain after
 restart; new execution evidence is pending.
@@ -168,11 +168,11 @@ pending entry. Other commits cannot consume those reservations. Reopen
 checks existing reservations against configured limits. Dead-lettering
 releases completion slots but not the retained inbox budget.
 
-Only explicit classified guest failures use this policy. Database,
-ownership, authorization and unexpected faults remain fail-closed;
-a process crash before a failure record is committed does not consume
-retry budget. There is no actual guest watchdog, process kill/reap or
-fuel-metering integration yet. The supervisor still dispatches one
+Classified stopped-guest failures and abandoned dispatch markers use this
+policy. Database, ownership, authorization and unexpected faults stop the
+poller; a surviving marker is resolved only under a fresh fenced activation.
+The compiled scalar watchdog and fuel worker have separate executed evidence.
+ The supervisor still dispatches one
 mailbox recovery turn at a time and a nonterminating callback can block
 it. These are not production guarantees of poison isolation or eventual
 delivery. Tests cover retry deadlines, restart, stale attempt fencing,
@@ -217,7 +217,7 @@ rollback, reopen, auto-activation, consumed receipt replay and terminal
 overflow. See the directory and actor-sync recovery tests; new tests remain
 unexecuted pending exact-head CI. No exactly-once external effect claim.
 
-### Deterministic fuel and Linux process limits (Wave 11 candidate)
+### Deterministic fuel and Linux process limits (Wave 11 — executed)
 
 The optional [Rust fuel worker](guest/fuel-worker/src/main.rs) uses pinned
 Wasmi 0.31.2 and a fresh 50,000-unit budget per scalar evaluation. Fuel
@@ -234,9 +234,31 @@ The same compiled looping fixture tests both execution engines. The fuel
 case must report fuel exhaustion, retry three times, dead-letter and permit
 healthy mail. Direct versions are pinned; CI resolves a lockfile, records
 its digest and graph, then builds --locked. A reviewed committed transitive
-lock remains required. Local Rust tooling and GitHub DNS are unavailable;
-new tests are not yet execution-verified. Crash-counted durable attempts
-remain outstanding: parent-death signaling is not a persistent attempt record.
+lock remains required. [Wave 11 guest run 45536758165](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45536758165)
+executed exact head `bd3b79570ced4ad3b5ba9e76c1c9b69049a69bee` and emitted
+`COMPILED_COUNTER_FUEL_WORKER_PASS` and `COMPILED_COUNTER_PROCESS_WATCHDOG_PASS`.
+The compiled looping artifact SHA-256 was
+`66c10e6311e347e92d726945a62937af1798d8d8f9abe33f4e62e0293d00b2a7`.
+
+### Crash-counted mailbox dispatch (Wave 12 candidate)
+
+Storage PR #9 adds a durable dispatch marker bound to the exact FIFO head
+and active epoch. The directory commits it before calling the scalar guest.
+A successful state/receipt/outbox transaction deletes the inbox and cascades
+the marker; a classified stopped-guest failure atomically clears the marker
+and advances retry metadata. A surviving marker under an older epoch is
+charged once before launching another attempt. Duplicate/stale tokens and
+unmarked completion of a marked head are rejected. The third charge dead
+letters the original request without inventing a success receipt.
+
+The conservative policy counts a crash after recording the marker even if
+guest launch had not occurred. Only the cooperating single-host controller
+and pure, authority-free scalar guest are supported. Controller lock release
+and epoch rotation are not proof of physical retirement of an arbitrary
+orphan guest, nor safe recovery of external side effects. General actor
+recovery requires a supervisor that establishes physical quiescence.
+The storage fork/reopen and directory controller-exit regressions are new;
+Wave 12 exact-head execution is pending.
 
 ### Bounded compiled guest process runner (Wave 10 — executed)
 
@@ -268,7 +290,7 @@ This is a candidate process-per-turn reference, not a high-performance
 persistent worker pool. It assumes trusted immutable script/artifact paths,
 a sole waitpid owner, and a cooperating local controller. It is not a full
 hostile-tenant sandbox: OS/cgroup memory and CPU limits, deterministic Wasm
-fuel, crash-counted attempts, worker isolation and authenticated artifact
+worker isolation and authenticated artifact
 provenance remain outstanding. A wall deadline includes startup and scheduling;
 an uninterruptible OS process cannot be treated as stopped until actually reaped.
 
@@ -295,7 +317,7 @@ an uninterruptible OS process cannot be treated as stopped until actually reaped
   policy gates require independent remediation. No cross-backend parity claim.
 
 These receipts supersede the older pending statuses for Wave 9 and earlier
-features covered by those tests. Wave 10 watchdog evidence is recorded above; Wave 11 remains unverified.
+features covered by those tests. Wave 10 and Wave 11 watchdog/fuel evidence is recorded above; Wave 12 remains unverified.
 
 ### Compile-once candidate ABI
 
