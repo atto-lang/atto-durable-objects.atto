@@ -98,3 +98,10 @@ jobs:
             -lsqlite3 -o "$RUNNER_TEMP/counter-directory-test"
           timeout 60 "$RUNNER_TEMP/counter-directory-test"
           echo 'HOST_ONLY_COUNTER_DIRECTORY_PASS'
+          g++ -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
+            -fno-omit-frame-pointer -fsanitize=address,undefined \
+            -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/counter_directory_test.cpp \
+            -lsqlite3 -o "$RUNNER_TEMP/counter-directory-sanitized"
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+            timeout 90 "$RUNNER_TEMP/counter-directory-sanitized"
+          echo 'HOST_ONLY_COUNTER_DIRECTORY_ASAN_UBSAN_PASS'
