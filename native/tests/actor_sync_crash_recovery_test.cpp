@@ -664,5 +664,76 @@ int main() {
             assert(denied && store.snapshot(key).revision==1);
         }
     }
+    // Archiving releases inbox capacity but preserves exact terminal
+    // identity, command, principal and any pre-existing redrive audit.
+    {
+        const auto archive_db=std::string(dir)+"/archive.db";
+        const SyncKey k{"tenant","mail","Counter","archive"};
+        SyncLimits limits;limits.inbox_entries_per_actor=1;limits.archive_entries_per_tenant=1;
+        std::int64_t source=0;
+        {
+            SqliteActorSync store(archive_db,limits);
+            store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+            auto epoch=store.activate_next(k);
+            store.set_principal_policy(k,"alice",1,0,true);
+            source=store.admit_mail(k,epoch,"@principal:old","1:2","counter","alice").sequence;
+            store.deny_mail(store.pending_mail()[0],epoch);
+            bool failed=false;
+            try {store.archive_dead_letter(k,epoch,source,"admin",true);}
+            catch(const std::runtime_error&) {failed=true;}
+            assert(failed && !store.dead_letters(k)[0].archived);
+            failed=false;
+            try {store.admit_mail(k,epoch,"@principal:new","1:3","counter","alice");}
+            catch(const std::length_error&) {failed=true;}
+            assert(failed);
+            assert(!store.archive_dead_letter(k,epoch,source,"admin").duplicate);
+            assert(store.archive_dead_letter(k,epoch,source,"admin").duplicate);
+            assert(store.dead_letters(k)[0].archived);
+            auto replay=store.admit_mail(k,epoch,"@principal:old","1:2","counter","alice");
+            assert(replay.sequence==source && replay.dead_letter && replay.authorization_denied);
+            failed=false;
+            try {store.admit_mail(k,epoch,"@principal:old","1:3","counter","alice");}
+            catch(const std::logic_error&) {failed=true;}
+            assert(failed);
+            const auto fresh=store.admit_mail(k,epoch,"@principal:new","1:3","counter","alice");
+            assert(fresh.sequence>source);
+            store.deny_mail(store.pending_mail()[0],epoch);
+            failed=false;
+            try {store.archive_dead_letter(k,epoch,fresh.sequence,"admin");}
+            catch(const std::length_error&) {failed=true;}
+            assert(failed);
+            auto page=store.dead_letters(k,source,1);
+            assert(page.size()==1 && page[0].sequence==fresh.sequence && !page[0].archived);
+        }
+        SqliteActorSync store(archive_db,limits);
+        auto epoch=store.activate_next(k);
+        assert(store.archive_dead_letter(k,epoch,source,"admin").duplicate);
+        assert(store.admit_mail(k,epoch,"@principal:old","1:2","counter","alice").dead_letter);
+        bool failed=false;
+        try {store.commit(k,epoch,0,"@principal:old","1:2","counter","2","2");}
+        catch(const std::logic_error&) {failed=true;}
+        assert(failed && store.snapshot(k).revision==0);
+    }
+    // Previously recorded redrive stays idempotent after archival.
+    {
+        const auto audit_db=std::string(dir)+"/archive-audit.db";
+        const SyncKey k{"tenant","mail","Counter","audit"};
+        SqliteActorSync store(audit_db);
+        store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+        auto epoch=store.activate_next(k);
+        store.set_principal_policy(k,"alice",1,0,true);
+        auto source=store.admit_mail(k,epoch,"@principal:old","1:1","counter","alice").sequence;
+        for(const auto now:{0,100,300}) {
+            auto mail=store.begin_mail(store.pending_mail(1,now)[0],epoch,now);
+            store.fail_mail(mail,epoch,now);
+        }
+        const auto redrive=store.redrive_dead_letter(k,epoch,source,"operator");
+        store.archive_dead_letter(k,epoch,source,"archiver");
+        const auto prior=store.redrive_dead_letter(k,epoch,source,"operator");
+        assert(prior.duplicate && prior.new_sequence==redrive.new_sequence);
+        const auto page=store.dead_letters(k);
+        assert(page.size()==1 && page[0].archived && page[0].redrive_sequence==redrive.new_sequence);
+        assert(store.pending_mail().size()==1);
+    }
     std::filesystem::remove_all(dir);
 }
