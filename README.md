@@ -324,6 +324,52 @@ restart deduplication and pending-mail recovery under identical deployment,
 and rejects changed configuration and legacy fallback. These are authored
 tests, not a Wave 14 execution receipt.
 
+### Durable principal-bound ingress (Wave 18 candidate)
+
+The signed-deployment gateway now provides `admit(capability, request, delta)`
+and an opt-in durable recovery poll interval. The live capability must
+belong to the current gateway, authorize the exact principal/object/op,
+and be unexpired during submission and admission handoff. SQLite commits
+the trusted stable principal binding with the immutable inbox row in the
+same transaction. The request identity remains the principal-scoped
+digest used by transient ingress; exact replay requires a fresh authorized
+grant. Stable principal names must not be reassigned by the upstream
+identity provider.
+
+Capability expiration limits new admissions, not the lifetime of a
+previously accepted message. Recovery re-evaluates current trusted
+scope and principal policy before dispatch, before guest entry, and
+after guest return but before state commit. An explicit policy denial
+terminally dead-letters the exact fenced head with
+`authorization_denied=true`, without a successful receipt, state change
+or outbox publication. The dead sentinel shares the existing retry table
+(its internal count of three is not evidence of three guest executions);
+the principal record distinguishes policy denial. The retained entry
+keeps its tenant quota and prevents automatic resurrection on regrant.
+The next authorized FIFO head remains eligible. A policy exception or
+missing binding fails closed rather than being classified as denial.
+
+Principal-mode startup rejects unbound legacy inbox rows; it never
+retroactively assigns them a principal. Raw admission is disabled in
+gateway mode. Principal recovery uses the same ownership/attempt fencing,
+bounded guest runner and tenant-aware discovery. The trusted policy
+provider must be thread-safe, current and available across restarts.
+The gateway still does not authenticate network credentials, persist the
+policy itself, provide linearizable revocation with the SQLite commit,
+or grant alarms/control capabilities. Policy change racing the commit
+can suppress handoff but cannot undo a committed transition. The scalar
+guest has no external effects; general effectful actors need stronger
+transactional authorization semantics.
+
+Storage tests cover immutable principal bindings, exact-attempt forgery
+rejection, raw admission denial and terminal denial after reopen.
+The compiled guest integration admits Alice and Bob with the same client
+request ID, restarts under a revoked Alice policy, requires Bob to commit,
+and verifies that regranting Alice returns the terminal denial rather
+than replaying her mutation. These tests are authored, not executed
+on the new head. CI pins storage head
+`71d0ec81d534888b9b6b1ddcc0f6c37c7f0919aa`.
+
 ### Tenant-aware durable admission and dispatch (Wave 17 candidate)
 
 Storage PR #9 bounds retained inbox records across all objects and
@@ -352,13 +398,7 @@ independent byte limit rejection and fail-closed quota reduction.
 The new tests are authored and the workflow pins storage head
 `9ab67c38f5b9c889daf69ac8c73061018310e36d`; exact-head execution is pending.
 
-Durable principal-bound admission remains intentionally separate:
-a short-lived process-local capability cannot serve as a restart-safe
-authorization record. Future ingress must persist a trusted principal
-binding atomically with admission and re-evaluate current policy before
-guest entry and publication; define revocation and terminal denied-mail
-semantics before enabling the persistent gateway. Do not reinterpret
-existing transient receipt IDs as durable authorization.
+Wave 18 introduces candidate durable principal binding and terminal denial; see the dedicated section above. No existing transient receipt is reinterpreted as durable authorization.
 
 ### Concurrent durable mailbox recovery (Wave 16 candidate)
 
@@ -415,10 +455,7 @@ trusted host APIs, not network boundaries. A policy change racing the final
 SQLite transaction cannot undo a commit; post-commit revocation can
 suppress reply handoff, and external transport must recheck publication
 authority. This does not provide linearizable revocation or network token
-authentication. Principal gateway intentionally exposes transient send
-only: durable principal-bound admission, persisted policy/revocation,
-authenticated transport, alarm/control grants and key rotation are future
-work. Tests cover per-principal receipt isolation, scope denial, operation
+authentication. Wave 15 exposed transient send only. Wave 18 adds candidate durable principal admission; persisted policy/revocation, authenticated transport, alarm/control grants and key rotation remain future work. Tests cover per-principal receipt isolation, scope denial, operation
 bounds, expiry, policy change, restart grants, replay and reserved
 namespace collision. No Wave 15 execution claim.
 
