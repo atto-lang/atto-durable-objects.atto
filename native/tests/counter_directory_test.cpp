@@ -107,9 +107,11 @@ int main() {
         assert(before && before->reply=="107");
         SqliteActorSync observer(db);
         const auto epoch=observer.snapshot(a).epoch;
-        // Idle policy uses a monotonic clock, not wall time. Poll a benign
-        // passivate on another identity to avoid racing the active object.
-        std::this_thread::sleep_for(120ms);
+        // Wait for observed quiescent idle eviction, not a guessed sleep.
+        const auto deadline=CounterDirectory::Clock::now()+3s;
+        while(directory.is_active(a) && CounterDirectory::Clock::now()<deadline)
+            std::this_thread::sleep_for(5ms);
+        assert(!directory.is_active(a));
         auto after=directory.send(a,"idle-after",1,1).get();
         assert(after && after->reply=="108");
         assert(observer.snapshot(a).epoch>epoch);
