@@ -631,6 +631,34 @@ public:
         }
         return due;
     }
+    // Rank eligible generations across tenants before LIMIT, then rotate
+    // lexically from the last attempted tenant. Deadline order within a tenant.
+    std::vector<SyncAlarm> fair_due_alarms(std::size_t limit,std::int64_t now_ms,
+                                          std::string_view after_tenant={}) {
+        if(now_ms<0 || limit==0 || limit>256) throw std::invalid_argument("invalid fair alarm scan");
+        label_or_empty(after_tenant);
+        std::lock_guard<std::mutex> lock(mu_);
+        Statement read(db_,"WITH eligible AS (SELECT a.tenant,a.space,a.actor_type,a.id,a.generation,a.due_ms,"
+            "COALESCE(p.principal,'') AS principal,COALESCE(p.grant_version,0) AS grant_version,"
+            "COALESCE(r.failures,0) AS failures,COALESCE(r.retry_at_ms,0) AS retry_at,COALESCE(r.attempt_epoch,0) AS attempt_epoch,"
+            "ROW_NUMBER() OVER (PARTITION BY a.tenant ORDER BY a.due_ms,a.space,a.actor_type,a.id) AS tenant_rank "
+            "FROM sync_alarms a LEFT JOIN sync_alarm_authority p ON a.tenant=p.tenant AND a.space=p.space AND a.actor_type=p.actor_type AND a.id=p.id AND a.generation=p.generation "
+            "LEFT JOIN sync_alarm_retry r ON a.tenant=r.tenant AND a.space=r.space AND a.actor_type=r.actor_type AND a.id=r.id AND a.generation=r.generation "
+            "WHERE a.due_ms IS NOT NULL AND a.due_ms<=? AND COALESCE(r.retry_at_ms,0)<=? AND COALESCE(r.failures,0)<3) "
+            "SELECT tenant,space,actor_type,id,generation,due_ms,principal,grant_version,failures,retry_at,attempt_epoch FROM eligible "
+            "ORDER BY tenant_rank,CASE WHEN tenant>? THEN 0 ELSE 1 END,tenant LIMIT ?");
+        read.i64(1,now_ms);read.i64(2,now_ms);
+        read.text(3,after_tenant.empty()?std::string_view(""):after_tenant);
+        read.i64(4,static_cast<std::int64_t>(limit));
+        std::vector<SyncAlarm> result;
+        while(read.step()==SQLITE_ROW) {
+            SyncAlarm alarm{{read.str(0),read.str(1),read.str(2),read.str(3)},read.number(4),read.number(5),
+                read.str(6),read.number(7),read.number(8),read.number(9),read.number(10)};
+            validate_key(alarm.key);result.push_back(std::move(alarm));
+        }
+        return result;
+    }
+
     bool alarm_pending(const SyncAlarm& alarm, std::int64_t epoch, std::int64_t now_ms) {
         validate_key(alarm.key);
         if(epoch<=0 || alarm.generation<=0 || alarm.due_ms<0 || now_ms<alarm.due_ms)
