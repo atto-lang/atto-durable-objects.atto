@@ -116,5 +116,54 @@ int main() {
         assert(after && after->reply=="108");
         assert(observer.snapshot(a).epoch>epoch);
     }
+    // Durable alarm recovery: schedule with poller disabled, close the
+    // controller, then reopen and automatically activate the due object.
+    {
+        using namespace std::chrono_literals;
+        const auto alarm_db=std::string(dir)+"/alarms.db";
+        {
+            CounterDirectory directory(alarm_db,guest,auth);
+            assert(directory.set_alarm(a,0,0).get()==1);
+            assert(directory.set_alarm(c,0,0).get()==1);
+            assert(directory.set_alarm(c,1,std::nullopt).get()==2);
+            assert(directory.passivate(a).get());
+            assert(!directory.is_active(a));
+            rejects<std::invalid_argument>([&]{(void)directory.send(a,"@alarm:1",1,1);});
+        }
+        {
+            CounterDirectory directory(alarm_db,guest,auth,16,4,2,10ms,10ms);
+            SqliteActorSync observer(alarm_db);
+            const auto deadline=CounterDirectory::Clock::now()+5s;
+            while(observer.snapshot(a).revision==0 && CounterDirectory::Clock::now()<deadline)
+                std::this_thread::sleep_for(5ms);
+            assert(observer.snapshot(a).bytes=="1");
+            assert(observer.snapshot(a).epoch>=2);
+            assert(observer.due_alarms(0).empty());
+            assert(observer.snapshot(c).revision==0);
+            assert(!directory.alarm_fault());
+            // A full counter produces a terminal rejected alarm receipt,
+            // not a repeated mutation or an infinite poison-message loop.
+            assert(directory.send(a,"fill",1,999999999).get()->reply=="1000000000");
+            assert(directory.alarm_generation(a).get()==1);
+            assert(directory.set_alarm(a,1,0).get()==2);
+            const auto until=CounterDirectory::Clock::now()+5s;
+            while(!observer.due_alarms(0).empty() && CounterDirectory::Clock::now()<until)
+                std::this_thread::sleep_for(5ms);
+            assert(observer.due_alarms(0).empty());
+            const auto snap=observer.snapshot(a);
+            assert(snap.revision==3 && snap.bytes=="1000000000");
+            const auto receipt=observer.lookup_receipt(a,snap.epoch,"@alarm:2","alarm:0",CounterTurn::schema);
+            assert(receipt && receipt->reply=="alarm_overflow");
+            assert(!directory.alarm_fault());
+        }
+        {
+            // Another restart cannot execute an already consumed alarm.
+            CounterDirectory directory(alarm_db,guest,auth,16,4,2,10ms,10ms);
+            SqliteActorSync observer(alarm_db);
+            assert(observer.due_alarms(0).empty());
+            assert(directory.send(a,"verify-read",2,0).get()->reply=="1000000000");
+            assert(observer.snapshot(a).revision==4);
+        }
+    }
     std::filesystem::remove_all(dir);
 }
