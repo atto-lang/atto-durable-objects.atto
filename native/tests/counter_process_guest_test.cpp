@@ -1,5 +1,5 @@
 // Real compiled guest integration, including an intentionally looping turn.
-#include "ores/durable/counter_signed_deployment.hpp"
+#include "ores/durable/counter_principal_gateway.hpp"
 #include <cassert>
 #include <atomic>
 #include <filesystem>
@@ -210,6 +210,67 @@ int main(int argc,char** argv) {
             auto replay=directory->send(a,"signed",1,3).get();
             assert(replay && replay->duplicate && replay->reply=="3");
         }
+        // Opaque, operation-bound in-process grants; no network credential
+        // handling in this fixture. Scope and principal policy are distinct.
+        const auto gateway_db=std::string(tmp)+"/gateway.db";
+        std::atomic<bool> alice_allowed{true};
+        const auto policy=[&](std::string_view principal,const SyncKey& k,std::int64_t op){
+            return k.tenant=="tenant" && k.object_id=="poison" &&
+                ((principal=="alice" && alice_allowed) || principal=="bob") &&
+                (op==1 || op==2);
+        };
+        std::optional<CounterPrincipalGateway::Capability> old;
+        {
+            CounterPrincipalGateway gateway(signed_deployment,gateway_db,authorize,policy);
+            const auto alice=gateway.issue("alice",a,1,30s);
+            const auto bob=gateway.issue("bob",a,1,30s);
+            old=alice;
+            assert(gateway.send(alice,"same-id",2).get()->reply=="2");
+            assert(gateway.send(bob,"same-id",3).get()->reply=="5");
+            auto again=gateway.send(alice,"same-id",2).get();
+            assert(again && again->duplicate && again->reply=="2");
+            denied=false;
+            try {(void)gateway.send(alice,"same-id",3).get();}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            denied=false;
+            try {(void)gateway.issue("alice",other,1,30s);}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            const auto read=gateway.issue("bob",a,2,30s);
+            denied=false;
+            try {(void)gateway.send(read,"write",1);}
+            catch(const std::invalid_argument&) {denied=true;}
+            assert(denied);
+            const auto expires=gateway.issue("alice",a,1,1ms);
+            std::this_thread::sleep_for(5ms);
+            denied=false;
+            try {(void)gateway.send(expires,"expired",1);}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            alice_allowed=false;
+            denied=false;
+            try {(void)gateway.send(alice,"same-id",2);}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            alice_allowed=true;
+        }
+        {
+            CounterPrincipalGateway gateway(signed_deployment,gateway_db,authorize,policy);
+            denied=false;
+            try {(void)gateway.send(*old,"same-id",2);}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            auto fresh=gateway.issue("alice",a,1,30s);
+            auto replay=gateway.send(fresh,"same-id",2).get();
+            assert(replay && replay->duplicate && replay->reply=="2");
+            SqliteActorSync observer(gateway_db);
+            assert(observer.snapshot(a).bytes=="5" && observer.snapshot(a).revision==2);
+        }
+        denied=false;
+        try {auto raw=signed_deployment.open(gateway_db,authorize);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
         // A populated legacy store must not be implicitly adopted.
         const auto legacy_db=std::string(tmp)+"/legacy-deployment.db";
         {CounterDirectory legacy(legacy_db,runner,auth);
