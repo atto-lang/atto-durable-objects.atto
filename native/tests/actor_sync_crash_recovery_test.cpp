@@ -504,5 +504,49 @@ int main() {
         assert(heads.size()==2 && heads[0].key.tenant=="hot" && heads[1].key.tenant=="quiet");
         assert(store.fair_pending_mail(1,0,"hot")[0].key.tenant=="quiet");
     }
+    // Principal admission is atomic, immutable across reopen, and denial
+    // is terminal without advancing state or manufacturing a success receipt.
+    {
+        const auto auth_db=std::string(dir)+"/principal-durable.db";
+        const SyncKey k{"tenant","mail","Counter","principal"};
+        {
+            SqliteActorSync store(auth_db);
+            store.bind_principal_namespace(true);
+            store.activate_next(k);
+            bool denied=false;
+            try {store.admit_mail(k,1,"raw","1:1","counter");}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            auto a=store.admit_mail(k,1,"@principal:a","1:1","counter","alice");
+            assert(a.sequence>0 && !a.dead_letter);
+            denied=false;
+            try {store.admit_mail(k,1,"@principal:a","1:1","counter","bob");}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            store.admit_mail(k,1,"@principal:b","1:2","counter","bob");
+        }
+        {
+            SqliteActorSync store(auth_db);
+            store.bind_principal_namespace(true);
+            auto epoch=store.activate_next(k);
+            auto heads=store.fair_pending_mail(2,0);
+            assert(heads.size()==1 && heads[0].principal=="alice");
+            auto started=store.begin_mail(heads[0],epoch,0);
+            auto forged=started;forged.principal="bob";
+            bool denied=false;
+            try {store.deny_mail(forged,epoch);}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            store.deny_mail(started,epoch);
+            auto terminal=store.admit_mail(k,epoch,"@principal:a","1:1","counter","alice");
+            assert(terminal.dead_letter && terminal.authorization_denied && !terminal.receipt);
+            assert(store.snapshot(k).revision==0 && store.changes_after(k,0).empty());
+            heads=store.pending_mail();
+            assert(heads.size()==1 && heads[0].principal=="bob");
+            auto next=store.begin_mail(heads[0],epoch,0);
+            assert(store.commit(k,epoch,0,"@principal:b","1:2","counter","2","2",false,nullptr,0,&next).revision==1);
+            assert(store.pending_mail().empty());
+        }
+    }
     std::filesystem::remove_all(dir);
 }
