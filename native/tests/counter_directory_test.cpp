@@ -668,5 +668,40 @@ int main() {
             assert(hot_calls==3 && hot_running==0 && !directory.mail_fault() && !directory.alarm_fault());
         }
     }
+    // Rolling guest budget throttles before durable attempt marking.
+    // A replay is free, durable admissions remain accepted, and a quiet
+    // tenant has its own allowance. Reopen cannot reset the spent budget.
+    {
+        using namespace std::chrono_literals;
+        const auto db2=std::string(dir)+"/rolling-tenant.db";
+        const SyncKey hot{"hot","counters","Counter","direct"},mail{"hot","counters","Counter","mail"},
+                      alarm{"hot","counters","Counter","alarm"},quiet{"quiet","counters","Counter","one"};
+        const auto scope=[](const SyncKey&){return true;};
+        const CounterTenantLimits limits{8,2,{60000,1}};
+        std::atomic<int> calls{0};
+        auto guest=[&](I n,I,I d)->I{++calls;return n+d;};
+        {
+            CounterDirectory directory(db2,guest,scope,16,8,2,10ms,0ms,0ms,limits);
+            assert(directory.send(hot,"first",1,2).get()->reply=="2");
+            assert(directory.send(hot,"first",1,2).get()->duplicate && calls==1);
+            rejects<std::length_error>([&]{(void)directory.send(hot,"blocked",1,1).get();});
+            assert(directory.admit(mail,"mail",1,2).get().sequence>0);
+            directory.set_alarm(alarm,0,0).get();
+        }
+        rejects<std::logic_error>([&]{CounterDirectory downgrade(db2,guest,scope);});
+        {
+            CounterDirectory directory(db2,guest,scope,16,8,2,10ms,10ms,10ms,limits);
+            assert(directory.send(quiet,"quiet",1,1).get()->reply=="1");
+            assert(directory.send(hot,"first",1,2).get()->duplicate);
+            std::this_thread::sleep_for(200ms);
+            SqliteActorSync observer(db2);
+            auto pending=observer.pending_mail();
+            auto due=observer.due_alarms(0);
+            assert(pending.size()==1 && pending[0].attempt_epoch==0 && pending[0].failures==0);
+            assert(due.size()==1 && due[0].attempt_epoch==0 && due[0].failures==0);
+            assert(observer.snapshot(hot).bytes=="2" && calls==2);
+            assert(!directory.mail_fault() && !directory.alarm_fault());
+        }
+    }
     std::filesystem::remove_all(dir);
 }
