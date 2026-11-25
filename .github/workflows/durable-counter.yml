@@ -11,6 +11,9 @@ on:
       - 'tests/durable_counter_guest.mjs'
       - 'tests/durable_counter_process_e2e.mjs'
       - 'native/tests/counter_guest_driver.cpp'
+      - 'native/include/ores/durable/counter_process_guest.hpp'
+      - 'native/tests/counter_process_guest_test.cpp'
+      - 'tests/durable_counter_watchdog_e2e.mjs'
       - '.github/workflows/durable-counter.yml'
 permissions:
   contents: read
@@ -64,6 +67,16 @@ jobs:
             -lsqlite3 -o "$RUNNER_TEMP/counter-guest-driver"
           ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" \
             COUNTER_DRIVER="$RUNNER_TEMP/counter-guest-driver" node tests/durable_counter_process_e2e.mjs
+      - name: Execute compiled looping guest with process watchdog and durable mailbox recovery
+        env:
+          ATTO_COMPILER_SOURCE_SHA: 1d6e8e31453064b6530c5c82679aef3cc9db489b
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
+            -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/counter_process_guest_test.cpp \
+            -lsqlite3 -o "$RUNNER_TEMP/counter-process-test"
+          ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" \
+            COUNTER_PROCESS_TEST="$RUNNER_TEMP/counter-process-test" node tests/durable_counter_watchdog_e2e.mjs
   host-seam:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
