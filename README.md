@@ -58,6 +58,7 @@ progress; epoch checks alone are not an ownership election protocol.
 | Automatic idle passivation, multi-object scheduling | Bounded host worker-pool prototype, tests authored (not executed) |
 | Cooperative single-host controller ownership | POSIX advisory lock prototype, competing-controller test authored |
 | Durable alarms | Generation-fenced storage + optional automatic FIFO dispatch prototype; tests authored, not executed |
+| Persistent mailbox admission and restart dispatch | Bounded host prototype; tests authored, not executed |
 | Typed RPC and secure transport | Planned |
 | WebSocket hibernation, placement, replication and failover | Planned |
 
@@ -100,8 +101,46 @@ ordered turns, dedupe, backpressure, restart, explicit and idle passivation,
 cross-object progress during a held turn, no same-object overlap, and
 competing-controller rejection. CI also schedules ASan/UBSan. None of this
 new directory evidence has executed yet. Compiled guest integration in the
-directory, authenticated ingress, durable inbox, cancellation, fuel/time
+directory, authenticated ingress, unified durable inbox, cancellation, fuel/time
 quotas and production alarm policy remain outstanding.
+
+### Persistent mailbox (host prototype)
+
+The durable API is explicitly separate from the transient `send()` path:
+
+```text
+admit(key, stable request ID, operation, delta)
+    -> authenticated FIFO control turn
+    -> SQLite transaction inserts immutable pending mail
+    -> admission receipt (sequence, not a state-transition ACK)
+    -> restart-safe mailbox poller selects oldest pending record per object
+    -> exclusive object turn checks owner, identity, command and schema
+    -> atomic snapshot + completion receipt + outbox + inbox removal
+```
+
+Retrying the identical request returns its pending sequence or committed
+receipt; conflicting commands/schemas reject. Pending rows survive restart
+and cannot be consumed out of order or bypassed by a direct commit with
+the same ID. The reserved alarm namespace cannot be admitted. Defaults
+bound pending mail to 128 records per actor, 4096 per database and 64 MiB
+aggregate command bytes; persisted limits are checked again at reopen.
+The separate configurable mailbox poller (disabled by default) scans up to
+64 object heads and dispatches one outstanding turn at a time. The counter
+demo commits a terminal `mail_overflow` receipt with unchanged state.
+Unexpected handler/authorization faults stop dispatch visibly through
+`mail_fault()`; backpressure retains pending rows.
+
+An admission future is not proof of eventual completion or network
+publication. Only requests admitted through this API have restart-safe
+admission; transient sends, alarms and controls can interleave between
+durable mailbox entries. FIFO is guaranteed within the durable mailbox,
+not across these separate admission domains. Host callbacks are not
+compiled guest execution. Durable retry/dead-letter handling, quota
+reservation for completion receipts, tenant fairness, authentication of
+persisted principals and a unified durable ingress remain open. The
+regression tests cover process exit after admission, reopen, exact replay,
+stale epochs, head checks, rollback, quota rejection and drain after
+restart; new execution evidence is pending.
 
 ### Durable alarms (host prototype)
 
