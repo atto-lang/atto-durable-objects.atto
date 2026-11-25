@@ -397,6 +397,50 @@ int main(int argc,char** argv) {
             assert(admin.principal_alarm_authority(a)->status==SyncAlarmStatus::denied);
             assert(admin.principal_alarm_authority(b)->status==SyncAlarmStatus::fired);
         }
+        // Real compiled scalar guest plus a persisted operator-mediated
+        // alarm effect; restart before dispatch and before alarm firing.
+        const auto atomic_strict_db=std::string(tmp)+"/strict-mail-alarm.db";
+        const SyncMailAlarm effect{{0,0},"operator:mail"};
+        {
+            auto directory=signed_deployment.open(atomic_strict_db,authorize,128,128,2,100ms,0ms,0ms,true,alarm_policy,true);
+            SqliteActorSync admin(atomic_strict_db);
+            admin.set_principal_policy(a,"alice",1,0,true);
+            bool rejected=false;
+            try {(void)directory->admit_with_alarm(a,"@principal:effect",2,"alice",effect,
+                    []{throw std::logic_error("operator denied");});}
+            catch(const std::logic_error&) {rejected=true;}
+            assert(rejected);
+            auto accepted=directory->admit_with_alarm(a,"@principal:effect",2,"alice",effect,[]{}).get();
+            assert(accepted.sequence>0);
+            assert(directory->admit_with_alarm(a,"@principal:effect",2,"alice",effect,[]{}).get().sequence==accepted.sequence);
+            rejected=false;
+            try {(void)directory->admit_with_alarm(a,"@principal:effect",2,"alice",SyncMailAlarm{{0,1},"operator:mail"},[]{}).get();}
+            catch(const std::logic_error&) {rejected=true;}
+            assert(rejected);
+        }
+        {
+            auto directory=signed_deployment.open(atomic_strict_db,authorize,128,128,2,100ms,0ms,10ms,true,alarm_policy,true);
+            SqliteActorSync admin(atomic_strict_db);
+            const auto until=CounterDirectory::Clock::now()+5s;
+            while(!admin.pending_mail().empty() && CounterDirectory::Clock::now()<until)
+                std::this_thread::sleep_for(5ms);
+            assert(admin.pending_mail().empty() && !directory->mail_fault());
+            assert(admin.snapshot(a).bytes=="2" && admin.snapshot(a).revision==1);
+            assert(admin.due_alarms(0).size()==1 && admin.principal_alarm_authority(a)->principal=="alice");
+            auto replay=directory->admit_with_alarm(a,"@principal:effect",2,"alice",effect,[]{}).get();
+            assert(replay.receipt && replay.receipt->duplicate && replay.receipt->reply=="2");
+        }
+        {
+            auto directory=signed_deployment.open(atomic_strict_db,authorize,128,128,2,100ms,10ms,0ms,true,alarm_policy,true);
+            SqliteActorSync admin(atomic_strict_db);
+            const auto until=CounterDirectory::Clock::now()+5s;
+            while(!admin.due_alarms(0).empty() && CounterDirectory::Clock::now()<until)
+                std::this_thread::sleep_for(5ms);
+            assert(admin.due_alarms(0).empty() && !directory->alarm_fault());
+            assert(admin.snapshot(a).bytes=="3" && admin.snapshot(a).revision==2);
+            auto replay=directory->admit_with_alarm(a,"@principal:effect",2,"alice",effect,[]{}).get();
+            assert(replay.receipt && replay.receipt->duplicate && admin.due_alarms(0).empty());
+        }
         // A populated legacy store must not be implicitly adopted.
         const auto legacy_db=std::string(tmp)+"/legacy-deployment.db";
         {CounterDirectory legacy(legacy_db,runner,auth);
