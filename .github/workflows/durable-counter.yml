@@ -15,6 +15,7 @@ on:
       - 'native/include/ores/durable/counter_artifact_registry.hpp'
       - 'native/include/ores/durable/counter_signed_deployment.hpp'
       - 'native/include/ores/durable/counter_principal_gateway.hpp'
+      - 'native/include/ores/durable/counter_dead_letter_admin.hpp'
       - 'native/tests/counter_process_guest_test.cpp'
       - 'tests/durable_counter_watchdog_e2e.mjs'
       - '.github/workflows/durable-counter.yml'
@@ -54,7 +55,7 @@ jobs:
           ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" node tests/durable_counter_guest.mjs
       - name: Compile host driver and execute real guest-to-SQLite process test
         env:
-          STORAGE_SHA: cf147f32d1ef6e1924b3d40377ae0a68309d752d
+          STORAGE_SHA: 1560ceba4eedfcc5c8be8f95902987f0366261a8
           ATTO_COMPILER_SOURCE_SHA: 1d6e8e31453064b6530c5c82679aef3cc9db489b
         run: |
           set -euo pipefail
@@ -78,11 +79,8 @@ jobs:
           g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
             -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/counter_process_guest_test.cpp \
             -lsqlite3 -lcrypto -o "$RUNNER_TEMP/counter-process-test"
-          # Capture the complete non-secret resolved lock, not just the graph.
-          # If a lock is committed, never silently regenerate it.
-          if test ! -f guest/fuel-worker/Cargo.lock; then
-            cargo +1.85.1 generate-lockfile --manifest-path guest/fuel-worker/Cargo.toml
-          fi
+          # The reviewed lock is mandatory. Never resolve new versions in CI.
+          test -f guest/fuel-worker/Cargo.lock
           sha256sum guest/fuel-worker/Cargo.lock
           echo 'BEGIN_FUEL_WORKER_CARGO_LOCK'
           cat guest/fuel-worker/Cargo.lock
@@ -105,7 +103,7 @@ jobs:
       - name: Execute host-only storage seam against pinned PR 9
         env:
           EXPECTED: ${{ github.event.pull_request.head.sha }}
-          STORAGE_SHA: cf147f32d1ef6e1924b3d40377ae0a68309d752d
+          STORAGE_SHA: 1560ceba4eedfcc5c8be8f95902987f0366261a8
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED"
