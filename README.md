@@ -324,6 +324,46 @@ restart deduplication and pending-mail recovery under identical deployment,
 and rejects changed configuration and legacy fallback. These are authored
 tests, not a Wave 14 execution receipt.
 
+### Operator dead-letter administration (Wave 20 candidate)
+
+The trusted CounterDeadLetterAdmin adapter requires an upstream-authenticated
+operator and a separate exact-object/action policy. Inspection pages are
+bounded to 256 records and expose identity, principal, terminal denial flag
+and replacement sequence, not command payload or raw guest errors.
+Strict-policy redrive is explicit, never automatic. It refuses
+authorization-denied mail and requires the original principal's current
+persisted grant. The old message remains terminal. Redrive copies the
+immutable command, schema and principal to a new reserved operation ID and
+new FIFO sequence, with ordinary admission quotas and completion reservations.
+Admission and source/replacement/operator audit are committed atomically.
+One redrive per source row; exact retry by the same operator returns its
+original audit result even after replacement completion. Different operators
+cannot silently adopt it. Recovery still checks the current grant at
+attempt and commit. The new audit is bounded to 65,536 rows. Retained
+originals and replacement messages count against quotas; no unsafe purge,
+identity reuse or administrative bypass of the authorization fence.
+
+Operator policy is a trusted callback, not a network authentication system
+or a transactional revocation guarantee. It is checked before and after
+handoff; revocation after admission cannot undo it. Redrive is an explicit
+new execution, not exactly-once replay of a previous success. The audit is
+a local SQLite record, not a tamper-evident external log. Retention/archive
+with preserved deduplication tombstones remains open.
+
+Storage and host directory tests cover scope and operator action denial,
+revoked grants, exact redrive retry, original terminal result, restart,
+fresh FIFO execution and refusal of authorization-denied redrive. New
+tests are authored, not execution-verified. Storage pin:
+`1560ceba4eedfcc5c8be8f95902987f0366261a8`.
+
+Wave 16 [run 45660631104](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45660631104)
+passed both guest and host jobs at head
+`78465334d6a1f33821080f938ae7df33e5f5187b`. Its complete resolved fuel-worker
+Cargo.lock was recovered and independently SHA-256 checked:
+`a4802aa3eb93c0748c2d87a51b766a458c6a2909844ab3eda6054e294d6550e1`.
+The exact 23-package lock is now committed; CI requires it and builds
+--locked without regenerating it. New-head verification is outstanding.
+
 ### Transactional principal authorization (Wave 19 candidate)
 
 An opt-in strict mode adds a persisted, exact-object principal/operation
@@ -469,9 +509,7 @@ between explicit markers, plus its digest and dependency graph. A
 committed lock is never regenerated; the build uses --locked. The
 previous executed Wave 11 lock digest was
 `a4802aa3eb93c0748c2d87a51b766a458c6a2909844ab3eda6054e294d6550e1`.
-The actual resolved lock bytes still need retrieval, review and commit;
-a hash alone is insufficient to reconstruct it. No release reproducibility
-claim until the committed lock and exact-head build pass.
+Wave 20 retrieved and committed the exact lock bytes after digest verification. A fresh exact-head locked build remains required.
 
 ### Principal-scoped ingress (Wave 15 candidate)
 
