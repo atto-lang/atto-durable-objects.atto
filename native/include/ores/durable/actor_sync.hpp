@@ -46,6 +46,15 @@ struct SyncAlarm {
     std::int64_t generation;
     std::int64_t due_ms;
 };
+struct SyncMail {
+    SyncKey key;
+    std::int64_t sequence;
+    std::string operation_id, command, schema;
+};
+struct SyncAdmission {
+    std::int64_t sequence; // 0 means already completed
+    std::optional<SyncCommit> receipt;
+};
 class ResyncRequired final : public std::logic_error {
 public:
     ResyncRequired() : std::logic_error("sync cursor requires a fresh snapshot") {}
@@ -61,6 +70,8 @@ struct SyncLimits {
     std::size_t dedupe_entries_per_actor = 8192;
     std::size_t actor_keys_per_database = 4096;
     std::size_t projection_consumers_per_actor = 1024;
+    std::size_t inbox_entries_per_actor = 128;
+    std::size_t inbox_entries_per_database = 4096;
 };
 
 class SqliteActorSync final {
@@ -72,6 +83,8 @@ public:
             limits_.feed_entries == 0 || limits_.feed_entries > 256 ||
             limits_.outbox_entries_per_actor == 0 || limits_.dedupe_entries_per_actor == 0 ||
             limits_.actor_keys_per_database == 0 || limits_.projection_consumers_per_actor == 0 ||
+            limits_.inbox_entries_per_actor == 0 || limits_.inbox_entries_per_database == 0 ||
+            limits_.inbox_entries_per_database > 65536 ||
             limits_.state_bytes > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
             limits_.command_bytes > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
             limits_.reply_bytes > static_cast<std::size_t>(std::numeric_limits<int>::max()))
@@ -129,6 +142,12 @@ public:
                  "PRIMARY KEY(tenant,space,actor_type,id),"
                  "FOREIGN KEY(tenant,space,actor_type,id) REFERENCES sync_objects(tenant,space,actor_type,id)) WITHOUT ROWID");
             exec("CREATE INDEX IF NOT EXISTS sync_alarm_due ON sync_alarms(due_ms,tenant,space,actor_type,id) WHERE due_ms IS NOT NULL");
+            exec("CREATE TABLE IF NOT EXISTS sync_inbox("
+                 "sequence INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT NOT NULL, space TEXT NOT NULL,"
+                 "actor_type TEXT NOT NULL, id TEXT NOT NULL, op_id TEXT NOT NULL, command BLOB NOT NULL,"
+                 "schema_fp TEXT NOT NULL, UNIQUE(tenant,space,actor_type,id,op_id),"
+                 "FOREIGN KEY(tenant,space,actor_type,id) REFERENCES sync_objects(tenant,space,actor_type,id))");
+            exec("CREATE INDEX IF NOT EXISTS sync_inbox_actor_fifo ON sync_inbox(tenant,space,actor_type,id,sequence)");
             exec("CREATE TABLE IF NOT EXISTS sync_projection("
                  "consumer TEXT NOT NULL, tenant TEXT NOT NULL, space TEXT NOT NULL,"
                  "actor_type TEXT NOT NULL, id TEXT NOT NULL, epoch INTEGER NOT NULL,"
@@ -342,6 +361,84 @@ public:
         return "@alarm:"+std::to_string(generation);
     }
 
+    // Durable admission is independent of execution. An accepted sequence
+    // survives crash; exact retries resolve to the pending row or receipt.
+    // Caller must hold authenticated exclusive controller/turn authority.
+    SyncAdmission admit_mail(const SyncKey& key,std::int64_t epoch,
+                             std::string_view operation_id,std::string_view command,
+                             std::string_view schema_fp) {
+        validate_key(key);label(operation_id);label(schema_fp);
+        bounded(command,limits_.command_bytes);
+        if(epoch<=0 || operation_id.substr(0,7)=="@alarm:")
+            throw std::invalid_argument("invalid mailbox admission");
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this);
+        if(snapshot_locked(key).epoch!=epoch) throw std::logic_error("stale mailbox owner");
+        std::optional<SyncCommit> completed;
+        {
+            Statement read(db_,"SELECT command,schema_fp,revision,reply FROM sync_operations WHERE tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?");
+            bind_key(read,key);read.text(5,operation_id);
+            if(read.step()==SQLITE_ROW) {
+                if(read.blob(0)!=command || read.str(1)!=schema_fp)
+                    throw std::logic_error("mail identity reused with different command/schema");
+                completed=SyncCommit{read.number(2),read.blob(3),true};
+            }
+        }
+        if(completed){tx.commit();return {0,completed};}
+        std::int64_t existing=0;
+        {
+            Statement read(db_,"SELECT sequence,command,schema_fp FROM sync_inbox WHERE tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?");
+            bind_key(read,key);read.text(5,operation_id);
+            if(read.step()==SQLITE_ROW) {
+                if(read.blob(1)!=command || read.str(2)!=schema_fp)
+                    throw std::logic_error("pending mail identity reused with different command/schema");
+                existing=read.number(0);
+            }
+        }
+        if(existing){tx.commit();return {existing,std::nullopt};}
+        if(count_for(key,"sync_inbox")>=limits_.inbox_entries_per_actor)
+            throw std::length_error("mailbox actor quota exhausted");
+        {
+            Statement count(db_,"SELECT COUNT(*) FROM sync_inbox");
+            if(count.step()!=SQLITE_ROW || static_cast<std::uint64_t>(count.number(0))>=limits_.inbox_entries_per_database)
+                throw std::length_error("mailbox database quota exhausted");
+        }
+        {
+            Statement write(db_,"INSERT INTO sync_inbox(tenant,space,actor_type,id,op_id,command,schema_fp) VALUES(?,?,?,?,?,?,?)");
+            bind_key(write,key);write.text(5,operation_id);write.blob(6,command);write.text(7,schema_fp);write.done();
+        }
+        const auto seq=sqlite3_last_insert_rowid(db_);
+        if(seq<=0) throw std::overflow_error("mail sequence exhausted");
+        tx.commit();return {seq,std::nullopt};
+    }
+
+    // Oldest pending record per object, globally ordered by admission.
+    // The scan is a hint; consume checks identity, epoch and head again.
+    std::vector<SyncMail> pending_mail(std::size_t limit=64) {
+        if(limit==0 || limit>256) throw std::invalid_argument("invalid mailbox scan");
+        std::lock_guard<std::mutex> lock(mu_);
+        Statement read(db_,"SELECT tenant,space,actor_type,id,sequence,op_id,command,schema_fp FROM sync_inbox AS m "
+            "WHERE NOT EXISTS(SELECT 1 FROM sync_inbox AS p WHERE p.tenant=m.tenant AND p.space=m.space "
+            "AND p.actor_type=m.actor_type AND p.id=m.id AND p.sequence<m.sequence) ORDER BY sequence LIMIT ?");
+        read.i64(1,static_cast<std::int64_t>(limit));
+        std::vector<SyncMail> result;
+        while(read.step()==SQLITE_ROW) {
+            SyncMail m{{read.str(0),read.str(1),read.str(2),read.str(3)},read.number(4),read.str(5),read.blob(6),read.str(7)};
+            validate_key(m.key);label(m.operation_id);label(m.schema);
+            bounded(m.command,limits_.command_bytes);result.push_back(std::move(m));
+        }
+        return result;
+    }
+
+    bool mail_pending(const SyncMail& mail,std::int64_t epoch) {
+        validate_key(mail.key);
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this,false);
+        if(snapshot_locked(mail.key).epoch!=epoch) throw std::logic_error("stale mailbox owner");
+        const bool pending=mail_matches_locked(mail);
+        tx.commit();return pending;
+    }
+
     // Atomic state + exact-operation dedup + replay reply + outbox.
     // If the ACK is lost, retry with identical op_id/command; the caller must
     // not interpret a timeout as a definitely failed operation.
@@ -350,8 +447,14 @@ public:
                       std::string_view command, std::string_view schema_fp,
                       std::string_view next_state, std::string_view reply,
                       bool inject_precommit_failure = false,
-                      const SyncAlarm* alarm = nullptr, std::int64_t now_ms = 0) {
+                      const SyncAlarm* alarm = nullptr, std::int64_t now_ms = 0,
+                      const SyncMail* mail = nullptr) {
         validate_key(key); label(operation_id); label(schema_fp);
+        if(mail && (alarm || mail->sequence<=0 ||
+            mail->key.tenant!=key.tenant || mail->key.name_space!=key.name_space ||
+            mail->key.actor_type!=key.actor_type || mail->key.object_id!=key.object_id ||
+            mail->operation_id!=operation_id || mail->command!=command || mail->schema!=schema_fp))
+            throw std::invalid_argument("invalid mailbox commit envelope");
         if(alarm) {
             if(alarm->key.tenant!=key.tenant || alarm->key.name_space!=key.name_space ||
                alarm->key.actor_type!=key.actor_type || alarm->key.object_id!=key.object_id ||
@@ -381,6 +484,13 @@ public:
             }
         }
         if (replay) { tx.commit(); return *replay; }
+        if(mail && !mail_matches_locked(*mail))
+            throw std::logic_error("mail is not the current FIFO head");
+        if(!mail) {
+            Statement pending(db_,"SELECT 1 FROM sync_inbox WHERE tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?");
+            bind_key(pending,key);pending.text(5,operation_id);
+            if(pending.step()==SQLITE_ROW) throw std::logic_error("mailbox completion required");
+        }
         if(alarm && !alarm_matches_locked(*alarm,now_ms))
             throw std::logic_error("alarm cancelled, replaced or not due");
         if (old.revision != expected_revision) throw std::logic_error("revision conflict");
@@ -413,6 +523,11 @@ public:
             bind_key(consume,key);consume.i64(5,alarm->generation);consume.i64(6,alarm->due_ms);
             consume.done();
             if(sqlite3_changes(db_)!=1) throw std::logic_error("lost alarm generation");
+        }
+        if(mail) {
+            Statement consume(db_,"DELETE FROM sync_inbox WHERE sequence=? AND tenant=? AND space=? AND actor_type=? AND id=?");
+            consume.i64(1,mail->sequence);bind_key(consume,key,2);consume.done();
+            if(sqlite3_changes(db_)!=1) throw std::logic_error("lost mailbox head");
         }
         if (inject_precommit_failure) throw std::runtime_error("injected failure before commit");
         tx.commit();
@@ -617,6 +732,12 @@ public:
     }
 
 private:
+    bool mail_matches_locked(const SyncMail& mail) {
+        Statement read(db_,"SELECT sequence,op_id,command,schema_fp FROM sync_inbox WHERE tenant=? AND space=? AND actor_type=? AND id=? ORDER BY sequence LIMIT 1");
+        bind_key(read,mail.key);
+        return read.step()==SQLITE_ROW && read.number(0)==mail.sequence &&
+            read.str(1)==mail.operation_id && read.blob(2)==mail.command && read.str(3)==mail.schema;
+    }
     bool alarm_matches_locked(const SyncAlarm& alarm,std::int64_t now_ms) {
         Statement read(db_,"SELECT 1 FROM sync_alarms WHERE tenant=? AND space=? AND actor_type=? AND id=? "
                            "AND generation=? AND due_ms=? AND due_ms<=?");
@@ -649,6 +770,9 @@ private:
                 throw std::length_error("persisted actor sync database exceeds configured limits");
         };
         validate("SELECT COUNT(*) FROM sync_objects",limits_.actor_keys_per_database);
+        validate("SELECT COUNT(*) FROM sync_inbox",limits_.inbox_entries_per_database);
+        validate("SELECT COALESCE(MAX(n),0) FROM (SELECT COUNT(*) AS n FROM sync_inbox GROUP BY tenant,space,actor_type,id)",limits_.inbox_entries_per_actor);
+        validate("SELECT COALESCE(MAX(LENGTH(command)),0) FROM sync_inbox",limits_.command_bytes);
         validate("SELECT COALESCE(MAX(n),0) FROM (SELECT COUNT(*) AS n FROM sync_outbox "
                  "GROUP BY tenant,space,actor_type,id)",limits_.outbox_entries_per_actor);
         validate("SELECT COALESCE(MAX(n),0) FROM (SELECT COUNT(*) AS n FROM sync_operations "
@@ -668,6 +792,8 @@ private:
             sql = "SELECT COUNT(*) FROM sync_operations WHERE tenant=? AND space=? AND actor_type=? AND id=?";
         else if (std::string_view(table) == "sync_outbox")
             sql = "SELECT COUNT(*) FROM sync_outbox WHERE tenant=? AND space=? AND actor_type=? AND id=?";
+        else if (std::string_view(table) == "sync_inbox")
+            sql = "SELECT COUNT(*) FROM sync_inbox WHERE tenant=? AND space=? AND actor_type=? AND id=?";
         else if (std::string_view(table) == "sync_projection")
             sql = "SELECT COUNT(*) FROM sync_projection WHERE tenant=? AND space=? AND actor_type=? AND id=?";
         else throw std::invalid_argument("invalid quota table");
