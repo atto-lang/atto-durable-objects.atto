@@ -107,7 +107,7 @@ private:
     };
     auto guarded_guest(const SyncKey& k,bool precharged=false) {
         return [this,&k,precharged](std::int64_t n,std::int64_t op,std::int64_t d){
-            if(!precharged) store_.reserve_guest_start(k.tenant,unix_ms());
+            if(rate_enabled_ && !precharged) store_.reserve_guest_start(k.tenant,unix_ms());
             GuestGuard guard(owner_.fd(),deployment_manifest_);
             return guest_(k,n,op,d);
         };
@@ -121,6 +121,7 @@ private:
     const PrincipalPolicy mail_policy_;
     struct PolicyDenied {};
     const std::size_t capacity_,active_limit_,tenant_queue_limit_,tenant_running_limit_;
+    const bool rate_enabled_;
     const Clock::duration idle_timeout_;
     std::map<Key,Lane> lanes_; // protected by mu_; running lanes cannot be erased
     std::size_t queued_=0,active_=0;
@@ -164,7 +165,7 @@ private:
                         if(alarm.attempt_epoch>=epoch) throw std::logic_error("unresolved current alarm attempt");
                         (void)store_.fail_alarm(alarm,epoch,now);return Reply{};
                     }
-                    store_.reserve_guest_start(alarm.key.tenant,now);
+                    if(rate_enabled_) store_.reserve_guest_start(alarm.key.tenant,now);
                     alarm=store_.begin_alarm(alarm,epoch,now);
                     auto invoke=guarded_guest(alarm.key,true);
                     auto checked=[&](auto n,auto op,auto d) {
@@ -294,7 +295,7 @@ private:
                     (void)store_.fail_mail(mail,epoch,unix_ms());
                     return Reply{};
                 }
-                store_.reserve_guest_start(mail.key.tenant,unix_ms());
+                if(rate_enabled_) store_.reserve_guest_start(mail.key.tenant,unix_ms());
                 SyncMail started=mail;
                 try {started=store_.begin_mail(mail,epoch,unix_ms());}
                 catch(const PrincipalPolicyChanged&) {store_.deny_mail(mail,epoch);return Reply{};}
@@ -547,7 +548,8 @@ public:
           principal_mode_(principal_mode),transactional_policy_(transactional_policy),mail_policy_(std::move(mail_policy)),
           capacity_(capacity),active_limit_(active_limit),
           tenant_queue_limit_(tenant_limits.queued?std::min(tenant_limits.queued,capacity):capacity),
-          tenant_running_limit_(tenant_limits.running?std::min(tenant_limits.running,workers):workers),idle_timeout_(idle_timeout) {
+          tenant_running_limit_(tenant_limits.running?std::min(tenant_limits.running,workers):workers),
+          rate_enabled_(tenant_limits.guest_rate.window_ms!=0),idle_timeout_(idle_timeout) {
         if(!guest_ || !authorize_ || !capacity_ || !active_limit_ ||
            !workers || workers>64 || idle_timeout_<Clock::duration::zero() ||
            alarm_interval<Clock::duration::zero() || mail_interval<Clock::duration::zero() ||
