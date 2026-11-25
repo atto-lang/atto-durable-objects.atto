@@ -57,7 +57,8 @@ progress; epoch checks alone are not an ownership election protocol.
 | Automatic named activation, exclusive FIFO turns, explicit passivation | [Host directory prototype](native/include/ores/durable/counter_directory.hpp), tests authored, not executed |
 | Automatic idle passivation, multi-object scheduling | Bounded host worker-pool prototype, tests authored (not executed) |
 | Cooperative single-host controller ownership | POSIX advisory lock prototype, competing-controller test authored |
-| Durable alarms, typed RPC and secure transport | Planned |
+| Durable alarms | Generation-fenced storage + optional automatic FIFO dispatch prototype; tests authored, not executed |
+| Typed RPC and secure transport | Planned |
 | WebSocket hibernation, placement, replication and failover | Planned |
 
 ### Virtual actor directory (host prototype)
@@ -100,7 +101,45 @@ cross-object progress during a held turn, no same-object overlap, and
 competing-controller rejection. CI also schedules ASan/UBSan. None of this
 new directory evidence has executed yet. Compiled guest integration in the
 directory, authenticated ingress, durable inbox, cancellation, fuel/time
-quotas and alarms remain outstanding.
+quotas and production alarm policy remain outstanding.
+
+### Durable alarms (host prototype)
+
+The storage candidate in [PR #9](https://github.com/atto-lang/atto-durable-objects.atto/pull/9)
+persists one Unix-millisecond deadline per logical object, with a monotonic
+alarm generation that survives cancel and consume. Setting/replacing or
+cancelling requires the current generation and owner epoch; cancellation
+retains a tombstone. The reserved receipt identity `@alarm:<generation>`
+cannot be submitted as an ordinary request. Legacy conflicting receipts
+fail closed on migration. Due scans are indexed and bounded.
+
+The directory provides trusted, asynchronous `set_alarm(key, generation,
+due_ms)`, `alarm_generation(key)`, and cancellation via a null deadline.
+An optional positive alarm poll interval enables a dedicated supervisor
+poller (disabled by default). It scans at most 64 due records per batch,
+submits at most one outstanding alarm turn, and uses the same exclusive
+FIFO lane as ordinary operations. Dormant objects activate under a fresh
+epoch. The worker checks the deadline, alarm generation and epoch again;
+it atomically consumes the deadline with state, immutable receipt and
+outbox update. Restart scans persisted deadlines; a consumed alarm is not
+run twice. Clock deadlines use wall-clock time, while polling and idle
+passivation use monotonic elapsed time.
+
+For the bounded counter demo an alarm invokes the existing increment-by-one
+transition. At maximum count it records terminal `alarm_overflow` with
+unchanged state. Queue/activation saturation delays dispatch; unexpected
+faults stop the poller and are exposed through `alarm_fault()` for trusted
+supervisor recovery. Shutdown drains a currently dispatched alarm.
+This is not a general compiled alarm-handler ABI: scheduling/cancellation
+are separate fenced control transactions, not atomic with arbitrary guest
+state changes. Durable retry backoff/dead-letter policy, per-tenant fair
+alarm dispatch, authenticated capabilities, hard watchdogs, multi-host
+ownership and integrated compiled guest execution remain outstanding.
+
+Host regression cases cover cancel/replace, stale owner and generation,
+rollback, reopen, auto-activation, consumed receipt replay and terminal
+overflow. See the directory and actor-sync recovery tests; new tests remain
+unexecuted pending exact-head CI. No exactly-once external effect claim.
 
 ### Compile-once candidate ABI
 
