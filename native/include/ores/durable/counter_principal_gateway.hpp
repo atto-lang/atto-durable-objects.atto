@@ -59,7 +59,8 @@ public:
                             CounterDirectory::Authorize scope,Policy policy,
                             std::size_t capacity=128,std::size_t active=128,std::size_t workers=1)
         :authority_(std::make_shared<const Authority>(std::move(policy))),
-         directory_(deployment.open(db,std::move(scope),capacity,active,workers)) {}
+         directory_(deployment.open(db,std::move(scope),capacity,active,workers,
+             Clock::duration::zero(),Clock::duration::zero(),Clock::duration::zero(),true)) {}
     // Caller MUST authenticate the principal upstream. Exact object and
     // operation are fixed at issue time; no ambient tenant supplied on send.
     Capability issue(std::string principal,SyncKey key,std::int64_t op,
