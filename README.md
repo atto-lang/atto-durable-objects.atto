@@ -324,6 +324,42 @@ restart deduplication and pending-mail recovery under identical deployment,
 and rejects changed configuration and legacy fallback. These are authored
 tests, not a Wave 14 execution receipt.
 
+### Crash-counted alarm attempts and bounded retries (Wave 24 candidate)
+
+The trusted runtime persists a generation-scoped attempt marker before
+invoking an alarm guest. An abandoned marker from a physically retired
+older controller consumes one failure on recovery before another attempt
+can begin. A classified stopped-guest failure consumes the same budget:
+two retries with 100 ms and 200 ms delay, then terminal exhaustion on
+the third failure. The original alarm deadline and generation remain
+unchanged during backoff. The eligible scan skips delayed alarms, so
+unrelated due alarms can progress. Exact generation/attempt/failure/deadline
+matching and the controller epoch fence stale failure tokens. Successful
+state/receipt/outbox/consume transactions clear retry metadata; exhaustion
+clears the deadline without state mutation or a success receipt. The
+latest strict alarm diagnostic distinguishes failed from denied and fired.
+Explicit replacement starts a new generation and clears the old retry
+metadata. This is bounded latest-generation state, not append-only history.
+
+Persisted principal grant version is rechecked at attempt admission,
+failure resolution and state commit. Policy denial takes precedence over
+retry and clears the exact generation. Unknown infrastructure failures
+still stop the supervisor and retain the marker for recovery. Trusted
+classified failures must mean physical guest retirement; a crash after
+marking but before launch conservatively counts. The existing poller
+remains sequential; no concurrent tenant-fair alarm dispatch or
+general effectful guest semantics are claimed. Legacy trusted unmarked
+storage calls remain supported only when no persisted attempt exists.
+
+Storage regression forks a controller that exits after marking, checks
+stale-token rejection, retry delay, unrelated healthy commit, exhaustion,
+restart and explicit fresh generation. Host directory regression injects
+classified failures and requires exactly three attempts with independent
+healthy progress. These new retry tests are host/storage tests, not
+proof of actual guest traps. Existing compiled-guest tests remain in CI.
+Storage pin: `7ed8d0e4acea3de125ca0b2c3a7bd530c1aac484`.
+New-head execution is pending.
+
 ### Principal-bound alarm authorization (Wave 23 candidate)
 
 Strict principal mode now supports a trusted operator scheduling path
