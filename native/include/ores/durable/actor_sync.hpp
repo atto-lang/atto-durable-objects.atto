@@ -411,6 +411,13 @@ public:
             }
         }
         if(existing){tx.commit();return {existing,std::nullopt,dead};}
+        // Reserve one receipt and outbox slot for each live admitted turn.
+        const auto live=live_mail_count(key);
+        if(live>=limits_.dedupe_entries_per_actor ||
+           count_for(key,"sync_operations")>=limits_.dedupe_entries_per_actor-live ||
+           live>=limits_.outbox_entries_per_actor ||
+           count_for(key,"sync_outbox")>=limits_.outbox_entries_per_actor-live)
+            throw std::length_error("mail completion reservation exhausted");
         if(count_for(key,"sync_inbox")>=limits_.inbox_entries_per_actor)
             throw std::length_error("mailbox actor quota exhausted");
         {
@@ -542,6 +549,15 @@ public:
         if(alarm && !alarm_matches_locked(*alarm,now_ms))
             throw std::logic_error("alarm cancelled, replaced or not due");
         if (old.revision != expected_revision) throw std::logic_error("revision conflict");
+        // Non-mail commits cannot take capacity reserved by accepted mail.
+        if(!mail) {
+            const auto live=live_mail_count(key);
+            if(live>=limits_.dedupe_entries_per_actor ||
+               count_for(key,"sync_operations")>=limits_.dedupe_entries_per_actor-live ||
+               live>=limits_.outbox_entries_per_actor ||
+               count_for(key,"sync_outbox")>=limits_.outbox_entries_per_actor-live)
+                throw std::length_error("completion capacity reserved for mailbox");
+        }
         if (count_for(key, "sync_operations") >= limits_.dedupe_entries_per_actor)
             throw std::length_error("durable operation retention quota exhausted");
         if (count_for(key, "sync_outbox") >= limits_.outbox_entries_per_actor)
@@ -780,6 +796,13 @@ public:
     }
 
 private:
+    std::size_t live_mail_count(const SyncKey& key) {
+        Statement read(db_,"SELECT COUNT(*) FROM sync_inbox m LEFT JOIN sync_mail_retry r ON r.sequence=m.sequence "
+            "WHERE m.tenant=? AND m.space=? AND m.actor_type=? AND m.id=? AND COALESCE(r.dead,0)=0");
+        bind_key(read,key);
+        if(read.step()!=SQLITE_ROW) throw std::runtime_error("mail reservation count failed");
+        return static_cast<std::size_t>(read.number(0));
+    }
     bool mail_matches_locked(const SyncMail& mail) {
         Statement read(db_,"SELECT m.sequence,m.op_id,m.command,m.schema_fp,COALESCE(r.failures,0),COALESCE(r.retry_at_ms,0) "
             "FROM sync_inbox m LEFT JOIN sync_mail_retry r ON r.sequence=m.sequence "
