@@ -108,6 +108,11 @@ public:
     ResyncRequired() : std::logic_error("sync cursor requires a fresh snapshot") {}
 };
 
+// Persistent rolling admission budget. Each admitted guest start is
+// conservatively charged a full worker envelope; no refund on crash.
+struct SyncGuestRate {
+    std::int64_t window_ms=0,starts=0;
+};
 struct SyncLimits {
     std::size_t state_bytes = 1 << 20;
     std::size_t command_bytes = 1 << 20;
@@ -203,6 +208,13 @@ public:
                  "PRIMARY KEY(tenant,space,actor_type,id),"
                  "FOREIGN KEY(tenant,space,actor_type,id) REFERENCES sync_objects(tenant,space,actor_type,id)) WITHOUT ROWID");
             exec("CREATE INDEX IF NOT EXISTS sync_alarm_due ON sync_alarms(due_ms,tenant,space,actor_type,id) WHERE due_ms IS NOT NULL");
+            exec("CREATE TABLE IF NOT EXISTS sync_guest_rate("
+                 "singleton INTEGER PRIMARY KEY CHECK(singleton=1),window_ms INTEGER NOT NULL CHECK(window_ms BETWEEN 1 AND 86400000),"
+                 "starts INTEGER NOT NULL CHECK(starts BETWEEN 1 AND 4096),high_water_ms INTEGER NOT NULL CHECK(high_water_ms>=0))");
+            exec("CREATE TABLE IF NOT EXISTS sync_guest_charges("
+                 "sequence INTEGER PRIMARY KEY,tenant TEXT NOT NULL,charged_ms INTEGER NOT NULL CHECK(charged_ms>=0))");
+            exec("CREATE INDEX IF NOT EXISTS sync_guest_charges_tenant ON sync_guest_charges(tenant,charged_ms)");
+            exec("CREATE INDEX IF NOT EXISTS sync_guest_charges_expiry ON sync_guest_charges(charged_ms)");
             exec("CREATE TABLE IF NOT EXISTS sync_alarm_retry("
                  "tenant TEXT NOT NULL,space TEXT NOT NULL,actor_type TEXT NOT NULL,id TEXT NOT NULL,"
                  "generation INTEGER NOT NULL CHECK(generation>0),failures INTEGER NOT NULL CHECK(failures BETWEEN 0 AND 3),"
@@ -320,6 +332,75 @@ public:
     // legacy host-fixture mode, which must not reopen a managed deployment.
     // Exact bytes (including artifact hashes/profile) are immutable in v1.
     // Any migration, adoption or rotation requires a separate offline protocol.
+    // Exact configuration survives restart. Disabling/changing a bound
+    // policy requires an explicit offline migration; never silently reset.
+    void bind_guest_rate(SyncGuestRate rate) {
+        const bool enabled=rate.window_ms!=0 || rate.starts!=0;
+        if(enabled && (rate.window_ms<1 || rate.window_ms>86400000 || rate.starts<1 || rate.starts>4096))
+            throw std::invalid_argument("invalid guest rate policy");
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this);
+        bool existing=false;
+        {
+            Statement read(db_,"SELECT window_ms,starts FROM sync_guest_rate WHERE singleton=1");
+            if(read.step()==SQLITE_ROW) {
+                existing=true;
+                if(!enabled || rate.window_ms!=read.number(0) || rate.starts!=read.number(1))
+                    throw std::logic_error("guest rate policy mismatch; offline migration required");
+            }
+        }
+        if(enabled && !existing) {
+            Statement write(db_,"INSERT INTO sync_guest_rate VALUES(1,?,?,0)");
+            write.i64(1,rate.window_ms);write.i64(2,rate.starts);write.done();
+        }
+        tx.commit();
+    }
+
+    // Charge before guest invocation, never after. The clock is trusted
+    // host wall time; backward movement is clamped to persisted high-water.
+    // A forward clock jump can advance expiry; no hostile-clock claim.
+    void reserve_guest_start(std::string_view tenant,std::int64_t now_ms) {
+        label(tenant);
+        if(now_ms<0) throw std::invalid_argument("invalid guest rate clock");
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this);
+        std::int64_t window=0,starts=0,effective=now_ms;
+        {
+            Statement read(db_,"SELECT window_ms,starts,high_water_ms FROM sync_guest_rate WHERE singleton=1");
+            if(read.step()==SQLITE_ROW) {
+                window=read.number(0);starts=read.number(1);
+                effective=std::max(now_ms,read.number(2));
+            }
+        }
+        if(!window){tx.commit();return;}
+        // Exact sliding window (effective-window,effective], not a fixed
+        // bucket. Entries at the left boundary may expire.
+        {
+            Statement clear(db_,"DELETE FROM sync_guest_charges WHERE charged_ms<=?");
+            clear.i64(1,effective-window);clear.done();
+        }
+        {
+            Statement count(db_,"SELECT COUNT(*) FROM sync_guest_charges WHERE tenant=?");
+            count.text(1,tenant);
+            if(count.step()!=SQLITE_ROW || count.number(0)>=starts)
+                throw std::length_error("tenant rolling guest budget exhausted");
+        }
+        {
+            Statement count(db_,"SELECT COUNT(*) FROM sync_guest_charges");
+            if(count.step()!=SQLITE_ROW || count.number(0)>=65536)
+                throw std::length_error("database rolling guest budget exhausted");
+        }
+        {
+            Statement write(db_,"INSERT INTO sync_guest_charges(tenant,charged_ms) VALUES(?,?)");
+            write.text(1,tenant);write.i64(2,effective);write.done();
+        }
+        {
+            Statement write(db_,"UPDATE sync_guest_rate SET high_water_ms=? WHERE singleton=1");
+            write.i64(1,effective);write.done();
+        }
+        tx.commit();
+    }
+
     void bind_deployment(std::string_view manifest) {
         if(manifest.size()>(4u<<20)) throw std::length_error("deployment manifest too large");
         std::lock_guard<std::mutex> lock(mu_);
@@ -1679,6 +1760,8 @@ private:
         };
         validate("SELECT COUNT(*) FROM sync_objects",limits_.actor_keys_per_database);
         validate("SELECT COUNT(*) FROM sync_principal_policy",65536);
+        validate("SELECT COUNT(*) FROM sync_guest_charges",65536);
+        validate("SELECT COALESCE(MAX(n),0) FROM (SELECT COUNT(*) AS n FROM sync_guest_charges GROUP BY tenant)",4096);
         validate("SELECT COUNT(*) FROM sync_dead_redrive",65536);
         validate("SELECT COUNT(*) FROM sync_dead_archive",limits_.archive_entries_per_database);
         validate("SELECT COALESCE(SUM(LENGTH(command)),0) FROM sync_dead_archive",limits_.archive_command_bytes_per_database);
