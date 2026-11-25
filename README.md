@@ -125,8 +125,7 @@ and cannot be consumed out of order or bypassed by a direct commit with
 the same ID. The reserved alarm namespace cannot be admitted. Defaults
 bound pending mail to 128 records per actor, 4096 per database and 64 MiB
 aggregate command bytes; persisted limits are checked again at reopen.
-The separate configurable mailbox poller (disabled by default) scans up to
-64 object heads and dispatches one outstanding turn at a time. The counter
+The separate configurable mailbox poller (disabled by default) now has a candidate bounded concurrent dispatch path described in Wave 16. The counter
 demo commits a terminal `mail_overflow` receipt with unchanged state.
 Explicitly classified stopped-guest failures use the bounded persistent retry policy below; other handler/authorization faults stop dispatch visibly through `mail_fault()`; backpressure retains pending rows.
 
@@ -172,9 +171,7 @@ Classified stopped-guest failures and abandoned dispatch markers use this
 policy. Database, ownership, authorization and unexpected faults stop the
 poller; a surviving marker is resolved only under a fresh fenced activation.
 The compiled scalar watchdog and fuel worker have separate executed evidence.
- The supervisor still dispatches one
-mailbox recovery turn at a time and a nonterminating callback can block
-it. These are not production guarantees of poison isolation or eventual
+ The Wave 16 candidate dispatches distinct objects concurrently, but a nonterminating trusted callback can still occupy a worker. These are not production guarantees of poison isolation or eventual
 delivery. Tests cover retry deadlines, restart, stale attempt fencing,
 dead-letter replay, healthy object progress and reserved capacity; no
 new exact-head execution receipts yet.
@@ -326,6 +323,36 @@ checks signature/key/manifest tampering, validates scoped dispatch, verifies
 restart deduplication and pending-mail recovery under identical deployment,
 and rejects changed configuration and legacy fallback. These are authored
 tests, not a Wave 14 execution receipt.
+
+### Concurrent durable mailbox recovery (Wave 16 candidate)
+
+The mailbox supervisor no longer waits synchronously for a single object
+before admitting another. It tracks at most one outstanding future per
+full logical object identity and at most the configured worker count
+overall (1–64). Ready futures are collected independently; a bounded
+scan of up to 256 eligible heads fills available slots. Exclusive per-object
+lanes, epoch/attempt fencing, durable FIFO and completion reservations
+are unchanged. A slow or backed-off head does not necessarily block an
+independent ready object when a worker slot is available. An unexpected
+fault stops new dispatch when observed, publishes the fault and drains
+already submitted turns before the supervisor exits. Shutdown drains
+accepted work; nonterminating trusted callbacks remain unsupported.
+This is bounded cross-object concurrency, not a guaranteed per-tenant
+fairness or admission latency policy.
+
+A host regression holds the first durable turn open with a promise,
+requires an independent object's commit while the held object's revision
+stays zero, then releases it and requires both same-object turns to
+complete in FIFO order. This test is authored, not yet execution-verified.
+
+Fuel-worker CI now emits the complete non-secret resolved Cargo.lock
+between explicit markers, plus its digest and dependency graph. A
+committed lock is never regenerated; the build uses --locked. The
+previous executed Wave 11 lock digest was
+`a4802aa3eb93c0748c2d87a51b766a458c6a2909844ab3eda6054e294d6550e1`.
+The actual resolved lock bytes still need retrieval, review and commit;
+a hash alone is insufficient to reconstruct it. No release reproducibility
+claim until the committed lock and exact-head build pass.
 
 ### Principal-scoped ingress (Wave 15 candidate)
 
