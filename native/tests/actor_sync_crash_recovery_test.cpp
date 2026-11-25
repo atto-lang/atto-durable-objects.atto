@@ -45,6 +45,16 @@ int main() {
         SqliteActorSync recovered(db);
         assert(recovered.snapshot(key).revision==1);
         assert(recovered.snapshot(key).bytes=="charged");
+        const auto found=recovered.lookup_receipt(key,1,"request-1","charge-10","order.v1");
+        assert(found && found->duplicate && found->revision==1 && found->reply=="receipt-1");
+        assert(!recovered.lookup_receipt(key,1,"unseen","charge-10","order.v1"));
+        for (const auto& mismatch : {std::pair<const char*,const char*>{"charge-11","order.v1"},
+                                     {"charge-10","order.v2"}}) {
+            bool denied=false;
+            try { (void)recovered.lookup_receipt(key,1,"request-1",mismatch.first,mismatch.second); }
+            catch(const std::logic_error&) { denied=true; }
+            assert(denied);
+        }
         const auto retry=recovered.commit(key,1,0,"request-1","charge-10","order.v1","duplicate","bad-receipt");
         assert(retry.duplicate && retry.revision==1 && retry.reply=="receipt-1");
         bool rejected=false;
@@ -82,6 +92,12 @@ int main() {
         assert(rejected);
         // The idempotency key remains scoped to the stable logical actor,
         // not to the transient epoch of its latest activation.
+        bool stale_lookup=false;
+        try { (void)recovered.lookup_receipt(key,1,"request-2","credit-2","order.v1"); }
+        catch(const std::logic_error&) { stale_lookup=true; }
+        assert(stale_lookup);
+        const auto current=recovered.lookup_receipt(key,2,"request-2","credit-2","order.v1");
+        assert(current && current->reply=="receipt-2" && current->revision==2);
         const auto replay=recovered.commit(key,2,0,"request-2","credit-2","order.v1","bad","bad");
         assert(replay.duplicate && replay.revision==2 && replay.reply=="receipt-2");
     }
