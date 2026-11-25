@@ -305,6 +305,35 @@ int main(int argc,char** argv) {
             assert(rejected.dead_letter && rejected.authorization_denied && !rejected.receipt);
             assert(observer.snapshot(a).revision==1);
         }
+        // Strict mode additionally requires persisted operator grants.
+        // The external policy still allows both principals; only the
+        // transactional policy revokes Alice before restart dispatch.
+        const auto strict_db=std::string(tmp)+"/strict-gateway.db";
+        {
+            CounterPrincipalGateway gateway(signed_deployment,strict_db,authorize,policy,128,128,2,0ms,true);
+            SqliteActorSync admin(strict_db);
+            assert(admin.set_principal_policy(a,"alice",1,0,true)==1);
+            assert(admin.set_principal_policy(a,"bob",1,0,true)==1);
+            auto alice=gateway.issue("alice",a,1,30s);
+            auto bob=gateway.issue("bob",a,1,30s);
+            assert(gateway.admit(alice,"strict",2).get().sequence>0);
+            assert(gateway.admit(bob,"strict",3).get().sequence>0);
+            assert(admin.set_principal_policy(a,"alice",1,1,false)==2);
+        }
+        {
+            CounterPrincipalGateway gateway(signed_deployment,strict_db,authorize,policy,128,128,2,10ms,true);
+            SqliteActorSync admin(strict_db);
+            const auto until=CounterDirectory::Clock::now()+5s;
+            while(!admin.pending_mail().empty() && CounterDirectory::Clock::now()<until)
+                std::this_thread::sleep_for(5ms);
+            assert(admin.pending_mail().empty() && !gateway.mail_fault());
+            assert(admin.snapshot(a).bytes=="3" && admin.snapshot(a).revision==1);
+            auto bob=gateway.issue("bob",a,1,30s);
+            assert(gateway.admit(bob,"strict",3).get().receipt->reply=="3");
+            assert(admin.set_principal_policy(a,"alice",1,2,true)==3);
+            auto alice=gateway.issue("alice",a,1,30s);
+            assert(gateway.admit(alice,"strict",2).get().authorization_denied);
+        }
         // A populated legacy store must not be implicitly adopted.
         const auto legacy_db=std::string(tmp)+"/legacy-deployment.db";
         {CounterDirectory legacy(legacy_db,runner,auth);
