@@ -544,5 +544,46 @@ int main() {
             assert(admin.snapshot(a).revision==0 && admin.snapshot(c).bytes=="1");
         }
     }
+    // Two tenant lanes: a held alarm must not block another tenant.
+    // The mailbox successor on the held object's lane cannot overtake it.
+    {
+        using namespace std::chrono_literals;
+        const auto db2=std::string(dir)+"/concurrent-alarms.db";
+        const SyncKey hot{"a-hot","counters","Counter","held"};
+        const SyncKey quiet{"z-quiet","counters","Counter","healthy"};
+        const auto scope=[](const SyncKey&){return true;};
+        {
+            CounterDirectory directory(db2,CounterDirectory::KeyedGuest(
+                [](const SyncKey&,I n,I,I d)->I{return n+d;}),scope);
+            directory.set_alarm(hot,0,0).get();
+            directory.set_alarm(quiet,0,1).get();
+        }
+        std::promise<void> entered,release;
+        auto ready=entered.get_future();auto gate=release.get_future();
+        std::atomic<int> held_calls{0};
+        {
+            CounterDirectory directory(db2,CounterDirectory::KeyedGuest(
+                [&](const SyncKey& k,I n,I,I d)->I{
+                    if(k.tenant==hot.tenant && ++held_calls==1){entered.set_value();gate.wait();}
+                    return n+d;
+                }),scope,16,4,2,10ms,10ms,0ms);
+            SqliteActorSync observer(db2);
+            const bool began=ready.wait_for(3s)==std::future_status::ready;
+            bool progressed=false,queued=false;
+            std::future<CounterDirectory::Reply> successor;
+            try {
+                successor=directory.send(hot,"after-alarm",1,2);
+                const auto until=CounterDirectory::Clock::now()+3s;
+                while(observer.snapshot(quiet).revision==0 && CounterDirectory::Clock::now()<until)
+                    std::this_thread::sleep_for(5ms);
+                progressed=observer.snapshot(quiet).bytes=="1";
+                queued=successor.wait_for(0ms)!=std::future_status::ready && observer.snapshot(hot).revision==0;
+            } catch(...) {release.set_value();throw;}
+            release.set_value();
+            assert(began && progressed && queued);
+            assert(successor.get()->reply=="3" && held_calls==2);
+            assert(!directory.alarm_fault() && observer.due_alarms(1).empty());
+        }
+    }
     std::filesystem::remove_all(dir);
 }
