@@ -78,6 +78,41 @@ int main(int argc,char** argv) {
         assert(directory.admit(a,"after",1,2).get().receipt->reply=="2");
     }
     assert(::waitpid(-1,&status,WNOHANG)==-1 && errno==ECHILD);
+    // Compile-once scalar guest, atomic host-proposed state/alarm effect.
+    // Reopening must replay the receipt without changing the deadline.
+    {
+        const auto alarm_db=std::string(tmp)+"/atomic-alarm.db";
+        const SyncAlarmChange schedule{0,0};
+        {
+            CounterDirectory directory(alarm_db,runner,auth);
+            auto receipt=directory.send_with_alarm(a,"schedule",1,2,schedule).get();
+            assert(receipt && receipt->reply=="2" && !receipt->duplicate);
+        }
+        {
+            CounterDirectory directory(alarm_db,runner,auth);
+            auto replay=directory.send_with_alarm(a,"schedule",1,2,schedule).get();
+            assert(replay && replay->reply=="2" && replay->duplicate);
+            bool denied=false;
+            try {(void)directory.send_with_alarm(a,"schedule",1,2,SyncAlarmChange{0,1}).get();}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            denied=false;
+            try {(void)directory.send(a,"schedule",1,2).get();}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            SqliteActorSync observer(alarm_db);
+            assert(observer.snapshot(a).revision==1 && observer.due_alarms(0).size()==1);
+        }
+        {
+            CounterDirectory directory(alarm_db,runner,auth,16,4,1,10ms,10ms,0ms);
+            SqliteActorSync observer(alarm_db);
+            const auto until=CounterDirectory::Clock::now()+5s;
+            while(!observer.due_alarms(0).empty() && CounterDirectory::Clock::now()<until)
+                std::this_thread::sleep_for(5ms);
+            assert(observer.due_alarms(0).empty() && !directory.alarm_fault());
+            assert(observer.snapshot(a).revision==2 && observer.snapshot(a).bytes=="3");
+        }
+    }
     // Real compiled fuel worker with host-selected, tenant-scoped artifacts.
     if(fuel) {
         using Binding=CounterArtifactRegistry::Binding;
