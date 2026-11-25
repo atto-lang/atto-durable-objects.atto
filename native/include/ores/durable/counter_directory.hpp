@@ -218,6 +218,7 @@ private:
     // already submitted turns before leaving the supervisor.
     void mail_loop(Clock::duration interval,std::size_t worker_count) noexcept {
         std::map<Key,std::future<Reply>> in_flight;
+        std::string last_tenant;
         std::exception_ptr fault;
         auto collect=[&](bool drain) {
             for(auto it=in_flight.begin();it!=in_flight.end();) {
@@ -239,7 +240,7 @@ private:
                 collect(false);
                 if(fault) break;
                 if(in_flight.size()>=worker_count) continue;
-                for(const auto& mail:store_.pending_mail(256,unix_ms())) {
+                for(const auto& mail:store_.fair_pending_mail(256,unix_ms(),last_tenant)) {
                     {
                         std::lock_guard<std::mutex> lock(mail_mu_);
                         if(mail_stop_) break;
@@ -247,6 +248,9 @@ private:
                     if(in_flight.size()>=worker_count) break;
                     const auto id=identity(mail.key);
                     if(in_flight.find(id)!=in_flight.end()) continue;
+                    // Rotate even on queue/activation saturation; do not
+                    // let one tenant monopolize subsequent bounded scans.
+                    last_tenant=mail.key.tenant;
                     // Allocate tracking before enqueue, so allocation failure
                     // cannot leave an untracked accepted future.
                     auto inserted=in_flight.try_emplace(id);
