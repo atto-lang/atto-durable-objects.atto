@@ -324,6 +324,53 @@ restart deduplication and pending-mail recovery under identical deployment,
 and rejects changed configuration and legacy fallback. These are authored
 tests, not a Wave 14 execution receipt.
 
+### Principal-bound alarm authorization (Wave 23 candidate)
+
+Strict principal mode now supports a trusted operator scheduling path
+`schedule_principal_alarm(key, generation, due, principal, operator_id, authorize_operator)`.
+The operator callback must authenticate the operator and independently
+authorize the exact object, principal and scheduling action. It is not
+a network endpoint or an ordinary principal capability. The scalar
+alarm handler increments by one, so the scheduler requires the existing
+exact-object op=1 grant and persists its version, principal, operator
+identity and alarm generation atomically with the deadline. Missing grants
+deny scheduling. The captured grant version is deliberately not refreshed
+on dispatch: revocation followed by regrant invalidates the old generation.
+An operator must explicitly schedule a fresh generation.
+
+The signed deployment can opt into an alarm poll interval in strict mode
+with its trusted scope/principal policy. Startup rejects unbound legacy
+pending alarms rather than retroactively assigning authority. The scheduler
+checks the external scope/principal policy before guest entry and after
+return, and SQLite checks the exact bound principal, generation and
+persisted grant again in the same write transaction as state, receipt,
+outbox and alarm consumption. A revocation committed first prevents
+that generation from committing; a commit ordered first remains committed.
+Policy denial marks the exact generation denied and clears the deadline
+without a successful receipt or actor state change. A stale scan cannot
+cancel a replacement generation. Latest-generation authority/status
+(pending, fired, denied) is available to trusted diagnostics; this is not
+an append-only alarm audit.
+
+The operator callback itself is not transactionally versioned, and
+revocation cannot retroactively undo committed work. A pure scalar guest
+may execute speculatively during a race but cannot commit against a revoked
+persisted grant. General guest effects, principal-bound atomic state plus
+alarm scheduling, cancellation grants, durable alarm attempts/backoff and
+fair concurrent alarm dispatch remain separate future work. Unknown alarm
+faults still stop the poller and preserve pending work; no automatic retry
+or liveness guarantee is claimed. Existing standalone raw alarm mutations
+remain forbidden in strict mode. Older writer binaries must not be used.
+
+Storage tests cover missing grant, forged binding, restart, revoke/regrant,
+stale-generation denial, atomic rollback and fired status. A host test
+holds the executing alarm while an independent admin connection revokes
+and restores its permission; the independent authorized alarm must
+progress. A signed-deployment compiled guest test exercises denied and
+authorized alarms after restart. These are authored tests, not executed
+Wave 23 receipts. Storage pin:
+`904a4d90563ddf956998a1d1d4d51b1a50d6fd`.
+
 ### Atomic state and alarm scheduling (Wave 22 candidate)
 
 The trusted scalar counter host may submit an exclusive non-principal turn
@@ -341,10 +388,7 @@ snapshot, receipt history, outbox and alarm unchanged.
 This is a trusted host-proposed alarm effect, not a new compiled guest
 effect ABI or a durable mailbox scheduling command. The compiled scalar
 guest still only computes the counter transition. The principal gateway
-does not expose the new API. Strict transactional policy rejects standalone
-alarm mutations and startup with pending alarms, as well as alarm state
-commits; the next authorization design must persist the scheduling principal,
-exact alarm grant and generation, and revalidate at firing/commit.
+does not expose the new API. Wave 22 strict transactional policy rejected alarms; Wave 23 adds a separate principal-bound trusted operator path as described above. Unbound pending alarms and raw alarm mutations remain forbidden.
 Do not use older writer binaries or bypass the trusted host boundary.
 
 Storage tests cover injected rollback, a fork exiting after commit before
