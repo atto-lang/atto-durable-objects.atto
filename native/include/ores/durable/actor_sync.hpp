@@ -50,7 +50,7 @@ struct SyncMail {
     SyncKey key;
     std::int64_t sequence;
     std::string operation_id, command, schema;
-    std::int64_t failures=0, retry_at_ms=0;
+    std::int64_t failures=0, retry_at_ms=0, attempt_epoch=0;
 };
 struct SyncAdmission {
     std::int64_t sequence; // 0 means already completed
@@ -160,6 +160,9 @@ public:
                  "sequence INTEGER PRIMARY KEY, failures INTEGER NOT NULL CHECK(failures BETWEEN 1 AND 3),"
                  "retry_at_ms INTEGER NOT NULL CHECK(retry_at_ms>=0), dead INTEGER NOT NULL CHECK(dead IN (0,1)),"
                  "CHECK((dead=1 AND failures=3) OR (dead=0 AND failures<3)),"
+                 "FOREIGN KEY(sequence) REFERENCES sync_inbox(sequence) ON DELETE CASCADE)");
+            exec("CREATE TABLE IF NOT EXISTS sync_mail_attempt("
+                 "sequence INTEGER PRIMARY KEY, epoch INTEGER NOT NULL CHECK(epoch>0),"
                  "FOREIGN KEY(sequence) REFERENCES sync_inbox(sequence) ON DELETE CASCADE)");
             exec("CREATE TABLE IF NOT EXISTS sync_projection("
                  "consumer TEXT NOT NULL, tenant TEXT NOT NULL, space TEXT NOT NULL,"
@@ -445,8 +448,9 @@ public:
         if(limit==0 || limit>256 || now_ms<0) throw std::invalid_argument("invalid mailbox scan");
         std::lock_guard<std::mutex> lock(mu_);
         Statement read(db_,"SELECT m.tenant,m.space,m.actor_type,m.id,m.sequence,m.op_id,m.command,m.schema_fp,"
-            "COALESCE(r.failures,0),COALESCE(r.retry_at_ms,0) FROM sync_inbox AS m "
+            "COALESCE(r.failures,0),COALESCE(r.retry_at_ms,0),COALESCE(a.epoch,0) FROM sync_inbox AS m "
             "LEFT JOIN sync_mail_retry r ON r.sequence=m.sequence "
+            "LEFT JOIN sync_mail_attempt a ON a.sequence=m.sequence "
             "WHERE COALESCE(r.dead,0)=0 AND COALESCE(r.retry_at_ms,0)<=? "
             "AND NOT EXISTS(SELECT 1 FROM sync_inbox AS p LEFT JOIN sync_mail_retry pr ON pr.sequence=p.sequence "
             "WHERE p.tenant=m.tenant AND p.space=m.space AND p.actor_type=m.actor_type AND p.id=m.id "
@@ -454,7 +458,7 @@ public:
         read.i64(1,now_ms);read.i64(2,static_cast<std::int64_t>(limit));
         std::vector<SyncMail> result;
         while(read.step()==SQLITE_ROW) {
-            SyncMail m{{read.str(0),read.str(1),read.str(2),read.str(3)},read.number(4),read.str(5),read.blob(6),read.str(7),read.number(8),read.number(9)};
+            SyncMail m{{read.str(0),read.str(1),read.str(2),read.str(3)},read.number(4),read.str(5),read.blob(6),read.str(7),read.number(8),read.number(9),read.number(10)};
             validate_key(m.key);label(m.operation_id);label(m.schema);
             bounded(m.command,limits_.command_bytes);result.push_back(std::move(m));
         }
@@ -470,14 +474,35 @@ public:
         tx.commit();return pending;
     }
 
-    // Record only a classified guest failure AFTER the guest has stopped.
+    // Persist a dispatch marker BEFORE running a guest. The trusted controller
+    // must hold the exclusive turn and establish physical retirement before
+    // recovery of an older epoch. Marker and failure/commit are atomic with
+    // their respective transactions; a crash before launch can spend budget.
+    SyncMail begin_mail(const SyncMail& mail,std::int64_t epoch,std::int64_t now_ms) {
+        validate_key(mail.key);
+        if(epoch<=0 || mail.attempt_epoch!=0 || now_ms<0 || now_ms<mail.retry_at_ms)
+            throw std::invalid_argument("invalid mailbox attempt");
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this);
+        if(snapshot_locked(mail.key).epoch!=epoch || !mail_matches_locked(mail))
+            throw std::logic_error("stale mailbox attempt");
+        Statement write(db_,"INSERT INTO sync_mail_attempt VALUES(?,?)");
+        write.i64(1,mail.sequence);write.i64(2,epoch);write.done();
+        tx.commit();
+        auto started=mail;started.attempt_epoch=epoch;return started;
+    }
+
+    // Record a classified stopped-guest failure, or resolve a surviving
+    // marker after the trusted controller has retired the previous owner.
+    // Unmarked legacy host calls remain supported; they cannot bypass a marker.
     // Exact head/attempt CAS prevents stale retry tokens from consuming budget.
     // Fixed policy v1: two retries, 100ms then 200ms; third failure is terminal.
     // No state, success receipt or outbox mutation in this transaction.
     bool fail_mail(const SyncMail& mail,std::int64_t epoch,std::int64_t now_ms) {
         validate_key(mail.key);
         if(epoch<=0 || now_ms<0 || mail.failures<0 || mail.failures>=3 ||
-           now_ms<mail.retry_at_ms || now_ms>std::numeric_limits<std::int64_t>::max()-200)
+           now_ms<mail.retry_at_ms || mail.attempt_epoch<0 || mail.attempt_epoch>epoch ||
+           now_ms>std::numeric_limits<std::int64_t>::max()-200)
             throw std::invalid_argument("invalid mail failure envelope");
         std::lock_guard<std::mutex> lock(mu_);
         Tx tx(*this);
@@ -490,6 +515,11 @@ public:
             Statement write(db_,"INSERT INTO sync_mail_retry VALUES(?,?,?,?) "
                 "ON CONFLICT(sequence) DO UPDATE SET failures=excluded.failures,retry_at_ms=excluded.retry_at_ms,dead=excluded.dead");
             write.i64(1,mail.sequence);write.i64(2,failures);write.i64(3,retry_at);write.i64(4,dead?1:0);write.done();
+        }
+        if(mail.attempt_epoch!=0) {
+            Statement clear(db_,"DELETE FROM sync_mail_attempt WHERE sequence=? AND epoch=?");
+            clear.i64(1,mail.sequence);clear.i64(2,mail.attempt_epoch);clear.done();
+            if(sqlite3_changes(db_)!=1) throw std::logic_error("lost mailbox attempt marker");
         }
         tx.commit();return dead;
     }
@@ -539,7 +569,7 @@ public:
             }
         }
         if (replay) { tx.commit(); return *replay; }
-        if(mail && !mail_matches_locked(*mail))
+        if(mail && ((mail->attempt_epoch!=0 && mail->attempt_epoch!=epoch) || !mail_matches_locked(*mail)))
             throw std::logic_error("mail is not the current FIFO head");
         if(!mail) {
             Statement pending(db_,"SELECT 1 FROM sync_inbox WHERE tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?");
@@ -804,13 +834,14 @@ private:
         return static_cast<std::size_t>(read.number(0));
     }
     bool mail_matches_locked(const SyncMail& mail) {
-        Statement read(db_,"SELECT m.sequence,m.op_id,m.command,m.schema_fp,COALESCE(r.failures,0),COALESCE(r.retry_at_ms,0) "
+        Statement read(db_,"SELECT m.sequence,m.op_id,m.command,m.schema_fp,COALESCE(r.failures,0),COALESCE(r.retry_at_ms,0),COALESCE(a.epoch,0) "
             "FROM sync_inbox m LEFT JOIN sync_mail_retry r ON r.sequence=m.sequence "
+            "LEFT JOIN sync_mail_attempt a ON a.sequence=m.sequence "
             "WHERE m.tenant=? AND m.space=? AND m.actor_type=? AND m.id=? AND COALESCE(r.dead,0)=0 ORDER BY m.sequence LIMIT 1");
         bind_key(read,mail.key);
         return read.step()==SQLITE_ROW && read.number(0)==mail.sequence &&
             read.str(1)==mail.operation_id && read.blob(2)==mail.command && read.str(3)==mail.schema &&
-            read.number(4)==mail.failures && read.number(5)==mail.retry_at_ms;
+            read.number(4)==mail.failures && read.number(5)==mail.retry_at_ms && read.number(6)==mail.attempt_epoch;
     }
     bool alarm_matches_locked(const SyncAlarm& alarm,std::int64_t now_ms) {
         Statement read(db_,"SELECT 1 FROM sync_alarms WHERE tenant=? AND space=? AND actor_type=? AND id=? "
