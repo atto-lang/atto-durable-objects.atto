@@ -31,6 +31,12 @@ public:
     using Reply = std::optional<SyncCommit>;
     using Authorize = std::function<bool(const SyncKey&)>;
     using Clock = std::chrono::steady_clock;
+    // Trusted runner signals a classified failure only after guest execution
+    // has physically stopped. Never use for database/ownership/unknown errors.
+    class RetryableGuestFailure final : public std::runtime_error {
+    public:
+        RetryableGuestFailure():std::runtime_error("classified guest failure"){}
+    };
 private:
     using Key = std::tuple<std::string,std::string,std::string,std::string>;
     struct Lane {
@@ -145,7 +151,18 @@ private:
             validate(mail.key);
             const auto epoch=activate(id,mail.key);
             try {
-                auto r=CounterTurn::run_mail(store_,mail,epoch,guest_);
+                if(unix_ms()<mail.retry_at_ms || !store_.mail_pending(mail,epoch))
+                    return Reply{};
+                Reply r;
+                try {
+                    r=CounterTurn::run_mail(store_,mail,epoch,guest_);
+                } catch(const RetryableGuestFailure&) {
+                    validate(mail.key);
+                    // No user exception text is persisted. Store checks the
+                    // current epoch and exact attempt before advancing budget.
+                    (void)store_.fail_mail(mail,epoch,unix_ms());
+                    return Reply{};
+                }
                 validate(mail.key);
                 if(store_.snapshot(mail.key).epoch!=epoch) throw std::logic_error("stale mail publication epoch");
                 return r;
@@ -162,7 +179,7 @@ private:
                     std::unique_lock<std::mutex> lock(mail_mu_);
                     if(mail_wake_.wait_for(lock,interval,[&]{return mail_stop_;})) return;
                 }
-                for(const auto& mail:store_.pending_mail(64)) {
+                for(const auto& mail:store_.pending_mail(64,unix_ms())) {
                     {
                         std::lock_guard<std::mutex> lock(mail_mu_);
                         if(mail_stop_) return;
