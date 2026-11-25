@@ -324,6 +324,41 @@ restart deduplication and pending-mail recovery under identical deployment,
 and rejects changed configuration and legacy fallback. These are authored
 tests, not a Wave 14 execution receipt.
 
+### Authorized atomic mailbox and alarm effects (Wave 25 candidate)
+
+Strict signed-deployment hosts may use `admit_with_alarm` with a trusted
+operator-and-principal authorization callback, an authenticated principal,
+an increment, and an explicit expected alarm generation/deadline/operator
+identity. This is not exposed to ordinary principal capabilities. The
+canonical command extension retains the immutable effect in the durable
+inbox, receipt and terminal archive, including its operator identity.
+An exact retry resolves the prior admission or receipt; a changed or
+omitted effect conflicts with the original command. The current persisted
+increment grant is required at admission and dispatch and its attempt
+version is checked in the commit transaction. That same version is bound
+to the installed alarm. The operator callback authorizes admission, not
+an independently transactionally revocable operator grant.
+
+State, receipt, outbox, inbox consumption, alarm generation/deadline and
+principal alarm authority are committed atomically. An overflow consumes
+the mail with its rejected receipt and does not apply the effect. A stale
+alarm generation rolls back the entire proposed state change and terminally
+dead-letters the exact mail without an authorization-denied flag. This
+uses the existing terminal retry sentinel (not evidence of three actual
+guest failures). Effect-bearing dead letters cannot be redriven; a fresh
+authorized request with a new expected generation is required.
+No cancellation grant, arbitrary guest effects, or external effects are
+implemented. This trusted host command is not a new AttoLang guest ABI.
+
+Storage regressions cover exact replay, omitted effects, rollback, grant
+revoke/regrant, stale generation, terminal redrive rejection and overflow.
+A signed deployment compiled-guest regression admits the effect, restarts
+before mailbox execution, replays the receipt, restarts before alarm firing,
+and verifies the alarm commits once. New tests are authored, not executed.
+Storage pin: `f9c19f9370d7f613302c2772ccab39f8b9f33b57`.
+Wave 22 [run 45672643607](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45672643607)
+completed both integration jobs successfully; Waves 23–24 were still queued.
+
 ### Crash-counted alarm attempts and bounded retries (Wave 24 candidate)
 
 The trusted runtime persists a generation-scoped attempt marker before
