@@ -110,6 +110,10 @@ public:
 
 // Persistent rolling admission budget. Each admitted guest start is
 // conservatively charged a full worker envelope; no refund on crash.
+class GuestRateExhausted final : public std::length_error {
+public:
+    explicit GuestRateExhausted(const char* reason):std::length_error(reason){}
+};
 struct SyncGuestRate {
     std::int64_t window_ms=0,starts=0;
 };
@@ -383,12 +387,12 @@ public:
             Statement count(db_,"SELECT COUNT(*) FROM sync_guest_charges WHERE tenant=?");
             count.text(1,tenant);
             if(count.step()!=SQLITE_ROW || count.number(0)>=starts)
-                throw std::length_error("tenant rolling guest budget exhausted");
+                throw GuestRateExhausted("tenant rolling guest budget exhausted");
         }
         {
             Statement count(db_,"SELECT COUNT(*) FROM sync_guest_charges");
             if(count.step()!=SQLITE_ROW || count.number(0)>=65536)
-                throw std::length_error("database rolling guest budget exhausted");
+                throw GuestRateExhausted("database rolling guest budget exhausted");
         }
         {
             Statement write(db_,"INSERT INTO sync_guest_charges(tenant,charged_ms) VALUES(?,?)");
