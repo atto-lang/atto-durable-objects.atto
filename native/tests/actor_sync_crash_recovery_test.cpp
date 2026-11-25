@@ -864,5 +864,71 @@ int main() {
         admin.set_principal_policy(k,"alice",1,3,false);
         assert(store.snapshot(k).revision==1);
     }
+    // Crash after durable alarm dispatch, before a guest result exists.
+    // Recovery consumes that attempt once, then bounded retry exhausts
+    // the generation without manufacturing a committed state or receipt.
+    {
+        const auto db2=std::string(dir)+"/alarm-attempt.db";
+        const SyncKey k{"tenant","mail","Counter","retry-alarm"};
+        const SyncKey healthy{"tenant","mail","Counter","healthy-alarm"};
+        {
+            SqliteActorSync store(db2);
+            store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+            auto epoch=store.activate_next(k);
+            auto he=store.activate_next(healthy);
+            store.set_principal_policy(k,"alice",1,0,true);
+            store.set_principal_policy(healthy,"bob",1,0,true);
+            store.set_principal_alarm(k,epoch,0,0,"alice","operator");
+            store.set_principal_alarm(healthy,he,0,1,"bob","operator");
+        }
+        const pid_t child=fork();assert(child>=0);
+        if(child==0) {
+            try {
+                SqliteActorSync store(db2);
+                auto epoch=store.activate_next(k);
+                auto a=store.due_alarms(0)[0];
+                auto started=store.begin_alarm(a,epoch,0);
+                if(started.attempt_epoch!=epoch) _exit(64);
+                _exit(63);
+            } catch(...) {_exit(64);}
+        }
+        check_exit(child,63);
+        SqliteActorSync store(db2);
+        auto epoch=store.activate_next(k);
+        auto abandoned=store.due_alarms(0)[0];
+        assert(abandoned.attempt_epoch<epoch && abandoned.attempt_epoch>0 && abandoned.failures==0);
+        assert(!store.fail_alarm(abandoned,epoch,0));
+        assert(store.due_alarms(0).empty());
+        bool denied=false;
+        try {store.fail_alarm(abandoned,epoch,0);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        auto h=store.due_alarms(1)[0];
+        assert(h.key.object_id==healthy.object_id);
+        auto he=store.snapshot(healthy).epoch;
+        h=store.begin_alarm(h,he,1);
+        assert(store.commit(healthy,he,0,"@alarm:1","alarm:1","counter","1","1",false,&h,1).revision==1);
+        assert(store.due_alarms(99).empty());
+        auto retry=store.due_alarms(100)[0];
+        assert(retry.due_ms==0 && retry.failures==1 && retry.attempt_epoch==0);
+        retry=store.begin_alarm(retry,epoch,100);
+        assert(!store.fail_alarm(retry,epoch,100));
+        assert(store.due_alarms(299).empty());
+        retry=store.begin_alarm(store.due_alarms(300)[0],epoch,300);
+        assert(store.fail_alarm(retry,epoch,300));
+        assert(store.due_alarms(1000).empty());
+        assert(store.principal_alarm_authority(k)->status==SyncAlarmStatus::failed);
+        assert(store.snapshot(k).revision==0 && store.changes_after(k,0).empty());
+        assert(!store.lookup_receipt(k,epoch,"@alarm:1","alarm:0","counter"));
+        SqliteActorSync reopened(db2);
+        reopened.bind_principal_namespace(true);reopened.bind_transactional_policy(true);
+        assert(reopened.principal_alarm_authority(k)->status==SyncAlarmStatus::failed);
+        assert(reopened.set_principal_alarm(k,epoch,1,400,"alice","operator")==2);
+        auto fresh=reopened.due_alarms(400)[0];
+        assert(fresh.generation==2 && fresh.failures==0 && fresh.attempt_epoch==0);
+        fresh=reopened.begin_alarm(fresh,epoch,400);
+        assert(reopened.commit(k,epoch,0,"@alarm:2","alarm:400","counter","1","1",false,&fresh,400).revision==1);
+        assert(reopened.principal_alarm_authority(k)->status==SyncAlarmStatus::fired);
+    }
     std::filesystem::remove_all(dir);
 }
