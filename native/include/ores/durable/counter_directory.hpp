@@ -5,6 +5,11 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <filesystem>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <future>
 #include <map>
 #include <mutex>
@@ -14,8 +19,9 @@
 #include <vector>
 
 namespace ores::durable {
-// Trusted single-controller prototype. Exclusive process ownership of the
-// store is an external prerequisite. No distributed lease election.
+// Trusted single-host controller prototype. Cooperative local ownership
+// uses a persistent advisory lock file in a trusted directory. Raw store
+// users must honor this policy. No distributed lease election.
 // Guest and authorization callbacks must be thread-safe and terminate.
 // Never invoke directory methods recursively from either callback.
 class CounterDirectory final {
@@ -32,6 +38,36 @@ private:
         std::int64_t epoch=0; // only its executing turn can install an epoch
         Clock::time_point idle_since=Clock::now();
     };
+    // Lock lifetime spans all workers and the SQLite store. Never unlink the
+    // lock file: unlink/recreate can give two controllers different inodes.
+    // Trusted local directory only; not safe against hostile path replacement.
+    class ControllerLock {
+        std::string db_;
+        int fd_=-1;
+    public:
+        explicit ControllerLock(const std::string& db) {
+            if(db.empty() || db.find('\0')!=std::string::npos)
+                throw std::invalid_argument("invalid controller database path");
+            db_=std::filesystem::weakly_canonical(std::filesystem::absolute(db)).string();
+            struct stat st{};
+            if(::stat(db_.c_str(),&st)==0 && (!S_ISREG(st.st_mode) || st.st_nlink!=1))
+                throw std::logic_error("database must be a regular unaliased file");
+            const auto lock=db_+".controller.lock";
+            fd_=::open(lock.c_str(),O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK,0600);
+            if(fd_<0) throw std::runtime_error("controller lock open failed");
+            if(::fstat(fd_,&st)!=0 || !S_ISREG(st.st_mode) || st.st_nlink!=1 ||
+               st.st_uid!=::geteuid() || (st.st_mode & 0077)!=0 ||
+               ::flock(fd_,LOCK_EX|LOCK_NB)!=0) {
+                ::close(fd_);fd_=-1;
+                throw std::logic_error("controller lock denied");
+            }
+        }
+        ControllerLock(const ControllerLock&)=delete;
+        ControllerLock& operator=(const ControllerLock&)=delete;
+        ~ControllerLock(){if(fd_>=0)::close(fd_);}
+        const std::string& path() const noexcept {return db_;}
+    };
+    ControllerLock owner_;
     SqliteActorSync store_;
     const Guest guest_;
     const Authorize authorize_;
@@ -159,7 +195,7 @@ public:
                      std::size_t capacity=128,std::size_t active_limit=128,
                      std::size_t workers=1,
                      Clock::duration idle_timeout=Clock::duration::zero())
-        : store_(db),guest_(std::move(guest)),authorize_(std::move(authorize)),
+        : owner_(db),store_(owner_.path()),guest_(std::move(guest)),authorize_(std::move(authorize)),
           capacity_(capacity),active_limit_(active_limit),idle_timeout_(idle_timeout) {
         if(!guest_ || !authorize_ || !capacity_ || !active_limit_ ||
            !workers || workers>64 || idle_timeout_<Clock::duration::zero())
