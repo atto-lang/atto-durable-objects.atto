@@ -30,6 +30,35 @@ public:
         return n;
     }
 
+    // Alarm v0: deterministic increment by one using the same admitted
+    // guest transition. A terminal domain overflow is consumed with an
+    // explicit rejected receipt, not retried forever. No arbitrary effects.
+    template<class Guest>
+    static std::optional<SyncCommit> run_alarm(SqliteActorSync& store,const SyncAlarm& alarm,
+                                               std::int64_t epoch,std::int64_t now_ms,Guest&& guest) {
+        if(alarm.key.actor_type!="Counter") throw std::invalid_argument("unexpected alarm actor type");
+        if(!store.alarm_pending(alarm,epoch,now_ms)) return std::nullopt;
+        const auto snapshot=store.snapshot(alarm.key);
+        if(snapshot.epoch!=epoch) throw std::logic_error("stale alarm owner");
+        std::int64_t committed=0;
+        if(snapshot.revision==0) {
+            if(!snapshot.schema.empty() || !snapshot.bytes.empty())
+                throw std::logic_error("unexpected uninitialized snapshot");
+        } else {
+            if(snapshot.schema!=schema) throw std::logic_error("counter schema migration required");
+            committed=decode(snapshot.bytes);
+        }
+        const auto next=guest(committed,1,1);
+        const bool overflow=committed==maximum;
+        if((overflow && next!=-1) || (!overflow && next!=committed+1))
+            throw std::logic_error("invalid alarm guest transition");
+        const auto state=std::to_string(overflow?committed:next);
+        const std::string reply=overflow?"alarm_overflow":state;
+        return store.commit(alarm.key,epoch,snapshot.revision,
+            SqliteActorSync::alarm_operation_id(alarm.generation),
+            "alarm:"+std::to_string(alarm.due_ms),schema,state,reply,false,&alarm,now_ms);
+    }
+
     // Guest runner receives a copied scalar and produces a proposed value.
     // It cannot commit, emit receipts or see SQLite handles through this API.
     // -1 = application rejection, not a committed result. Transport errors
