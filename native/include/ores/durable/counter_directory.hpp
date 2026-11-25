@@ -367,7 +367,7 @@ public:
                      Clock::duration idle_timeout=Clock::duration::zero(),
                      Clock::duration alarm_interval=Clock::duration::zero(),
                      Clock::duration mail_interval=Clock::duration::zero(),
-                     std::string deployment_manifest={})
+                     std::string deployment_manifest={},bool principal_mode=false)
         : owner_(db),store_(owner_.path()),guest_(std::move(guest)),
           deployment_manifest_(std::move(deployment_manifest)),authorize_(std::move(authorize)),
           capacity_(capacity),active_limit_(active_limit),idle_timeout_(idle_timeout) {
@@ -377,6 +377,7 @@ public:
             throw std::invalid_argument("invalid directory configuration");
         // Reject changed or missing deployment before any activation or replay.
         store_.bind_deployment(deployment_manifest_);
+        store_.bind_principal_namespace(principal_mode);
         workers_.reserve(workers);
         try {
             for(std::size_t i=0;i<workers;++i) workers_.emplace_back([this]{loop();});
