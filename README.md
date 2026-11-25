@@ -73,3 +73,11 @@ require execution on the merged tree before CI/merge readiness can be claimed.
 See [native API proposal](docs/API_V0.md) and
 [LLVM integration gates](docs/LLVM_INTEGRATION.md). The optional LLVM adapter
 has not been compiled against the private LLVM integration branch.
+
+## Legacy migration and verification gates
+
+The archived predecessor is [ores-truffle-oreslang/oreslang-durable-objects.ores](https://github.com/ores-truffle-oreslang/oreslang-durable-objects.ores). This repository is maintained at [atto-lang/atto-durable-objects.atto](https://github.com/atto-lang/atto-durable-objects.atto); do not infer an ID-preserving transfer or source parity from naming or imported history. Preserve working legacy `.ores` inputs and package/CLI aliases until their compiler-backed `.atto` replacements and consumers are verified.
+
+Guest-level durable object identity, actor execution/storage contracts and tenant-fencing fixtures belong here; commercial hosted durable-object control planes, billing and storage administration do not. [atto-lang](https://github.com/atto-lang) owns language, portable libraries, compilers, tooling, tests and examples; [atto-co](https://github.com/atto-co) separately governs hosted deployment, tenant infrastructure, identity and billing. Future transfers or carve-outs require separate source/target owner authorization, independent security review and rollback ownership. Inventory exact SHA/tree, numeric ID, history, access, visibility, protections, PRs, releases, packages, consumers, Actions/runners, secrets, applications, webhooks, deploy keys and Pages. Never mirror private source without explicit authorization. Verify identity/history and restored controls after any authorized transfer, then execute exact-head tests before changing consumers. Zero-step jobs are NOT_EXECUTED; host-only checks do not establish compiled guest execution or production readiness.
+
+Historical planning: [coordination issue #26](https://github.com/ores-truffle-oreslang/.github/issues/26) and [migration runbook #25](https://github.com/ores-truffle-oreslang/.github/pull/25).
