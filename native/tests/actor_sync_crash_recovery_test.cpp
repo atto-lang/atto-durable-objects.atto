@@ -101,5 +101,20 @@ int main() {
         const auto replay=recovered.commit(key,2,0,"request-2","credit-2","order.v1","bad","bad");
         assert(replay.duplicate && replay.revision==2 && replay.reply=="receipt-2");
     }
+    // Trusted controller allocates epochs atomically without resetting state.
+    {
+        SqliteActorSync first(db), second(db);
+        assert(first.activate_next(key)==3);
+        assert(second.activate_next(key)==4);
+        assert(first.snapshot(key).epoch==4);
+        assert(first.snapshot(key).revision==2);
+        const SyncKey fresh{"tenant","orders","Order","fresh"};
+        assert(second.activate_next(fresh)==1);
+        assert(first.snapshot(fresh).revision==0);
+        bool denied=false;
+        try { (void)first.lookup_receipt(key,3,"request-2","credit-2","order.v1"); }
+        catch(const std::logic_error&) { denied=true; }
+        assert(denied);
+    }
     std::filesystem::remove_all(dir);
 }
