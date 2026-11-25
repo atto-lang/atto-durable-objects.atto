@@ -324,6 +324,58 @@ restart deduplication and pending-mail recovery under identical deployment,
 and rejects changed configuration and legacy fallback. These are authored
 tests, not a Wave 14 execution receipt.
 
+### Persistent rolling guest-start accounting (Wave 28 candidate)
+
+The signed Linux fuel-worker profile now derives an exact rolling
+guest-start allowance from the smaller of rolling fuel and CPU
+reservation ceilings divided by the fixed per-worker envelope.
+Defaults: 60,000 ms, 6,000,000 fuel and 240 CPU seconds, admitting at
+most 120 starts per tenant per rolling minute (further bounded by
+in-flight slots). Each accepted start charges a full 50,000 fuel and
+2 CPU-second reservation, never refunded after failure or crash.
+This is conservative admission accounting, not measured CPU time,
+RSS or a portable instruction-cost metric. Executions spanning a
+window are still bounded by concurrent reservations but are not
+measured or apportioned across windows.
+
+SQLite persists the exact window/allowance configuration, timestamp
+ledger and clock high-water under a write transaction. Expiry is
+an exact sliding window, not a fixed bucket. Backward clock movement
+cannot reset the budget; forward movement follows the trusted host
+clock. Rows are bounded to 4,096 per tenant and 65,536 per database.
+Changing or disabling an already bound policy fails closed on reopen;
+offline migration is required. Budget policy is per controller database,
+not distributed, signed into the artifact manifest, or resistant to
+database rollback or old writer binaries.
+
+Transient guest invocation charges only when the guest runs, not for
+an exact receipt replay. Mail and alarm dispatch reserve before marking
+an attempt; quota denial leaves pending work and failure counts intact.
+A crash between charge and launch conservatively spends the allowance.
+Typed rate backpressure preserves the current activation; the pollers
+retry according to their existing polling intervals. Metadata-only
+admission/control turns do not consume the guest-start allowance.
+
+Storage regressions cover exact expiry, restart, backward time,
+crash charge retention, cross-connection contention and policy
+downgrade. Host regression requires exact replay free, durable work
+unmarked while throttled, and quiet-tenant progress. Signed compiled
+fuel-guest regression exercises one-start budget, restart and a
+second tenant. A focused local C++/SQLite harness using the ledger
+methods and schema passed normal and ASan/UBSan builds (marker
+FOCUSED_ROLLING_LEDGER_SQLITE_PASS); this is not an exact-tree build
+or the complete runtime suite. New CI head must execute the full
+regressions. Storage pin: `5822a39cbd8fe49200961dcd0d396827c379d16b`.
+
+Wave 26 [run 45679320463](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45679320463)
+passed both integration jobs. Its logs report compiled Node watchdog
+and wasmi fuel receipts with seven reaped failures per test suite,
+Wasm SHA-256
+`8cd298cdfff9a5b0bec56db72871430f29bac91d54fd8cbe6179886f7ecb67c1`.
+Host directory ASan/UBSan and storage recovery markers also passed.
+Wave 27 remained queued at inspection. These historical results
+do not certify Wave 28.
+
 ### Shared tenant resource reservations (Wave 27 candidate)
 
 All transient, durable mailbox, alarm and control turns now share a
