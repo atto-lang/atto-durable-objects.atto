@@ -324,6 +324,44 @@ restart deduplication and pending-mail recovery under identical deployment,
 and rejects changed configuration and legacy fallback. These are authored
 tests, not a Wave 14 execution receipt.
 
+### Bounded dead-letter archival (Wave 21 candidate)
+
+A separately authorized operator can archive terminal principal mail in
+strict mode. The SQLite transaction moves the exact original object key,
+operation ID, command bytes, schema, principal and denial status into
+an immutable archive record with the archiving operator identity.
+Any existing redrive audit is copied into that record before removing
+the inbox row and its dependent retry/principal metadata. A failed
+transaction leaves the original unchanged. Inbox count and command
+byte capacity are released; archived identities remain reserved.
+Exact authorized admission replay returns the same terminal status;
+conflicting replay and state commits under the archived ID are rejected.
+Inspection uses one bounded sequence-ordered page across both stores.
+
+The archive defaults to 65,536 records and 64 MiB of command bytes
+per database, and 4,096 records and 16 MiB per tenant. Reopening with
+insufficient limits and new archives that exceed those limits fail
+closed. No eviction, automatic identity reuse, physical file shrink,
+or total database byte cap is implied. Archive is terminal: unredriven
+archived mail cannot be redriven; a previously recorded redrive remains
+idempotently discoverable by its original authorized operator, subject
+to the current principal grant. Operators must choose redrive before
+archiving if another execution is desired. Local audit records are not
+externally tamper-evident. No compatibility with older writer binaries
+is claimed.
+
+Tests cover capacity release, injected rollback, archived exact replay
+and conflicting reuse, archive exhaustion, merged pagination, restart,
+separate operator archive permission and retained redrive audit.
+The storage pin is `4ba9d0f793c9cc88aa279fe5f572c49d62b4904e`.
+These are authored tests, not executed Wave 21 receipts.
+
+Wave 17 [run 45661384441](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45661384441)
+and Wave 18 [run 45662149576](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45662149576)
+completed both guest and host integration jobs successfully. Wave 19
+host seam passed, guest was in progress at inspection; Wave 20 remained
+queued. These receipts apply to the corresponding historical heads.
+
 ### Operator dead-letter administration (Wave 20 candidate)
 
 The trusted CounterDeadLetterAdmin adapter requires an upstream-authenticated
@@ -339,9 +377,7 @@ Admission and source/replacement/operator audit are committed atomically.
 One redrive per source row; exact retry by the same operator returns its
 original audit result even after replacement completion. Different operators
 cannot silently adopt it. Recovery still checks the current grant at
-attempt and commit. The new audit is bounded to 65,536 rows. Retained
-originals and replacement messages count against quotas; no unsafe purge,
-identity reuse or administrative bypass of the authorization fence.
+attempt and commit. The new audit is bounded to 65,536 rows. Retained inbox originals and replacement messages count against quotas; Wave 21 adds bounded archival with preserved terminal identities. No unsafe purge, identity reuse or administrative bypass of the authorization fence.
 
 Operator policy is a trusted callback, not a network authentication system
 or a transactional revocation guarantee. It is checked before and after
