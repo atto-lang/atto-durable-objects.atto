@@ -182,3 +182,32 @@ ABI in the compiler, then an authenticated single-owner activation manager
 that holds a per-object turn permit across suspended work and publication.
 Do not use epoch rotation as a substitute for exclusive activation or a
 lease authority. SQLite work belongs on isolated bounded I/O workers.
+
+## Wave 4: compile-once scalar ABI (2026-11-24)
+
+Compiler candidate [atto-source.rs#566](https://github.com/atto-lang/atto-source.rs/pull/566)
+at `1d6e8e31453064b6530c5c82679aef3cc9db489b` adds an explicitly
+selected `attoc --durable-scalar-v1 input.atto -o output.wasm` mode.
+The checked typed entry `durable_transition(int,int,int)->int` exports
+`atto_durable_transition_v1` (three i64 arguments, i64 result).
+Ordinary browser compilation has no extra export. The compiler rejects
+heap/state/actor/generator/string/host-import and wrong-signature modules.
+This is a narrow candidate ABI, not a normative durable actor ABI or proof
+that arbitrary code terminates; production guest workers need fuel or
+watchdog, memory ceilings and authenticated artifact admission.
+
+The process integration test now compiles one artifact before any turn
+and instantiates a fresh copy for each of the seven expected evaluations;
+each receipt binds the exact same Wasm SHA-256 and explicit integer inputs.
+The host has no access to guest-owned references or arbitrary callbacks.
+The previous per-turn compilation strategy described above is superseded
+for this test. Existing main-only self-tests remain independent.
+CI pins the compiler candidate and existing #9 storage head; neither
+draft is merged or claimed production-ready.
+
+The prior exact-head run 45519828073 remained queued on inspection,
+so neither the corrected source guest nor the SIGKILL test has a passing
+receipt. The earlier compiler build and host-only result remain historical.
+Next priority after both exact-head lanes run: an authenticated single-host
+virtual directory and exclusive asynchronous scheduling, with durable epoch
+allocation under a real ownership authority; not merely a table of IDs.
