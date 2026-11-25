@@ -54,9 +54,32 @@ progress; epoch checks alone are not an ownership election protocol.
 | Commit-gated counter adapter | [counter_turn.hpp](native/include/ores/durable/counter_turn.hpp), earlier host-only CI passed |
 | Compile-once scalar Wasm entry | [Compiler PR #566](https://github.com/atto-lang/atto-source.rs/pull/566), draft, not executed |
 | Compiled guest to SQLite, hard kill after commit, replay | [Process integration fixture](tests/durable_counter_process_e2e.mjs), not executed |
-| Automatic named activation, exclusive async turns, passivation | Next runtime milestones |
+| Automatic named activation, exclusive FIFO turns, explicit passivation | [Host directory prototype](native/include/ores/durable/counter_directory.hpp), tests authored, not executed |
+| Automatic idle passivation, multi-object scheduling | Planned |
 | Durable alarms, typed RPC and secure transport | Planned |
 | WebSocket hibernation, placement, replication and failover | Planned |
+
+### Virtual actor directory (host prototype)
+
+[CounterDirectory](native/include/ores/durable/counter_directory.hpp) resolves
+the complete tenant/namespace/type/name tuple; a trusted authorization
+callback checks access before admission, at execution and before returning
+the receipt. A dedicated single worker drains a bounded FIFO and lazily
+allocates a durable monotonic activation epoch. Callers receive a host
+future without blocking on SQLite; the queue rejects overflow. Explicit
+passivation is an ordered barrier, so active turns are never evicted and
+the next call loads the committed snapshot under a fresh epoch.
+
+This is a **single-controller** host prototype, not a production tenant
+sandbox or distributed lease manager. The external controller must own the
+store exclusively and provide thread-safe authorization and a terminating
+trusted guest runner. One worker serializes all objects; it does not yet
+prove cross-object concurrency or integrate AttoLang suspensions. Futures
+are host-only and do not grant external publication rights. Idle eviction,
+cancellation, authenticated ingress, durable inbox admission and watchdogs
+remain outstanding. [Directory test](native/tests/counter_directory_test.cpp)
+covers FIFO, quota rejection, replay, explicit passivation and reopen;
+execution is not yet verified.
 
 ### Compile-once candidate ABI
 
