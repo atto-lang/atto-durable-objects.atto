@@ -369,6 +369,34 @@ int main(int argc,char** argv) {
             auto alice=gateway.issue("alice",a,1,30s);
             assert(gateway.admit(alice,"strict",2).get().authorization_denied);
         }
+        // Principal-bound alarms recover under the signed deployment,
+        // reject a stale persisted grant, and execute an independent
+        // authorized alarm with the real compiled scalar guest.
+        const auto strict_alarm_db=std::string(tmp)+"/strict-alarm-gateway.db";
+        const auto alarm_policy=[](std::string_view who,const SyncKey& k,std::int64_t op){
+            return k.tenant=="tenant" && op==1 && (who=="alice" || who=="bob");
+        };
+        {
+            auto directory=signed_deployment.open(strict_alarm_db,authorize,128,128,2,100ms,0ms,0ms,true,alarm_policy,true);
+            SqliteActorSync admin(strict_alarm_db);
+            admin.set_principal_policy(a,"alice",1,0,true);
+            admin.set_principal_policy(b,"bob",1,0,true);
+            assert(directory->schedule_principal_alarm(a,0,0,"alice","operator",[]{}).get()==1);
+            assert(directory->schedule_principal_alarm(b,0,0,"bob","operator",[]{}).get()==1);
+            admin.set_principal_policy(a,"alice",1,1,false);
+            admin.set_principal_policy(a,"alice",1,2,true);
+        }
+        {
+            auto directory=signed_deployment.open(strict_alarm_db,authorize,128,128,2,100ms,10ms,0ms,true,alarm_policy,true);
+            SqliteActorSync admin(strict_alarm_db);
+            const auto until=CounterDirectory::Clock::now()+5s;
+            while(!admin.due_alarms(0).empty() && CounterDirectory::Clock::now()<until)
+                std::this_thread::sleep_for(5ms);
+            assert(admin.due_alarms(0).empty() && !directory->alarm_fault());
+            assert(admin.snapshot(a).revision==0 && admin.snapshot(b).bytes=="1");
+            assert(admin.principal_alarm_authority(a)->status==SyncAlarmStatus::denied);
+            assert(admin.principal_alarm_authority(b)->status==SyncAlarmStatus::fired);
+        }
         // A populated legacy store must not be implicitly adopted.
         const auto legacy_db=std::string(tmp)+"/legacy-deployment.db";
         {CounterDirectory legacy(legacy_db,runner,auth);
