@@ -271,6 +271,40 @@ int main(int argc,char** argv) {
         try {auto raw=signed_deployment.open(gateway_db,authorize);}
         catch(const std::logic_error&) {denied=true;}
         assert(denied);
+        // Durable admission survives capability expiry and gateway restart,
+        // but never bypasses current principal policy at dispatch.
+        const auto durable_gateway_db=std::string(tmp)+"/durable-gateway.db";
+        {
+            CounterPrincipalGateway gateway(signed_deployment,durable_gateway_db,authorize,policy);
+            auto alice=gateway.issue("alice",a,1,30s);
+            auto bob=gateway.issue("bob",a,1,30s);
+            auto first=gateway.admit(alice,"durable",2).get();
+            auto second=gateway.admit(bob,"durable",3).get();
+            assert(first.sequence>0 && second.sequence>first.sequence);
+            assert(gateway.admit(alice,"durable",2).get().sequence==first.sequence);
+            SqliteActorSync observer(durable_gateway_db);
+            auto heads=observer.pending_mail();
+            assert(heads.size()==1 && heads[0].principal=="alice");
+            assert(observer.snapshot(a).revision==0);
+        }
+        alice_allowed=false;
+        {
+            CounterPrincipalGateway gateway(signed_deployment,durable_gateway_db,authorize,policy,128,128,2,10ms);
+            SqliteActorSync observer(durable_gateway_db);
+            const auto until=CounterDirectory::Clock::now()+5s;
+            while(!observer.pending_mail().empty() && CounterDirectory::Clock::now()<until)
+                std::this_thread::sleep_for(5ms);
+            assert(observer.pending_mail().empty() && !gateway.mail_fault());
+            assert(observer.snapshot(a).bytes=="3" && observer.snapshot(a).revision==1);
+            auto bob=gateway.issue("bob",a,1,30s);
+            auto receipt=gateway.admit(bob,"durable",3).get();
+            assert(receipt.receipt && receipt.receipt->duplicate && receipt.receipt->reply=="3");
+            alice_allowed=true;
+            auto alice=gateway.issue("alice",a,1,30s);
+            auto rejected=gateway.admit(alice,"durable",2).get();
+            assert(rejected.dead_letter && rejected.authorization_denied && !rejected.receipt);
+            assert(observer.snapshot(a).revision==1);
+        }
         // A populated legacy store must not be implicitly adopted.
         const auto legacy_db=std::string(tmp)+"/legacy-deployment.db";
         {CounterDirectory legacy(legacy_db,runner,auth);
