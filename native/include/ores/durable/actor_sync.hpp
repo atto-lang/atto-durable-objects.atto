@@ -183,6 +183,34 @@ public:
         return snapshot_locked(key);
     }
 
+    // Read-only receipt resolution before speculative guest execution. The
+    // current owner epoch is checked even for duplicates. A missing receipt
+    // is not a reservation: commit must still perform its own atomic check.
+    std::optional<SyncCommit> lookup_receipt(const SyncKey& key, std::int64_t epoch,
+                                            std::string_view operation_id,
+                                            std::string_view command,
+                                            std::string_view schema_fp) {
+        validate_key(key); label(operation_id); label(schema_fp);
+        bounded(command, limits_.command_bytes);
+        if (epoch <= 0) throw std::invalid_argument("invalid epoch");
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this, false);
+        if (snapshot_locked(key).epoch != epoch) throw std::logic_error("stale writer epoch");
+        std::optional<SyncCommit> replay;
+        {
+            Statement s(db_, "SELECT command,schema_fp,revision,reply FROM sync_operations WHERE "
+                             "tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?");
+            bind_key(s, key); s.text(5, operation_id);
+            if (s.step() == SQLITE_ROW) {
+                if (s.blob(0) != command || s.str(1) != schema_fp)
+                    throw std::logic_error("operation id reused with different command/schema");
+                replay = SyncCommit{s.number(2), s.blob(3), true};
+            }
+        }
+        tx.commit();
+        return replay;
+    }
+
     // Atomic state + exact-operation dedup + replay reply + outbox.
     // If the ACK is lost, retry with identical op_id/command; the caller must
     // not interpret a timeout as a definitely failed operation.
