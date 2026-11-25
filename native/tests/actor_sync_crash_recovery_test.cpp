@@ -289,5 +289,75 @@ int main() {
         assert(store.commit(poison,epoch,0,"next","1:2","counter","2","2",false,nullptr,0,&ready[0]).revision==1);
         assert(store.pending_mail().empty());
     }
+    // A controller disappears after durable dispatch and before any failure
+    // or commit record. Recovery charges exactly one failure per marker.
+    const auto attempt_db=std::string(dir)+"/attempt.db";
+    const SyncKey crash_key{"tenant","mail","Counter","crasher"};
+    {
+        SqliteActorSync store(attempt_db);
+        auto epoch=store.activate_next(crash_key);
+        store.admit_mail(crash_key,epoch,"crash","1:1","counter");
+        store.admit_mail(crash_key,epoch,"next","1:2","counter");
+    }
+    std::int64_t now=1000;
+    for(int i=0;i<3;++i) {
+        const pid_t crashed=fork();
+        assert(crashed>=0);
+        if(crashed==0) {
+            try {
+                SqliteActorSync store(attempt_db);
+                const auto epoch=store.activate_next(crash_key);
+                auto heads=store.pending_mail(64,now);
+                if(heads.size()!=1 || heads[0].failures!=i || heads[0].attempt_epoch!=0) _exit(19);
+                const auto started=store.begin_mail(heads[0],epoch,now);
+                if(started.attempt_epoch!=epoch || store.mail_pending(heads[0],epoch)) _exit(20);
+                _exit(45);
+            } catch(...) {_exit(21);}
+        }
+        check_exit(crashed,45);
+        SqliteActorSync recovered(attempt_db);
+        const auto current=recovered.activate_next(crash_key);
+        auto heads=recovered.pending_mail(64,now);
+        assert(heads.size()==1 && heads[0].attempt_epoch==current-1 && heads[0].failures==i);
+        const auto marked=heads[0];
+        bool denied=false;
+        try {recovered.commit(crash_key,current,0,"crash","1:1","counter","1","1",false,nullptr,0,&marked);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        denied=false;
+        try {recovered.fail_mail(marked,current-1,now);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        assert(recovered.fail_mail(marked,current,now)==(i==2));
+        denied=false;
+        try {recovered.fail_mail(marked,current,now);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied && recovered.snapshot(crash_key).revision==0);
+        assert(!recovered.lookup_receipt(crash_key,current,"crash","1:1","counter"));
+        assert(recovered.changes_after(crash_key,0).empty());
+        if(i<2) {
+            now+=100*(i+1);
+            assert(recovered.pending_mail(64,now-1).empty());
+        }
+    }
+    {
+        SqliteActorSync store(attempt_db);
+        const auto epoch=store.activate_next(crash_key);
+        assert(store.admit_mail(crash_key,epoch,"crash","1:1","counter").dead_letter);
+        auto heads=store.pending_mail(64,now);
+        assert(heads.size()==1 && heads[0].operation_id=="next");
+        const auto started=store.begin_mail(heads[0],epoch,now);
+        bool denied=false;
+        try {store.commit(crash_key,epoch,0,"next","1:2","counter","2","2",false,nullptr,0,&heads[0]);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        bool rolled=false;
+        try {store.commit(crash_key,epoch,0,"next","1:2","counter","2","2",true,nullptr,0,&started);}
+        catch(const std::runtime_error&) {rolled=true;}
+        assert(rolled && store.mail_pending(started,epoch));
+        assert(store.commit(crash_key,epoch,0,"next","1:2","counter","2","2",false,nullptr,0,&started).revision==1);
+        assert(store.pending_mail().empty());
+        assert(store.admit_mail(crash_key,epoch,"next","1:2","counter").receipt->reply=="2");
+    }
     std::filesystem::remove_all(dir);
 }
