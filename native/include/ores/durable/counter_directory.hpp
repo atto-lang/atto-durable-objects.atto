@@ -83,18 +83,24 @@ private:
     ControllerLock owner_;
     SqliteActorSync store_;
     const KeyedGuest guest_;
+    const std::string deployment_manifest_;
     // Borrowed only while invoking a synchronous trusted guest runner.
     // A spawned worker duplicates this open file description into its own
     // descriptor table, retaining flock until physical process termination.
     inline static thread_local int guest_guard_fd_=-1;
+    inline static thread_local const std::string* guest_deployment_=nullptr;
     struct GuestGuard {
         int previous;
-        explicit GuestGuard(int fd):previous(guest_guard_fd_) {guest_guard_fd_=fd;}
-        ~GuestGuard(){guest_guard_fd_=previous;}
+        const std::string* previous_deployment;
+        GuestGuard(int fd,const std::string& manifest)
+            :previous(guest_guard_fd_),previous_deployment(guest_deployment_) {
+            guest_guard_fd_=fd;guest_deployment_=&manifest;
+        }
+        ~GuestGuard(){guest_guard_fd_=previous;guest_deployment_=previous_deployment;}
     };
     auto guarded_guest(const SyncKey& k) {
         return [this,&k](std::int64_t n,std::int64_t op,std::int64_t d){
-            GuestGuard guard(owner_.fd());
+            GuestGuard guard(owner_.fd(),deployment_manifest_);
             return guest_(k,n,op,d);
         };
     }
@@ -344,6 +350,9 @@ private:
 public:
     // Host-only borrowed descriptor; never expose to compiled guest imports.
     static int current_guest_guard_fd() noexcept {return guest_guard_fd_;}
+    static bool current_guest_deployment_matches(std::string_view manifest) noexcept {
+        return guest_deployment_ && !manifest.empty() && *guest_deployment_==manifest;
+    }
     CounterDirectory(const std::string& db, Guest guest, Authorize authorize,
                      std::size_t capacity=128,std::size_t active_limit=128,
                      std::size_t workers=1,
@@ -357,13 +366,17 @@ public:
                      std::size_t workers=1,
                      Clock::duration idle_timeout=Clock::duration::zero(),
                      Clock::duration alarm_interval=Clock::duration::zero(),
-                     Clock::duration mail_interval=Clock::duration::zero())
-        : owner_(db),store_(owner_.path()),guest_(std::move(guest)),authorize_(std::move(authorize)),
+                     Clock::duration mail_interval=Clock::duration::zero(),
+                     std::string deployment_manifest={})
+        : owner_(db),store_(owner_.path()),guest_(std::move(guest)),
+          deployment_manifest_(std::move(deployment_manifest)),authorize_(std::move(authorize)),
           capacity_(capacity),active_limit_(active_limit),idle_timeout_(idle_timeout) {
         if(!guest_ || !authorize_ || !capacity_ || !active_limit_ ||
            !workers || workers>64 || idle_timeout_<Clock::duration::zero() ||
            alarm_interval<Clock::duration::zero() || mail_interval<Clock::duration::zero())
             throw std::invalid_argument("invalid directory configuration");
+        // Reject changed or missing deployment before any activation or replay.
+        store_.bind_deployment(deployment_manifest_);
         workers_.reserve(workers);
         try {
             for(std::size_t i=0;i<workers;++i) workers_.emplace_back([this]{loop();});
