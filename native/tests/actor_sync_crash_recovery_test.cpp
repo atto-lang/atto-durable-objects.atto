@@ -393,5 +393,40 @@ int main() {
         assert(denied);
         legacy.bind_deployment("");
     }
+    // Reserved principal namespace must not reinterpret legacy receipts
+    // or admit an old raw controller after gateway-mode activation.
+    {
+        const auto nsdb=std::string(dir)+"/principal-namespace.db";
+        SqliteActorSync store(nsdb);
+        store.bind_principal_namespace(false);
+        store.bind_principal_namespace(true);
+        store.bind_principal_namespace(true);
+        bool denied=false;
+        try {store.bind_principal_namespace(false);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+    }
+    {
+        const auto nsdb=std::string(dir)+"/principal-legacy.db";
+        SqliteActorSync store(nsdb);
+        const auto epoch=store.activate_next(deployed);
+        store.commit(deployed,epoch,0,"@principal:legacy","1:1","counter","1","1");
+        bool denied=false;
+        try {store.bind_principal_namespace(true);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        store.bind_principal_namespace(false);
+    }
+    {
+        const auto nsdb=std::string(dir)+"/principal-inbox.db";
+        SqliteActorSync store(nsdb);
+        const auto epoch=store.activate_next(deployed);
+        store.admit_mail(deployed,epoch,"@principal:legacy","1:1","counter");
+        bool denied=false;
+        try {store.bind_principal_namespace(true);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        store.bind_principal_namespace(false);
+    }
     std::filesystem::remove_all(dir);
 }
