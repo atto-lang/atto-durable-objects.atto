@@ -59,6 +59,10 @@ struct SyncAdmission {
     bool dead_letter=false;
     bool authorization_denied=false;
 };
+class PrincipalPolicyChanged final : public std::logic_error {
+public:
+    PrincipalPolicyChanged():std::logic_error("persisted principal policy denied or changed"){}
+};
 class ResyncRequired final : public std::logic_error {
 public:
     ResyncRequired() : std::logic_error("sync cursor requires a fresh snapshot") {}
@@ -181,6 +185,16 @@ public:
                  "manifest BLOB NOT NULL CHECK(length(manifest)>0 AND length(manifest)<=4194304))");
             exec("CREATE TABLE IF NOT EXISTS sync_principal_namespace("
                  "singleton INTEGER PRIMARY KEY CHECK(singleton=1))");
+            exec("CREATE TABLE IF NOT EXISTS sync_policy_mode("
+                 "singleton INTEGER PRIMARY KEY CHECK(singleton=1))");
+            exec("CREATE TABLE IF NOT EXISTS sync_principal_policy("
+                 "tenant TEXT NOT NULL, space TEXT NOT NULL, actor_type TEXT NOT NULL,id TEXT NOT NULL,"
+                 "principal TEXT NOT NULL,op INTEGER NOT NULL CHECK(op IN (1,2)),"
+                 "version INTEGER NOT NULL CHECK(version>0),allowed INTEGER NOT NULL CHECK(allowed IN (0,1)),"
+                 "PRIMARY KEY(tenant,space,actor_type,id,principal,op)) WITHOUT ROWID");
+            exec("CREATE TABLE IF NOT EXISTS sync_attempt_policy("
+                 "sequence INTEGER PRIMARY KEY,version INTEGER NOT NULL CHECK(version>0),"
+                 "FOREIGN KEY(sequence) REFERENCES sync_mail_attempt(sequence) ON DELETE CASCADE)");
             exec("CREATE TABLE IF NOT EXISTS sync_projection("
                  "consumer TEXT NOT NULL, tenant TEXT NOT NULL, space TEXT NOT NULL,"
                  "actor_type TEXT NOT NULL, id TEXT NOT NULL, epoch INTEGER NOT NULL,"
@@ -289,6 +303,55 @@ public:
             exec("INSERT INTO sync_principal_namespace VALUES(1)");
         }
         tx.commit();
+    }
+
+    // Opt-in, irreversible for this database. Quiescent migration only:
+    // existing pending work must be drained or explicitly migrated first.
+    void bind_transactional_policy(bool enabled) {
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this);
+        const bool prior=transactional_policy_locked();
+        if(prior && !enabled) throw std::logic_error("transactional principal policy required");
+        if(enabled && !prior) {
+            {
+                Statement mode(db_,"SELECT 1 FROM sync_principal_namespace WHERE singleton=1");
+                if(mode.step()!=SQLITE_ROW) throw std::logic_error("principal namespace required");
+            }
+            {
+                Statement pending(db_,"SELECT 1 FROM sync_inbox LIMIT 1");
+                if(pending.step()==SQLITE_ROW) throw std::logic_error("drain inbox before enabling transactional policy");
+            }
+            exec("INSERT INTO sync_policy_mode VALUES(1)");
+        }
+        tx.commit();
+    }
+
+    // Trusted operator API, not a guest or user-facing grant endpoint.
+    // Denied rows are versioned tombstones; version zero means absent.
+    // Every update increments version even if the boolean is unchanged.
+    std::int64_t set_principal_policy(const SyncKey& key,std::string_view principal,
+                                     std::int64_t op,std::int64_t expected_version,bool allowed) {
+        validate_key(key);label(principal);
+        if((op!=1 && op!=2) || expected_version<0 ||
+           expected_version==std::numeric_limits<std::int64_t>::max())
+            throw std::invalid_argument("invalid principal policy version/op");
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this);
+        if(!transactional_policy_locked()) throw std::logic_error("transactional policy not enabled");
+        const auto prior=policy_locked(key,principal,op);
+        if(prior.first!=expected_version) throw std::logic_error("stale principal policy version");
+        if(expected_version==0) {
+            Statement count(db_,"SELECT COUNT(*) FROM sync_principal_policy");
+            if(count.step()!=SQLITE_ROW || count.number(0)>=65536)
+                throw std::length_error("principal policy quota exhausted");
+        }
+        {
+            Statement write(db_,"INSERT INTO sync_principal_policy VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(tenant,space,actor_type,id,principal,op) DO UPDATE SET version=excluded.version,allowed=excluded.allowed");
+            bind_key(write,key);write.text(5,principal);write.i64(6,op);
+            write.i64(7,expected_version+1);write.i64(8,allowed?1:0);write.done();
+        }
+        tx.commit();return expected_version+1;
     }
 
     // Called only by a trusted controller that has already established writer
@@ -477,6 +540,10 @@ public:
             if(bound!=!principal.empty() || (!principal.empty() && operation_id.substr(0,11)!="@principal:"))
                 throw std::logic_error("mail principal namespace mismatch");
         }
+        if(transactional_policy_locked()) {
+            if(principal.empty() || !policy_locked(key,principal,policy_op(command)).second)
+                throw PrincipalPolicyChanged();
+        }
         std::optional<SyncCommit> completed;
         {
             Statement read(db_,"SELECT command,schema_fp,revision,reply FROM sync_operations WHERE tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?");
@@ -625,8 +692,20 @@ public:
         Tx tx(*this);
         if(snapshot_locked(mail.key).epoch!=epoch || !mail_matches_locked(mail))
             throw std::logic_error("stale mailbox attempt");
-        Statement write(db_,"INSERT INTO sync_mail_attempt VALUES(?,?)");
-        write.i64(1,mail.sequence);write.i64(2,epoch);write.done();
+        std::int64_t version=0;
+        if(transactional_policy_locked()) {
+            const auto grant=policy_locked(mail.key,mail.principal,policy_op(mail.command));
+            if(mail.principal.empty() || !grant.second) throw PrincipalPolicyChanged();
+            version=grant.first;
+        }
+        {
+            Statement write(db_,"INSERT INTO sync_mail_attempt VALUES(?,?)");
+            write.i64(1,mail.sequence);write.i64(2,epoch);write.done();
+        }
+        if(version) {
+            Statement write(db_,"INSERT INTO sync_attempt_policy VALUES(?,?)");
+            write.i64(1,mail.sequence);write.i64(2,version);write.done();
+        }
         tx.commit();
         auto started=mail;started.attempt_epoch=epoch;return started;
     }
@@ -724,6 +803,17 @@ public:
         Tx tx(*this);
         const auto old = snapshot_locked(key);
         if (old.epoch != epoch) throw std::logic_error("stale writer epoch");
+        // BEGIN IMMEDIATE serializes this check with policy administration.
+        // No transient/raw/alarm state commits in strict principal mode.
+        if(transactional_policy_locked()) {
+            if(!mail || mail->principal.empty() || mail->attempt_epoch!=epoch || !mail_matches_locked(*mail))
+                throw PrincipalPolicyChanged();
+            const auto grant=policy_locked(key,mail->principal,policy_op(command));
+            Statement attempt(db_,"SELECT version FROM sync_attempt_policy WHERE sequence=?");
+            attempt.i64(1,mail->sequence);
+            if(!grant.second || attempt.step()!=SQLITE_ROW || attempt.number(0)!=grant.first)
+                throw PrincipalPolicyChanged();
+        }
         std::optional<SyncCommit> replay;
         {
             Statement s(db_, "SELECT command,schema_fp,revision,reply FROM sync_operations WHERE "
@@ -1000,6 +1090,21 @@ private:
         if(read.step()!=SQLITE_ROW) throw std::runtime_error("mail reservation count failed");
         return static_cast<std::size_t>(read.number(0));
     }
+    bool transactional_policy_locked() {
+        Statement mode(db_,"SELECT 1 FROM sync_policy_mode WHERE singleton=1");
+        return mode.step()==SQLITE_ROW;
+    }
+    static std::int64_t policy_op(std::string_view command) {
+        if(command.size()<3 || command[1]!=':' || (command[0]!='1' && command[0]!='2'))
+            throw std::invalid_argument("invalid transactional policy command");
+        return command[0]-'0';
+    }
+    std::pair<std::int64_t,bool> policy_locked(const SyncKey& key,std::string_view principal,std::int64_t op) {
+        Statement read(db_,"SELECT version,allowed FROM sync_principal_policy WHERE tenant=? AND space=? AND actor_type=? AND id=? AND principal=? AND op=?");
+        bind_key(read,key);read.text(5,principal);read.i64(6,op);
+        if(read.step()!=SQLITE_ROW) return {0,false};
+        return {read.number(0),read.number(1)==1};
+    }
     std::pair<std::string,bool> mail_principal_locked(std::int64_t seq) {
         Statement read(db_,"SELECT principal,denied FROM sync_mail_principal WHERE sequence=?");
         read.i64(1,seq);
@@ -1048,6 +1153,7 @@ private:
                 throw std::length_error("persisted actor sync database exceeds configured limits");
         };
         validate("SELECT COUNT(*) FROM sync_objects",limits_.actor_keys_per_database);
+        validate("SELECT COUNT(*) FROM sync_principal_policy",65536);
         // Reject an older database with more live promises than completion
         // capacity. Reconfiguration must not silently abandon accepted mail.
         validate("SELECT COALESCE(MAX(n),0) FROM (SELECT "
