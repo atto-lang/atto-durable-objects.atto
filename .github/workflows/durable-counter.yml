@@ -23,7 +23,7 @@ jobs:
       - name: Verify guest source and build pinned public Rust compiler
         env:
           EXPECTED: ${{ github.event.pull_request.head.sha }}
-          COMPILER_SHA: a4c2497decbb3782a1a6f810e8078bbee094ccbb
+          COMPILER_SHA: 1d6e8e31453064b6530c5c82679aef3cc9db489b
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED"
@@ -39,14 +39,14 @@ jobs:
           cargo +1.85.1 build --locked --release --bin attoc
       - name: Execute compiled counter Wasm and compiler negative
         env:
-          ATTO_COMPILER_SOURCE_SHA: a4c2497decbb3782a1a6f810e8078bbee094ccbb
+          ATTO_COMPILER_SOURCE_SHA: 1d6e8e31453064b6530c5c82679aef3cc9db489b
         run: |
           set -euo pipefail
           ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" node tests/durable_counter_guest.mjs
       - name: Compile host driver and execute real guest-to-SQLite process test
         env:
           STORAGE_SHA: 57c15af3b9dfa31c32dbbb459ee824ebb5b06390
-          ATTO_COMPILER_SOURCE_SHA: a4c2497decbb3782a1a6f810e8078bbee094ccbb
+          ATTO_COMPILER_SOURCE_SHA: 1d6e8e31453064b6530c5c82679aef3cc9db489b
         run: |
           set -euo pipefail
           git init "$RUNNER_TEMP/storage"
