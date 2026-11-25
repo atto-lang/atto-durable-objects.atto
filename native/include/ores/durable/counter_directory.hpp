@@ -32,6 +32,7 @@ public:
     using KeyedGuest = std::function<std::int64_t(const SyncKey&,std::int64_t,std::int64_t,std::int64_t)>;
     using Reply = std::optional<SyncCommit>;
     using Authorize = std::function<bool(const SyncKey&)>;
+    using PrincipalPolicy=std::function<bool(std::string_view,const SyncKey&,std::int64_t)>;
     using Clock = std::chrono::steady_clock;
     // Trusted runner signals a classified failure only after guest execution
     // has physically stopped. Never use for database/ownership/unknown errors.
@@ -109,6 +110,9 @@ private:
         return [guest=std::move(guest)](const SyncKey&,auto n,auto op,auto d){return guest(n,op,d);};
     }
     const Authorize authorize_;
+    const bool principal_mode_;
+    const PrincipalPolicy mail_policy_;
+    struct PolicyDenied {};
     const std::size_t capacity_,active_limit_;
     const Clock::duration idle_timeout_;
     std::map<Key,Lane> lanes_; // protected by mu_; running lanes cannot be erased
@@ -175,15 +179,31 @@ private:
     bool mail_stop_=false;
     std::exception_ptr mail_fault_;
     std::thread mail_worker_;
+    bool mail_authorized(const SyncMail& mail) const {
+        check(mail.key.tenant);check(mail.key.name_space);check(mail.key.actor_type);check(mail.key.object_id);
+        if(mail.key.actor_type!="Counter") throw std::logic_error("unexpected mail actor");
+        if(!principal_mode_) {
+            if(!mail.principal.empty()) throw std::logic_error("principal gateway required");
+            validate(mail.key);return true;
+        }
+        if(mail.principal.empty() || !mail_policy_ || mail.operation_id.compare(0,11,"@principal:")!=0 ||
+           mail.command.size()<3 || mail.command[1]!=':' || (mail.command[0]!='1' && mail.command[0]!='2'))
+            throw std::logic_error("invalid persisted principal mail");
+        return authorize_(mail.key) && mail_policy_(mail.principal,mail.key,mail.command[0]-'0');
+    }
     std::future<Reply> enqueue_mail(SyncMail mail) {
-        validate(mail.key);
+        // Structural validation only here; a revoked principal is a
+        // terminal outcome for its exact head, not a global poller fault.
+        check(mail.key.tenant);check(mail.key.name_space);check(mail.key.actor_type);check(mail.key.object_id);
         const auto id=identity(mail.key);
         return submit(id,[this,id,mail=std::move(mail)]{
-            validate(mail.key);
             const auto epoch=activate(id,mail.key);
             try {
                 if(unix_ms()<mail.retry_at_ms || !store_.mail_pending(mail,epoch))
                     return Reply{};
+                if(!mail_authorized(mail)) {
+                    store_.deny_mail(mail,epoch);return Reply{};
+                }
                 // A surviving dispatch marker belongs to a previous activation.
                 // The controller lock excludes former hosts and cooperating
                 // process runners that inherit its open file description.
@@ -197,16 +217,27 @@ private:
                 const auto started=store_.begin_mail(mail,epoch,unix_ms());
                 Reply r;
                 try {
-                    r=CounterTurn::run_mail(store_,started,epoch,guarded_guest(mail.key));
+                    auto invoke=guarded_guest(mail.key);
+                    auto checked=[&](auto n,auto op,auto d) {
+                        if(!mail_authorized(started)) throw PolicyDenied{};
+                        auto result=invoke(n,op,d);
+                        if(!mail_authorized(started)) throw PolicyDenied{};
+                        return result;
+                    };
+                    r=CounterTurn::run_mail(store_,started,epoch,checked);
+                } catch(const PolicyDenied&) {
+                    store_.deny_mail(started,epoch);return Reply{};
                 } catch(const RetryableGuestFailure&) {
-                    validate(mail.key);
+                    if(!mail_authorized(started)) {
+                        store_.deny_mail(started,epoch);return Reply{};
+                    }
                     // Only after the runner physically stops may this owner
                     // resolve its marker as a classified failure.
                     (void)store_.fail_mail(started,epoch,unix_ms());
                     return Reply{};
                 }
                 if(!r) throw std::logic_error("marked mailbox turn did not commit");
-                validate(mail.key);
+                if(!mail_authorized(started)) return Reply{};
                 if(store_.snapshot(mail.key).epoch!=epoch) throw std::logic_error("stale mail publication epoch");
                 return r;
             } catch(...) {retire(id);throw;}
@@ -403,13 +434,16 @@ public:
                      Clock::duration idle_timeout=Clock::duration::zero(),
                      Clock::duration alarm_interval=Clock::duration::zero(),
                      Clock::duration mail_interval=Clock::duration::zero(),
-                     std::string deployment_manifest={},bool principal_mode=false)
+                     std::string deployment_manifest={},bool principal_mode=false,PrincipalPolicy mail_policy={})
         : owner_(db),store_(owner_.path()),guest_(std::move(guest)),
           deployment_manifest_(std::move(deployment_manifest)),authorize_(std::move(authorize)),
+          principal_mode_(principal_mode),mail_policy_(std::move(mail_policy)),
           capacity_(capacity),active_limit_(active_limit),idle_timeout_(idle_timeout) {
         if(!guest_ || !authorize_ || !capacity_ || !active_limit_ ||
            !workers || workers>64 || idle_timeout_<Clock::duration::zero() ||
-           alarm_interval<Clock::duration::zero() || mail_interval<Clock::duration::zero())
+           alarm_interval<Clock::duration::zero() || mail_interval<Clock::duration::zero() ||
+           (principal_mode_ && (alarm_interval!=Clock::duration::zero() || (mail_interval!=Clock::duration::zero() && !mail_policy_))) ||
+           (!principal_mode_ && mail_policy_))
             throw std::invalid_argument("invalid directory configuration");
         // Reject changed or missing deployment before any activation or replay.
         store_.bind_deployment(deployment_manifest_);
@@ -488,17 +522,37 @@ public:
     // Retry the exact identity/command to retrieve a pending sequence or
     // completed receipt. Ordinary send() remains a transient request path.
     std::future<SyncAdmission> admit(SyncKey k,std::string request,std::int64_t op,std::int64_t delta) {
+        if(principal_mode_) throw std::logic_error("principal admission required");
+        return admit_bound(std::move(k),std::move(request),op,delta,"",[]{});
+    }
+    // Trusted gateway supplies the authenticated principal and a live
+    // capability check. The durable policy is separate from capability TTL.
+    std::future<SyncAdmission> admit_bound(SyncKey k,std::string request,std::int64_t op,std::int64_t delta,
+                                            std::string principal,std::function<void()> authorize_request) {
         validate(k);check(request);
-        if(request.compare(0,7,"@alarm:")==0 || request.compare(0,11,"@principal:")==0 || (op!=1 && op!=2) ||
+        if(!authorize_request || principal_mode_!=!principal.empty() ||
+           (!principal.empty() && (!mail_policy_ || request.compare(0,11,"@principal:")!=0)))
+            throw std::logic_error("invalid principal admission");
+        if(!principal.empty()) check(principal);
+        if(request.compare(0,7,"@alarm:")==0 || (principal.empty() && request.compare(0,11,"@principal:")==0) || (op!=1 && op!=2) ||
            (op==1 && (delta<=0 || delta>CounterTurn::maximum)) || (op==2 && delta!=0))
             throw std::invalid_argument("invalid mailbox command");
+        auto check_policy=[this,&principal,&k,op] {
+            if(!principal.empty() && !mail_policy_(principal,k,op)) throw std::logic_error("principal policy denied");
+        };
+        authorize_request();check_policy();
         const auto id=identity(k);
-        return submit(id,[this,id,k=std::move(k),request=std::move(request),op,delta]{
-            validate(k);
+        return submit(id,[this,id,k=std::move(k),request=std::move(request),op,delta,
+                          principal=std::move(principal),authorize_request=std::move(authorize_request)]{
+            auto authorized=[&]{
+                validate(k);authorize_request();
+                if(!principal.empty() && !mail_policy_(principal,k,op)) throw std::logic_error("principal policy denied");
+            };
+            authorized();
             const auto epoch=activate(id,k);
             try {
-                auto r=store_.admit_mail(k,epoch,request,std::to_string(op)+":"+std::to_string(delta),CounterTurn::schema);
-                validate(k);
+                auto r=store_.admit_mail(k,epoch,request,std::to_string(op)+":"+std::to_string(delta),CounterTurn::schema,principal);
+                authorized();
                 if(store_.snapshot(k).epoch!=epoch) throw std::logic_error("stale admission epoch");
                 return r;
             } catch(...) {retire(id);throw;}
