@@ -294,5 +294,44 @@ int main() {
             assert(observer.snapshot(c).revision==1 && observer.snapshot(c).bytes=="5");
         }
     }
+    // A durable head that is still physically executing cannot hold up
+    // an independent ready object, nor permit its own successor to run.
+    {
+        using namespace std::chrono_literals;
+        const auto parallel_db=std::string(dir)+"/parallel-mail.db";
+        {
+            CounterDirectory directory(parallel_db,guest,auth);
+            assert(directory.admit(a,"held",1,7).get().sequence>0);
+            assert(directory.admit(a,"next",1,2).get().sequence>0);
+            assert(directory.admit(c,"other",1,5).get().sequence>0);
+        }
+        std::promise<void> entered,release;
+        auto started=entered.get_future();auto gate=release.get_future();
+        {
+            CounterDirectory directory(parallel_db,[&](I n,I op,I d)->I {
+                if(d==7){entered.set_value();gate.wait();}
+                return op==2?n:n+d;
+            },auth,16,4,2,10ms,0ms,10ms);
+            SqliteActorSync observer(parallel_db);
+            const bool began=started.wait_for(3s)==std::future_status::ready;
+            bool independent=false,exclusive=false;
+            try {
+                const auto deadline=CounterDirectory::Clock::now()+3s;
+                while(CounterDirectory::Clock::now()<deadline) {
+                    if(observer.snapshot(c).revision==1){independent=true;break;}
+                    std::this_thread::sleep_for(5ms);
+                }
+                exclusive=observer.snapshot(a).revision==0;
+            } catch(...) {release.set_value();throw;}
+            release.set_value();
+            assert(began && independent && exclusive);
+            const auto end=CounterDirectory::Clock::now()+5s;
+            while(!observer.pending_mail().empty() && CounterDirectory::Clock::now()<end)
+                std::this_thread::sleep_for(5ms);
+            assert(observer.pending_mail().empty() && !directory.mail_fault());
+            assert(observer.snapshot(a).revision==2 && observer.snapshot(a).bytes=="9");
+            assert(observer.snapshot(c).bytes=="5");
+        }
+    }
     std::filesystem::remove_all(dir);
 }
