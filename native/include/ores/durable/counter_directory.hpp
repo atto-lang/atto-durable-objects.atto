@@ -488,14 +488,24 @@ public:
             throw std::invalid_argument("reserved principal request identity");
         return send_authorized(std::move(k),std::move(request),op,delta,[]{});
     }
+    // Trusted host only; not a guest-proposed effect or principal grant.
+    std::future<Reply> send_with_alarm(SyncKey k,std::string request,std::int64_t op,
+                                       std::int64_t delta,SyncAlarmChange change) {
+        if(principal_mode_ || request.compare(0,11,"@principal:")==0)
+            throw std::logic_error("principal alarm authority not implemented");
+        return send_authorized(std::move(k),std::move(request),op,delta,[]{},change);
+    }
     // Trusted ingress only. The callback is bound to an authenticated
     // principal, exact object and operation by the gateway; it is never
     // guest code. Recheck on admission, worker entry, after guest execution
     // and before handing a receipt to the host. A policy change racing a
     // commit cannot undo it; this is not transactional revocation.
     std::future<Reply> send_authorized(SyncKey k,std::string request,std::int64_t op,
-                                      std::int64_t delta,std::function<void()> authorize_request) {
+                                      std::int64_t delta,std::function<void()> authorize_request,
+                                      std::optional<SyncAlarmChange> change=std::nullopt) {
         if(transactional_policy_) throw std::logic_error("strict policy requires durable admission");
+        if(change && (principal_mode_ || change->expected_generation<0 || (change->due_ms && *change->due_ms<0)))
+            throw std::invalid_argument("invalid or unauthorized alarm change");
         if(!authorize_request) throw std::invalid_argument("missing request authorization");
         validate(k);check(request);
         if(request.compare(0,7,"@alarm:")==0) throw std::invalid_argument("reserved alarm operation identity");
@@ -504,7 +514,7 @@ public:
         authorize_request();
         const auto id=identity(k);
         return submit(id,[this,id,k=std::move(k),request=std::move(request),op,delta,
-                          authorize_request=std::move(authorize_request)]{
+                          authorize_request=std::move(authorize_request),change]{
             validate(k);authorize_request();
             const auto epoch=activate(id,k);
             try {
@@ -515,7 +525,7 @@ public:
                     authorize_request();
                     return result;
                 };
-                auto r=CounterTurn::run(store_,k,epoch,request,op,delta,checked);
+                auto r=CounterTurn::run(store_,k,epoch,request,op,delta,checked,false,nullptr,change?&*change:nullptr);
                 validate(k);authorize_request();
                 if(store_.snapshot(k).epoch!=epoch) throw std::logic_error("stale publication epoch");
                 return r;
