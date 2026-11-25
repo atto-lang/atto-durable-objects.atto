@@ -463,5 +463,50 @@ int main() {
             assert(store.snapshot(a).revision==1);
         }
     }
+    // A revoke/regrant during a physically executing alarm cannot
+    // commit state even when the external policy callback remains true.
+    {
+        using namespace std::chrono_literals;
+        const auto db2=std::string(dir)+"/strict-alarm-race.db";
+        const auto scope=[](const SyncKey&){return true;};
+        const auto policy=[](std::string_view,const SyncKey&,I){return true;};
+        {
+            CounterDirectory directory(db2,CounterDirectory::KeyedGuest(
+                [](const SyncKey&,I n,I,I d)->I{return n+d;}),
+                scope,16,4,1,10ms,0ms,0ms,"",true,policy,true);
+            SqliteActorSync admin(db2);
+            admin.set_principal_policy(a,"alice",1,0,true);
+            admin.set_principal_policy(c,"bob",1,0,true);
+            rejects<std::logic_error>([&]{
+                (void)directory.schedule_principal_alarm(a,0,0,"alice","operator",
+                    []{throw std::logic_error("operator denied");});
+            });
+            assert(directory.schedule_principal_alarm(a,0,0,"alice","operator",[]{}).get()==1);
+            assert(directory.schedule_principal_alarm(c,0,1,"bob","operator",[]{}).get()==1);
+        }
+        std::promise<void> entered,release;
+        auto ready=entered.get_future();auto gate=release.get_future();
+        {
+            CounterDirectory directory(db2,CounterDirectory::KeyedGuest(
+                [&](const SyncKey& k,I n,I,I d)->I{
+                    if(k.object_id==a.object_id){entered.set_value();gate.wait();}
+                    return n+d;
+                }),scope,16,4,1,10ms,10ms,0ms,"",true,policy,true);
+            SqliteActorSync admin(db2);
+            const bool began=ready.wait_for(3s)==std::future_status::ready;
+            try {
+                admin.set_principal_policy(a,"alice",1,1,false);
+                admin.set_principal_policy(a,"alice",1,2,true);
+            } catch(...) {release.set_value();throw;}
+            release.set_value();assert(began);
+            const auto until=CounterDirectory::Clock::now()+5s;
+            while(!admin.due_alarms(1).empty() && CounterDirectory::Clock::now()<until)
+                std::this_thread::sleep_for(5ms);
+            assert(admin.due_alarms(1).empty() && !directory.alarm_fault());
+            assert(admin.snapshot(a).revision==0 && admin.snapshot(c).bytes=="1");
+            assert(admin.principal_alarm_authority(a)->status==SyncAlarmStatus::denied);
+            assert(admin.principal_alarm_authority(c)->status==SyncAlarmStatus::fired);
+        }
+    }
     std::filesystem::remove_all(dir);
 }
