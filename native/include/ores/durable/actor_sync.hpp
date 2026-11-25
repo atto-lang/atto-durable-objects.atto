@@ -64,6 +64,11 @@ struct SyncDeadLetter {
     std::string operation_id,principal;
     bool authorization_denied;
     std::int64_t redrive_sequence=0;
+    bool archived=false;
+};
+struct SyncArchive {
+    std::int64_t sequence;
+    bool duplicate=false;
 };
 struct SyncRedrive {
     std::int64_t original_sequence,new_sequence;
@@ -94,6 +99,8 @@ struct SyncLimits {
     std::size_t inbox_command_bytes_per_database = 64u << 20;
     std::size_t inbox_entries_per_tenant = 1024;
     std::size_t inbox_command_bytes_per_tenant = 16u << 20;
+    std::size_t archive_entries_per_database=65536,archive_entries_per_tenant=4096;
+    std::size_t archive_command_bytes_per_database=64u<<20,archive_command_bytes_per_tenant=16u<<20;
 };
 
 class SqliteActorSync final {
@@ -107,6 +114,10 @@ public:
             limits_.actor_keys_per_database == 0 || limits_.projection_consumers_per_actor == 0 ||
             limits_.inbox_entries_per_actor == 0 || limits_.inbox_entries_per_database == 0 ||
             limits_.inbox_entries_per_database > 65536 ||
+            limits_.archive_entries_per_database==0 || limits_.archive_entries_per_database>65536 ||
+            limits_.archive_entries_per_tenant==0 || limits_.archive_entries_per_tenant>65536 ||
+            limits_.archive_command_bytes_per_database==0 || limits_.archive_command_bytes_per_database>(1u<<30) ||
+            limits_.archive_command_bytes_per_tenant==0 || limits_.archive_command_bytes_per_tenant>(1u<<30) ||
             limits_.inbox_entries_per_tenant == 0 || limits_.inbox_entries_per_tenant > 65536 ||
             limits_.inbox_command_bytes_per_tenant == 0 || limits_.inbox_command_bytes_per_tenant > (1u << 30) ||
             limits_.inbox_command_bytes_per_database == 0 ||
@@ -207,6 +218,13 @@ public:
                  "source_sequence INTEGER PRIMARY KEY, new_sequence INTEGER NOT NULL UNIQUE,"
                  "operator_id TEXT NOT NULL, new_op_id TEXT NOT NULL,"
                  "FOREIGN KEY(source_sequence) REFERENCES sync_inbox(sequence) ON DELETE RESTRICT)");
+            exec("CREATE TABLE IF NOT EXISTS sync_dead_archive("
+                 "sequence INTEGER PRIMARY KEY,tenant TEXT NOT NULL,space TEXT NOT NULL,actor_type TEXT NOT NULL,id TEXT NOT NULL,"
+                 "op_id TEXT NOT NULL,command BLOB NOT NULL,schema_fp TEXT NOT NULL,principal TEXT NOT NULL,"
+                 "denied INTEGER NOT NULL CHECK(denied IN (0,1)),archiver TEXT NOT NULL,"
+                 "redrive_sequence INTEGER NOT NULL DEFAULT 0,redrive_operator TEXT NOT NULL DEFAULT '',redrive_op TEXT NOT NULL DEFAULT '',"
+                 "UNIQUE(tenant,space,actor_type,id,op_id))");
+            exec("CREATE INDEX IF NOT EXISTS sync_dead_archive_scope ON sync_dead_archive(tenant,space,actor_type,id,sequence)");
             exec("CREATE TABLE IF NOT EXISTS sync_attempt_policy("
                  "sequence INTEGER PRIMARY KEY,version INTEGER NOT NULL CHECK(version>0),"
                  "FOREIGN KEY(sequence) REFERENCES sync_mail_attempt(sequence) ON DELETE CASCADE)");
@@ -560,15 +578,84 @@ public:
         validate_key(key);
         if(after<0 || limit==0 || limit>256) throw std::invalid_argument("invalid dead-letter page");
         std::lock_guard<std::mutex> lock(mu_);
-        Statement read(db_,"SELECT m.sequence,m.op_id,COALESCE(p.principal,''),COALESCE(p.denied,0),COALESCE(d.new_sequence,0) "
+        Statement read(db_,"SELECT sequence,op_id,principal,denied,redrive_sequence,archived FROM ("
+            "SELECT m.sequence AS sequence,m.op_id AS op_id,COALESCE(p.principal,'') AS principal,COALESCE(p.denied,0) AS denied,COALESCE(d.new_sequence,0) AS redrive_sequence,0 AS archived "
             "FROM sync_inbox m JOIN sync_mail_retry r ON r.sequence=m.sequence "
             "LEFT JOIN sync_mail_principal p ON p.sequence=m.sequence LEFT JOIN sync_dead_redrive d ON d.source_sequence=m.sequence "
-            "WHERE m.tenant=? AND m.space=? AND m.actor_type=? AND m.id=? AND r.dead=1 AND m.sequence>? "
-            "ORDER BY m.sequence LIMIT ?");
-        bind_key(read,key);read.i64(5,after);read.i64(6,static_cast<std::int64_t>(limit));
+            "WHERE m.tenant=? AND m.space=? AND m.actor_type=? AND m.id=? AND r.dead=1 "
+            "UNION ALL SELECT sequence,op_id,principal,denied,redrive_sequence,1 FROM sync_dead_archive "
+            "WHERE tenant=? AND space=? AND actor_type=? AND id=?) WHERE sequence>? ORDER BY sequence LIMIT ?");
+        bind_key(read,key);bind_key(read,key,5);read.i64(9,after);read.i64(10,static_cast<std::int64_t>(limit));
         std::vector<SyncDeadLetter> result;
-        while(read.step()==SQLITE_ROW) result.push_back({read.number(0),read.str(1),read.str(2),read.number(3)!=0,read.number(4)});
+        while(read.step()==SQLITE_ROW) result.push_back({read.number(0),read.str(1),read.str(2),read.number(3)!=0,read.number(4),read.number(5)!=0});
         return result;
+    }
+
+    // Archive is a terminal administrative operation, not a purge.
+    // Keep exact immutable bytes and audit identity outside the inbox.
+    // Source rows already redriven retain their audit in the archive;
+    // archived unredriven rows may never be redriven.
+    SyncArchive archive_dead_letter(const SyncKey& key,std::int64_t epoch,std::int64_t source,
+                                    std::string_view operator_id,bool inject_failure=false) {
+        validate_key(key);label(operator_id);
+        if(epoch<=0 || source<=0) throw std::invalid_argument("invalid archive envelope");
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this);
+        if(!transactional_policy_locked() || snapshot_locked(key).epoch!=epoch)
+            throw std::logic_error("strict policy and current epoch required for archive");
+        {
+            Statement read(db_,"SELECT archiver FROM sync_dead_archive WHERE tenant=? AND space=? AND actor_type=? AND id=? AND sequence=?");
+            bind_key(read,key);read.i64(5,source);
+            if(read.step()==SQLITE_ROW) {
+                if(read.str(0)!=operator_id) throw std::logic_error("archive already recorded by another operator");
+                // SELECT is finalized before commit below.
+            } else goto new_archive;
+        }
+        tx.commit();return {source,true};
+        new_archive:
+        std::int64_t bytes=0;
+        {
+            Statement read(db_,"SELECT LENGTH(m.command) FROM sync_inbox m JOIN sync_mail_retry r ON r.sequence=m.sequence "
+                "JOIN sync_mail_principal p ON p.sequence=m.sequence LEFT JOIN sync_mail_attempt a ON a.sequence=m.sequence "
+                "WHERE m.tenant=? AND m.space=? AND m.actor_type=? AND m.id=? AND m.sequence=? AND r.dead=1 AND a.sequence IS NULL");
+            bind_key(read,key);read.i64(5,source);
+            if(read.step()!=SQLITE_ROW) throw std::logic_error("archive requires terminal principal mail");
+            bytes=read.number(0);
+        }
+        auto quota=[&](const char* sql,std::size_t entries,std::size_t cap,bool tenant) {
+            Statement count(db_,sql);
+            if(tenant) count.text(1,key.tenant);
+            if(count.step()!=SQLITE_ROW) throw std::runtime_error("archive quota query failed");
+            const auto used=count.number(1);
+            if(bytes<0 || used<0 || static_cast<std::uint64_t>(count.number(0))>=entries ||
+               static_cast<std::uint64_t>(used)>cap || static_cast<std::uint64_t>(bytes)>cap-static_cast<std::size_t>(used))
+                throw std::length_error("dead-letter archive quota exhausted");
+        };
+        quota("SELECT COUNT(*),COALESCE(SUM(LENGTH(command)),0) FROM sync_dead_archive",
+              limits_.archive_entries_per_database,limits_.archive_command_bytes_per_database,false);
+        quota("SELECT COUNT(*),COALESCE(SUM(LENGTH(command)),0) FROM sync_dead_archive WHERE tenant=?",
+              limits_.archive_entries_per_tenant,limits_.archive_command_bytes_per_tenant,true);
+        {
+            Statement write(db_,"INSERT INTO sync_dead_archive "
+                "SELECT m.sequence,m.tenant,m.space,m.actor_type,m.id,m.op_id,m.command,m.schema_fp,p.principal,p.denied,?,"
+                "COALESCE(d.new_sequence,0),COALESCE(d.operator_id,''),COALESCE(d.new_op_id,'') "
+                "FROM sync_inbox m JOIN sync_mail_retry r ON r.sequence=m.sequence JOIN sync_mail_principal p ON p.sequence=m.sequence "
+                "LEFT JOIN sync_dead_redrive d ON d.source_sequence=m.sequence "
+                "WHERE m.tenant=? AND m.space=? AND m.actor_type=? AND m.id=? AND m.sequence=? AND r.dead=1");
+            write.text(1,operator_id);bind_key(write,key,2);write.i64(6,source);write.done();
+            if(sqlite3_changes(db_)!=1) throw std::logic_error("lost archive source");
+        }
+        {
+            Statement clear(db_,"DELETE FROM sync_dead_redrive WHERE source_sequence=?");
+            clear.i64(1,source);clear.done();
+        }
+        {
+            Statement clear(db_,"DELETE FROM sync_inbox WHERE tenant=? AND space=? AND actor_type=? AND id=? AND sequence=?");
+            bind_key(clear,key);clear.i64(5,source);clear.done();
+            if(sqlite3_changes(db_)!=1) throw std::logic_error("lost archived inbox row");
+        }
+        if(inject_failure) throw std::runtime_error("injected archive failure");
+        tx.commit();return {source,false};
     }
 
     // Strict policy only. Trusted authenticated operator authorizes this
@@ -585,6 +672,19 @@ public:
         if(!transactional_policy_locked() || snapshot_locked(key).epoch!=epoch)
             throw std::logic_error("strict policy and current epoch required for redrive");
         std::string command,schema,principal;
+        std::optional<SyncRedrive> archived;
+        {
+            Statement read(db_,"SELECT command,principal,denied,redrive_sequence,redrive_operator,redrive_op FROM sync_dead_archive "
+                "WHERE tenant=? AND space=? AND actor_type=? AND id=? AND sequence=?");
+            bind_key(read,key);read.i64(5,source);
+            if(read.step()==SQLITE_ROW) {
+                if(read.number(2)!=0 || read.number(3)<=0 || read.str(4)!=operator_id)
+                    throw std::logic_error("archived source cannot be redriven");
+                if(!policy_locked(key,read.str(1),policy_op(read.blob(0))).second) throw PrincipalPolicyChanged();
+                archived=SyncRedrive{source,read.number(3),read.str(5),true};
+            }
+        }
+        if(archived){tx.commit();return *archived;}
         {
             Statement read(db_,"SELECT m.command,m.schema_fp,p.principal,p.denied FROM sync_inbox m "
                 "JOIN sync_mail_retry r ON r.sequence=m.sequence JOIN sync_mail_principal p ON p.sequence=m.sequence "
@@ -614,7 +714,8 @@ public:
         const auto op_id="@principal:redrive:"+std::to_string(source);
         // No adoption of a pre-existing identity (including legacy raw writes).
         for(const auto* sql:{"SELECT 1 FROM sync_inbox WHERE tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?",
-                             "SELECT 1 FROM sync_operations WHERE tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?"}) {
+                             "SELECT 1 FROM sync_operations WHERE tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?",
+                             "SELECT 1 FROM sync_dead_archive WHERE tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?"}) {
             Statement read(db_,sql);bind_key(read,key);read.text(5,op_id);
             if(read.step()==SQLITE_ROW) throw std::logic_error("redrive identity collision");
         }
@@ -641,6 +742,15 @@ private:
         if(transactional_policy_locked()) {
             if(principal.empty() || !policy_locked(key,principal,policy_op(command)).second)
                 throw PrincipalPolicyChanged();
+        }
+        {
+            Statement read(db_,"SELECT sequence,command,schema_fp,principal,denied FROM sync_dead_archive WHERE tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?");
+            bind_key(read,key);read.text(5,operation_id);
+            if(read.step()==SQLITE_ROW) {
+                if(read.blob(1)!=command || read.str(2)!=schema_fp || read.str(3)!=principal)
+                    throw std::logic_error("archived mail identity conflict");
+                return {read.number(0),std::nullopt,true,read.number(4)!=0};
+            }
         }
         std::optional<SyncCommit> completed;
         {
@@ -902,6 +1012,11 @@ public:
         Tx tx(*this);
         const auto old = snapshot_locked(key);
         if (old.epoch != epoch) throw std::logic_error("stale writer epoch");
+        {
+            Statement read(db_,"SELECT 1 FROM sync_dead_archive WHERE tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?");
+            bind_key(read,key);read.text(5,operation_id);
+            if(read.step()==SQLITE_ROW) throw std::logic_error("archived terminal identity cannot commit");
+        }
         // BEGIN IMMEDIATE serializes this check with policy administration.
         // No transient/raw/alarm state commits in strict principal mode.
         if(transactional_policy_locked()) {
@@ -1254,6 +1369,11 @@ private:
         validate("SELECT COUNT(*) FROM sync_objects",limits_.actor_keys_per_database);
         validate("SELECT COUNT(*) FROM sync_principal_policy",65536);
         validate("SELECT COUNT(*) FROM sync_dead_redrive",65536);
+        validate("SELECT COUNT(*) FROM sync_dead_archive",limits_.archive_entries_per_database);
+        validate("SELECT COALESCE(SUM(LENGTH(command)),0) FROM sync_dead_archive",limits_.archive_command_bytes_per_database);
+        validate("SELECT COALESCE(MAX(n),0) FROM (SELECT COUNT(*) AS n FROM sync_dead_archive GROUP BY tenant)",limits_.archive_entries_per_tenant);
+        validate("SELECT COALESCE(MAX(n),0) FROM (SELECT SUM(LENGTH(command)) AS n FROM sync_dead_archive GROUP BY tenant)",limits_.archive_command_bytes_per_tenant);
+        validate("SELECT COALESCE(MAX(LENGTH(command)),0) FROM sync_dead_archive",limits_.command_bytes);
         // Reject an older database with more live promises than completion
         // capacity. Reconfiguration must not silently abandon accepted mail.
         validate("SELECT COALESCE(MAX(n),0) FROM (SELECT "
