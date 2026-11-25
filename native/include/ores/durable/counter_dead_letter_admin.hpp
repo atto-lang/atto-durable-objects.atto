@@ -8,7 +8,7 @@ namespace ores::durable {
 // This is not a network endpoint or transactional operator revocation.
 class CounterDeadLetterAdmin final {
 public:
-    enum class Action { inspect, redrive };
+    enum class Action { inspect, redrive, archive };
     using Policy=std::function<bool(std::string_view,const SyncKey&,Action)>;
 private:
     SqliteActorSync& store_;
@@ -30,6 +30,14 @@ public:
         auto page=store_.dead_letters(key,after,limit);
         require(operator_id,key,Action::inspect);
         return page;
+    }
+    SyncArchive archive(std::string_view operator_id,const SyncKey& key,std::int64_t source) {
+        require(operator_id,key,Action::archive);
+        const auto epoch=store_.snapshot(key).epoch;
+        require(operator_id,key,Action::archive);
+        auto result=store_.archive_dead_letter(key,epoch,source,operator_id);
+        require(operator_id,key,Action::archive);
+        return result;
     }
     SyncRedrive redrive(std::string_view operator_id,const SyncKey& key,std::int64_t source) {
         require(operator_id,key,Action::redrive);
