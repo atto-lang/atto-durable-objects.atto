@@ -359,5 +359,39 @@ int main() {
         assert(store.pending_mail().empty());
         assert(store.admit_mail(crash_key,epoch,"next","1:2","counter").receipt->reply=="2");
     }
+    // Immutable deployment guard rejects changed startup configuration
+    // even when a pending operation has not executed yet.
+    const auto deployment_db=std::string(dir)+"/deployment.db";
+    const SyncKey deployed{"tenant","mail","Counter","deployed"};
+    const std::string manifest="fixture-deployment-v1";
+    {
+        SqliteActorSync store(deployment_db);
+        store.bind_deployment(manifest);
+        const auto epoch=store.activate_next(deployed);
+        store.admit_mail(deployed,epoch,"pending","1:1","counter");
+    }
+    {
+        SqliteActorSync store(deployment_db);
+        for(const auto& rejected:{std::string{},std::string("changed-deployment")}) {
+            bool denied=false;
+            try {store.bind_deployment(rejected);}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+        }
+        store.bind_deployment(manifest);
+        const auto epoch=store.activate_next(deployed);
+        const auto heads=store.pending_mail();
+        assert(heads.size()==1 && heads[0].operation_id=="pending");
+        const auto result=store.commit(deployed,epoch,0,"pending","1:1","counter","1","1",false,nullptr,0,&heads[0]);
+        assert(result.revision==1 && store.pending_mail().empty());
+    }
+    {
+        SqliteActorSync legacy(db);
+        bool denied=false;
+        try {legacy.bind_deployment(manifest);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        legacy.bind_deployment("");
+    }
     std::filesystem::remove_all(dir);
 }
