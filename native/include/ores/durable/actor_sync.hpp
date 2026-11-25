@@ -356,6 +356,7 @@ public:
             if(alarm->key.tenant!=key.tenant || alarm->key.name_space!=key.name_space ||
                alarm->key.actor_type!=key.actor_type || alarm->key.object_id!=key.object_id ||
                operation_id!=alarm_operation_id(alarm->generation) ||
+               command!=("alarm:"+std::to_string(alarm->due_ms)) ||
                alarm->due_ms<0 || now_ms<alarm->due_ms)
                 throw std::invalid_argument("invalid alarm commit envelope");
         } else if(operation_id.substr(0,7)=="@alarm:") {
