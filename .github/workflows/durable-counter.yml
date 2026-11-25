@@ -48,7 +48,7 @@ jobs:
           ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" node tests/durable_counter_guest.mjs
       - name: Compile host driver and execute real guest-to-SQLite process test
         env:
-          STORAGE_SHA: e97c8fc15efad1e35be3c908b2e88319f864bd70
+          STORAGE_SHA: b760a0c61155f8f8109fe4e2144746749df8fcd7
           ATTO_COMPILER_SOURCE_SHA: 1d6e8e31453064b6530c5c82679aef3cc9db489b
         run: |
           set -euo pipefail
@@ -75,7 +75,7 @@ jobs:
       - name: Execute host-only storage seam against pinned PR 9
         env:
           EXPECTED: ${{ github.event.pull_request.head.sha }}
-          STORAGE_SHA: e97c8fc15efad1e35be3c908b2e88319f864bd70
+          STORAGE_SHA: b760a0c61155f8f8109fe4e2144746749df8fcd7
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED"
@@ -109,4 +109,4 @@ jobs:
             -I"$RUNNER_TEMP/storage/native/include" "$RUNNER_TEMP/storage/native/tests/actor_sync_crash_recovery_test.cpp" \
             -lsqlite3 -o "$RUNNER_TEMP/actor-sync-crash-test"
           timeout 60 "$RUNNER_TEMP/actor-sync-crash-test"
-          echo 'HOST_ONLY_ACTOR_SYNC_ALARM_RECOVERY_PASS'
+          echo 'HOST_ONLY_ACTOR_SYNC_ALARM_AND_MAILBOX_RECOVERY_PASS'
