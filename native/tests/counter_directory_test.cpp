@@ -508,5 +508,41 @@ int main() {
             assert(admin.principal_alarm_authority(c)->status==SyncAlarmStatus::fired);
         }
     }
+    // A classified stopped guest exhausts only its alarm generation.
+    // A different object's due alarm progresses during retry backoff.
+    {
+        using namespace std::chrono_literals;
+        const auto db2=std::string(dir)+"/alarm-retry-directory.db";
+        const auto scope=[](const SyncKey&){return true;};
+        const auto policy=[](std::string_view,const SyncKey&,I){return true;};
+        {
+            CounterDirectory directory(db2,CounterDirectory::KeyedGuest(
+                [](const SyncKey&,I n,I,I d)->I{return n+d;}),
+                scope,16,4,1,10ms,0ms,0ms,"",true,policy,true);
+            SqliteActorSync admin(db2);
+            admin.set_principal_policy(a,"alice",1,0,true);
+            admin.set_principal_policy(c,"bob",1,0,true);
+            assert(directory.schedule_principal_alarm(a,0,0,"alice","operator",[]{}).get()==1);
+            assert(directory.schedule_principal_alarm(c,0,1,"bob","operator",[]{}).get()==1);
+        }
+        std::atomic<int> failures{0};
+        {
+            CounterDirectory directory(db2,CounterDirectory::KeyedGuest(
+                [&](const SyncKey& k,I n,I,I d)->I{
+                    if(k.object_id==a.object_id){++failures;throw CounterDirectory::RetryableGuestFailure();}
+                    return n+d;
+                }),scope,16,4,1,10ms,10ms,0ms,"",true,policy,true);
+            SqliteActorSync admin(db2);
+            const auto until=CounterDirectory::Clock::now()+5s;
+            while((admin.principal_alarm_authority(a)->status!=SyncAlarmStatus::failed ||
+                   admin.principal_alarm_authority(c)->status!=SyncAlarmStatus::fired) &&
+                   CounterDirectory::Clock::now()<until)
+                std::this_thread::sleep_for(5ms);
+            assert(failures==3 && !directory.alarm_fault());
+            assert(admin.principal_alarm_authority(a)->status==SyncAlarmStatus::failed);
+            assert(admin.principal_alarm_authority(c)->status==SyncAlarmStatus::fired);
+            assert(admin.snapshot(a).revision==0 && admin.snapshot(c).bytes=="1");
+        }
+    }
     std::filesystem::remove_all(dir);
 }
