@@ -324,6 +324,42 @@ restart deduplication and pending-mail recovery under identical deployment,
 and rejects changed configuration and legacy fallback. These are authored
 tests, not a Wave 14 execution receipt.
 
+### Tenant-aware durable admission and dispatch (Wave 17 candidate)
+
+Storage PR #9 bounds retained inbox records across all objects and
+namespaces of a tenant: default 1,024 records and 16 MiB of aggregate
+command payload, in addition to existing actor/database limits. Dead
+letters remain charged until a future explicit retention API; exact
+pending/terminal replay is checked before admission quotas. Reopen
+rejects a configuration that would silently abandon retained mail.
+These are inbox payload/count limits, not total database size, actor
+activation quota, aggregate CPU/memory quota or a network rate limit.
+
+The scheduler uses a rotating tenant cursor and ranks eligible heads
+within each tenant before applying the 256-head scan limit. A sparse
+tenant's head need not wait behind all earlier hot-tenant objects.
+Within one tenant older eligible heads come first; a backed-off head
+still blocks later live mail for its own object. Existing per-object
+FIFO, durable attempt/epoch fencing and worker bounds remain in force.
+The cursor is volatile and this is best-effort discovery fairness, not
+a guaranteed tenant resource share, preemption or latency SLA. The
+ordinary transient scheduler and alarm poller are not tenant-fair yet.
+
+Regression cases include 260 hot objects plus a sparse tenant, cursor
+wraparound, single-worker integration (quiet tenant second), retry
+backoff, retained dead-letter capacity, exact replay under saturation,
+independent byte limit rejection and fail-closed quota reduction.
+The new tests are authored and the workflow pins storage head
+`9ab67c38f5b9c889daf69ac8c73061018310e36d`; exact-head execution is pending.
+
+Durable principal-bound admission remains intentionally separate:
+a short-lived process-local capability cannot serve as a restart-safe
+authorization record. Future ingress must persist a trusted principal
+binding atomically with admission and re-evaluate current policy before
+guest entry and publication; define revocation and terminal denied-mail
+semantics before enabling the persistent gateway. Do not reinterpret
+existing transient receipt IDs as durable authorization.
+
 ### Concurrent durable mailbox recovery (Wave 16 candidate)
 
 The mailbox supervisor no longer waits synchronously for a single object
