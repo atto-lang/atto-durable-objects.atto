@@ -2,6 +2,7 @@
 
 #include <sqlite3.h>
 #include <cstddef>
+#include <charconv>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -47,6 +48,10 @@ struct SyncAlarmChange {
     std::int64_t expected_generation;
     std::optional<std::int64_t> due_ms;
 };
+struct SyncMailAlarm {
+    SyncAlarmChange change;
+    std::string operator_id;
+};
 struct SyncAlarm {
     SyncKey key;
     std::int64_t generation;
@@ -89,6 +94,10 @@ struct SyncRedrive {
     std::int64_t original_sequence,new_sequence;
     std::string operation_id;
     bool duplicate=false;
+};
+class AlarmGenerationConflict final : public std::logic_error {
+public:
+    AlarmGenerationConflict():std::logic_error("alarm generation conflict"){}
 };
 class PrincipalPolicyChanged final : public std::logic_error {
 public:
@@ -554,12 +563,7 @@ public:
         const auto grant=policy_locked(key,principal,1);
         if(!grant.second) throw PrincipalPolicyChanged();
         const auto generation=set_alarm_locked(key,expected_generation,due_ms);
-        {
-            Statement write(db_,"INSERT INTO sync_alarm_authority VALUES(?,?,?,?,?,?,?,?,0) "
-                "ON CONFLICT(tenant,space,actor_type,id) DO UPDATE SET generation=excluded.generation,"
-                "principal=excluded.principal,grant_version=excluded.grant_version,operator_id=excluded.operator_id,status=0");
-            bind_key(write,key);write.i64(5,generation);write.text(6,principal);write.i64(7,grant.first);write.text(8,operator_id);write.done();
-        }
+        bind_alarm_authority_locked(key,generation,principal,grant.first,operator_id);
         tx.commit();return generation;
     }
 
@@ -688,6 +692,38 @@ public:
     // Durable admission is independent of execution. An accepted sequence
     // survives crash; exact retries resolve to the pending row or receipt.
     // Caller must hold authenticated exclusive controller/turn authority.
+    // Canonical persisted command extension. The operator ID is the
+    // remaining bytes (may contain colons), not a guest-controlled field.
+    static std::string encode_mail_alarm(std::int64_t delta,const SyncMailAlarm& effect) {
+        label(effect.operator_id);validate_alarm_change(&effect.change);
+        if(delta<=0 || delta>1000000000 || !effect.change.due_ms)
+            throw std::invalid_argument("invalid strict mailbox alarm effect");
+        return "1:"+std::to_string(delta)+":alarm:"+std::to_string(effect.change.expected_generation)+
+            ":"+std::to_string(*effect.change.due_ms)+":"+effect.operator_id;
+    }
+    static std::optional<SyncMailAlarm> mail_alarm_effect(std::string_view command) {
+        const auto split=command.find(":alarm:");
+        if(split==std::string_view::npos) return std::nullopt;
+        if(command.substr(0,2)!="1:" || split<=2) throw std::invalid_argument("invalid alarm command");
+        auto number=[](std::string_view v){
+            std::int64_t n=0;
+            const auto parsed=std::from_chars(v.data(),v.data()+v.size(),n);
+            if(v.empty() || parsed.ec!=std::errc{} || parsed.ptr!=v.data()+v.size() ||
+               n<0 || std::to_string(n)!=v) throw std::invalid_argument("noncanonical alarm command");
+            return n;
+        };
+        const auto delta=number(command.substr(2,split-2));
+        auto tail=command.substr(split+7);
+        const auto a=tail.find(':');
+        if(a==std::string_view::npos) throw std::invalid_argument("missing alarm deadline");
+        const auto generation=number(tail.substr(0,a));tail.remove_prefix(a+1);
+        const auto b=tail.find(':');
+        if(b==std::string_view::npos) throw std::invalid_argument("missing alarm operator");
+        SyncMailAlarm effect{{generation,number(tail.substr(0,b))},std::string(tail.substr(b+1))};
+        if(encode_mail_alarm(delta,effect)!=command) throw std::invalid_argument("invalid alarm command");
+        return effect;
+    }
+
     SyncAdmission admit_mail(const SyncKey& key,std::int64_t epoch,
                              std::string_view operation_id,std::string_view command,
                              std::string_view schema_fp,std::string_view principal={}) {
@@ -827,6 +863,7 @@ public:
             command=read.blob(0);schema=read.str(1);principal=read.str(2);
         }
         label(principal);label(schema);bounded(command,limits_.command_bytes);
+        if(mail_alarm_effect(command)) throw std::logic_error("effect-bearing mail requires fresh authorized admission");
         if(!policy_locked(key,principal,policy_op(command)).second) throw PrincipalPolicyChanged();
         std::optional<SyncRedrive> prior;
         {
@@ -870,6 +907,9 @@ private:
             if(bound!=!principal.empty() || (!principal.empty() && operation_id.substr(0,11)!="@principal:"))
                 throw std::logic_error("mail principal namespace mismatch");
         }
+        const auto effect=mail_alarm_effect(command);
+        if(effect && (!transactional_policy_locked() || principal.empty()))
+            throw PrincipalPolicyChanged();
         if(transactional_policy_locked()) {
             if(principal.empty() || !policy_locked(key,principal,policy_op(command)).second)
                 throw PrincipalPolicyChanged();
@@ -893,7 +933,10 @@ private:
                 completed=SyncCommit{read.number(2),read.blob(3),true};
             }
         }
-        if(completed){match_alarm_effect_locked(key,operation_id,nullptr);return {0,completed};}
+        if(completed){
+            match_alarm_effect_locked(key,operation_id,effect && completed->reply!="mail_overflow"?&effect->change:nullptr);
+            return {0,completed};
+        }
         std::int64_t existing=0;
         bool dead=false;
         {
@@ -1085,14 +1128,22 @@ public:
     // Policy denial is terminal and distinct from retry exhaustion in
     // admission responses. The retry table's dead sentinel releases the
     // completion reservation; no state, receipt or outbox is manufactured.
-    void deny_mail(const SyncMail& mail,std::int64_t epoch) {
+    void deny_mail(const SyncMail& mail,std::int64_t epoch,bool authorization_denial=true) {
         validate_key(mail.key);label(mail.principal);
         if(epoch<=0 || mail.attempt_epoch>epoch) throw std::invalid_argument("invalid denied mail envelope");
         std::lock_guard<std::mutex> lock(mu_);
         Tx tx(*this);
         if(snapshot_locked(mail.key).epoch!=epoch || !mail_matches_locked(mail))
             throw std::logic_error("stale denied mail token");
-        {
+        if(!authorization_denial) {
+            const auto effect=mail_alarm_effect(mail.command);
+            if(!effect || !transactional_policy_locked()) throw std::logic_error("invalid effect conflict termination");
+            std::int64_t generation=0;
+            Statement read(db_,"SELECT generation FROM sync_alarms WHERE tenant=? AND space=? AND actor_type=? AND id=?");
+            bind_key(read,mail.key);if(read.step()==SQLITE_ROW) generation=read.number(0);
+            if(generation==effect->change.expected_generation) throw std::logic_error("alarm generation still matches");
+        }
+        if(authorization_denial) {
             Statement write(db_,"UPDATE sync_mail_principal SET denied=1 WHERE sequence=? AND principal=? AND denied=0");
             write.i64(1,mail.sequence);write.text(2,mail.principal);write.done();
             if(sqlite3_changes(db_)!=1) throw std::logic_error("missing principal binding");
@@ -1122,9 +1173,13 @@ public:
                       const SyncMail* mail = nullptr,const SyncAlarmChange* change=nullptr) {
         validate_key(key); label(operation_id); label(schema_fp);
         validate_alarm_change(change);
-        // Durable mailbox scheduling must bind the effect at admission.
-        // This slice permits trusted transient and alarm-handler turns only.
-        if(change && mail) throw std::invalid_argument("mail alarm effect requires durable admission binding");
+        const auto effect=mail?mail_alarm_effect(command):std::optional<SyncMailAlarm>{};
+        if(mail) {
+            const bool apply=effect && reply!="mail_overflow";
+            if(apply!=static_cast<bool>(change) ||
+               (apply && (change->expected_generation!=effect->change.expected_generation || change->due_ms!=effect->change.due_ms)))
+                throw std::invalid_argument("mail alarm effect differs from admitted command");
+        }
         if(change && alarm && change->expected_generation!=alarm->generation)
             throw std::invalid_argument("alarm replacement must fence consumed generation");
         if(mail && (alarm || mail->sequence<=0 ||
@@ -1156,6 +1211,8 @@ public:
         }
         // BEGIN IMMEDIATE serializes this check with policy administration.
         // No transient/raw commits or unbound alarm effects in strict mode.
+        if(effect && !transactional_policy_locked()) throw PrincipalPolicyChanged();
+        std::int64_t effect_grant=0;
         if(transactional_policy_locked()) {
             if(alarm) {
                 if(change || !alarm_matches_locked(*alarm,now_ms)) throw PrincipalPolicyChanged();
@@ -1168,6 +1225,7 @@ public:
                 attempt.i64(1,mail->sequence);
                 if(!grant.second || attempt.step()!=SQLITE_ROW || attempt.number(0)!=grant.first)
                     throw PrincipalPolicyChanged();
+                if(effect) effect_grant=grant.first;
             }
         }
         std::optional<SyncCommit> replay;
@@ -1239,7 +1297,8 @@ public:
             if(sqlite3_changes(db_)!=1) throw std::logic_error("lost mailbox head");
         }
         if(change) {
-            (void)set_alarm_locked(key,change->expected_generation,change->due_ms);
+            const auto generation=set_alarm_locked(key,change->expected_generation,change->due_ms);
+            if(effect) bind_alarm_authority_locked(key,generation,mail->principal,effect_grant,effect->operator_id);
             Statement write(db_,"INSERT INTO sync_alarm_effects VALUES(?,?,?,?,?,?,?)");
             bind_key(write,key);write.text(5,operation_id);write.i64(6,change->expected_generation);
             if(change->due_ms) write.i64(7,*change->due_ms);
@@ -1499,7 +1558,7 @@ private:
             bind_key(read,key);
             if(read.step()==SQLITE_ROW) old=read.number(0);
         }
-        if(old!=expected_generation) throw std::logic_error("alarm generation conflict");
+        if(old!=expected_generation) throw AlarmGenerationConflict();
         if(old==std::numeric_limits<std::int64_t>::max()) throw std::overflow_error("alarm generation exhausted");
         {
             Statement write(db_,"INSERT INTO sync_alarms VALUES(?,?,?,?,?,?) "
@@ -1532,6 +1591,13 @@ private:
         if(!alarm_binding_matches_locked(alarm)) throw std::logic_error("invalid alarm authority binding");
         const auto grant=policy_locked(alarm.key,alarm.principal,1);
         if(!grant.second || grant.first!=alarm.grant_version) throw PrincipalPolicyChanged();
+    }
+    void bind_alarm_authority_locked(const SyncKey& key,std::int64_t generation,std::string_view principal,
+                                      std::int64_t grant_version,std::string_view operator_id) {
+        Statement write(db_,"INSERT INTO sync_alarm_authority VALUES(?,?,?,?,?,?,?,?,0) "
+            "ON CONFLICT(tenant,space,actor_type,id) DO UPDATE SET generation=excluded.generation,"
+            "principal=excluded.principal,grant_version=excluded.grant_version,operator_id=excluded.operator_id,status=0");
+        bind_key(write,key);write.i64(5,generation);write.text(6,principal);write.i64(7,grant_version);write.text(8,operator_id);write.done();
     }
     void finish_alarm_authority_locked(const SyncAlarm& alarm,std::int64_t status) {
         if(!alarm_binding_matches_locked(alarm)) throw std::logic_error("invalid alarm authority binding");
