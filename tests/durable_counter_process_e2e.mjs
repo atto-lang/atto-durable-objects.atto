@@ -10,7 +10,8 @@ import { createInterface } from 'node:readline';
 
 assert.ok(process.env.ATTOC && process.env.COUNTER_DRIVER, 'real compiler and host driver required');
 const compiler=resolve(process.env.ATTOC), driver=resolve(process.env.COUNTER_DRIVER);
-const source=readFileSync(new URL('../guest/durable_counter.atto',import.meta.url),'utf8');
+const actorProfile=process.env.DURABLE_ACTOR_PROFILE==='1';
+const source=readFileSync(new URL(actorProfile?'../guest/durable_counter_actor.atto':'../guest/durable_counter.atto',import.meta.url),'utf8');
 const dir=mkdtempSync(join(tmpdir(),'atto-counter-e2e-'));
 const db=join(dir,'counter.db');
 const hash=b=>createHash('sha256').update(b).digest('hex');
@@ -18,11 +19,11 @@ let executed=0;
 const receipts=[];
 // One source compilation, one reusable module, fresh instance per turn.
 // The checked compiler's opt-in export carries three i64 values and returns i64.
-const text=source+'\nfnc durable_transition(int n,int op,int d)->int { return durable_counter_next(n,op,d); }\npub fnc main()->int { return 0; }\n';
+const text=actorProfile?source:source+'\nfnc durable_transition(int n,int op,int d)->int { return durable_counter_next(n,op,d); }\npub fnc main()->int { return 0; }\n';
 function compileOnce() {
     const input=join(dir,'counter.atto'), output=join(dir,'counter.wasm');
     writeFileSync(input,text); rmSync(output,{force:true});
-    const r=spawnSync(compiler,['--durable-scalar-v1',input,'-o',output],{cwd:dir,encoding:'utf8',timeout:30000,maxBuffer:1<<20});
+    const r=spawnSync(compiler,[actorProfile?'--durable-counter-actor-v1':'--durable-scalar-v1',input,'-o',output],{cwd:dir,encoding:'utf8',timeout:30000,maxBuffer:1<<20});
     assert.equal(r.error,undefined); assert.equal(r.status,0,r.stderr);
     assert.ok(existsSync(output),'real compiler did not emit artifact');
     const bytes=readFileSync(output);
@@ -96,7 +97,7 @@ try {
     await turn('turn','a','same',2,'read',2,0,['COMMITTED 4 1000000000 0']);
     await turn('turn','b','same',1,'max',1,1,['COMMITTED 1 1 0']);
     assert.equal(executed,7);
-    console.log(JSON.stringify({kind:'COMPILED_SCALAR_GUEST_SQLITE_PROCESS_E2E',compiler_binary_sha256:hash(readFileSync(compiler)),
+    console.log(JSON.stringify({kind:actorProfile?'COMPILED_DURABLE_ACTOR_SQLITE_PROCESS_E2E':'COMPILED_SCALAR_GUEST_SQLITE_PROCESS_E2E',compiler_binary_sha256:hash(readFileSync(compiler)),
       driver_binary_sha256:hash(readFileSync(driver)),compiler_source_head_claim:process.env.ATTO_COMPILER_SOURCE_SHA??null,
       fixture_sha256:hash(source),guest_executions:executed,compiler_invocations:1,process_turns:13,receipts},null,2));
 } finally {rmSync(dir,{recursive:true,force:true});}
