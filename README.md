@@ -58,8 +58,8 @@ progress; epoch checks alone are not an ownership election protocol.
 | Automatic idle passivation, multi-object scheduling | Bounded host worker-pool prototype, tests authored (not executed) |
 | Cooperative single-host controller ownership | POSIX advisory lock prototype, competing-controller test authored |
 | Durable alarms | Generation-fenced storage + optional automatic FIFO dispatch prototype; tests authored, not executed |
-| Persistent mailbox admission and restart dispatch | Bounded host prototype; tests authored, not executed |
-| Mailbox retry, dead letters and completion reservation | Persistent host prototype, tests authored, not executed |
+| Persistent mailbox admission and restart dispatch | Wave 9 host regression passed |
+| Mailbox retry, dead letters and completion reservation | Wave 9 host regression passed |
 | Typed RPC and secure transport | Planned |
 | WebSocket hibernation, placement, replication and failover | Planned |
 
@@ -216,6 +216,58 @@ Host regression cases cover cancel/replace, stale owner and generation,
 rollback, reopen, auto-activation, consumed receipt replay and terminal
 overflow. See the directory and actor-sync recovery tests; new tests remain
 unexecuted pending exact-head CI. No exactly-once external effect claim.
+
+### Bounded compiled guest process runner (Wave 10 candidate)
+
+[CounterProcessGuest](native/include/ores/durable/counter_process_guest.hpp)
+is a Linux/glibc host runner compatible with the existing directory's scalar
+guest callback. It launches a fixed trusted Node/Wasm worker without a shell,
+with an empty environment, redirected standard streams and closed extra file
+descriptors. The worker verifies the expected SHA-256, reads at most 1 MiB of
+Wasm, rejects host imports and unexpected exports, and returns one canonical
+bounded scalar. The parent bounds stdout and waits for the child to exit.
+A wall-clock deadline triggers SIGKILL followed by waitpid/reap **before**
+reporting a classified failure; a Wasm trap is classified only after exit.
+Digest, protocol and unexpected process errors fail closed.
+
+The new [compiled watchdog fixture](tests/durable_counter_watchdog_e2e.mjs)
+compiles an AttoLang transition once, including a deliberately looping branch,
+then exercises the directory with actual Wasm children. Tests require a deadline
+timeout, no remaining child, terminal dead-letter status after three classified
+failures, subsequent healthy execution, and artifact digest rejection.
+This is a candidate process-per-turn reference, not a high-performance
+persistent worker pool. It assumes trusted immutable script/artifact paths,
+a sole waitpid owner, and a cooperating local controller. It is not a full
+hostile-tenant sandbox: OS/cgroup memory and CPU limits, deterministic Wasm
+fuel, crash-counted attempts, worker isolation and authenticated artifact
+provenance remain outstanding. A wall deadline includes startup and scheduling;
+an uninterruptible OS process cannot be treated as stopped until actually reaped.
+
+### Executed Wave 9 evidence (2026-11-24)
+
+- [Runtime run 45522504636](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45522504636)
+  executed exact head `d18f26d328b618b056120c0a863b81bb9c71be0d`,
+  root tree `6ff280af9f08119ec852a17e05882a273f6117dc`.
+  The compiled scalar SQLite process fixture passed 13 process turns, seven
+  actual guest evaluations, one compiler invocation and a single repeated
+  Wasm SHA-256 `8ac38b5b4ea76e6e0b8c9df56d72353c2e7739f6f1ab5e3e341c7dd3ae69ec64`.
+  Host-only counter, directory, ASan/UBSan and storage alarm/mailbox/retry
+  recovery tests passed separately.
+- [Storage run 45522468879](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45522468879)
+  executed GCC TSan and GCC/Clang ASan/UBSan jobs on
+  `e4133470f18d7c2c9a0bf250df6b86096488b9b3` (tree
+  `9873db34a026ad3a48269d1d42f0677d129fe9f2`).
+- [Compiler ABI run 45520132964](https://github.com/atto-lang/atto-source.rs/actions/runs/45520132964)
+  emitted `DURABLE_SCALAR_ABI_V1_PASS` at
+  `1d6e8e31453064b6530c5c82679aef3cc9db489b` (tree
+  `89f29eb33650b69d3ab8a12da73a28ea26f4b42f`). Broader compiler
+  CI remains red: the native checked-i64 fixture imports an unavailable
+  legacy crate `oreslang_source_rs`; full corpus, formatting and repository
+  policy gates require independent remediation. No cross-backend parity claim.
+
+These receipts supersede the older pending statuses for Wave 9 and earlier
+features covered by those tests. The new Wave 10 watchdog and integrated
+directory guest tests do not yet have executed receipts.
 
 ### Compile-once candidate ABI
 
