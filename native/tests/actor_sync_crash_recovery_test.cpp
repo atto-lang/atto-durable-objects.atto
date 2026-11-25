@@ -548,5 +548,56 @@ int main() {
             assert(store.pending_mail().empty());
         }
     }
+    // Independent connections serialize policy changes against state commits.
+    {
+        const auto strict_db=std::string(dir)+"/strict-policy.db";
+        const SyncKey k{"tenant","mail","Counter","strict"};
+        SqliteActorSync store(strict_db),admin(strict_db);
+        store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+        const auto epoch=store.activate_next(k);
+        bool denied=false;
+        try {store.admit_mail(k,epoch,"@principal:one","1:1","counter","alice");}
+        catch(const PrincipalPolicyChanged&) {denied=true;}
+        assert(denied);
+        assert(admin.set_principal_policy(k,"alice",1,0,true)==1);
+        assert(admin.set_principal_policy(k,"bob",1,0,true)==1);
+        store.admit_mail(k,epoch,"@principal:one","1:1","counter","alice");
+        store.admit_mail(k,epoch,"@principal:two","1:2","counter","bob");
+        auto heads=store.pending_mail();
+        auto started=store.begin_mail(heads[0],epoch,0);
+        // A revoke/regrant ABA must still invalidate the in-flight version.
+        assert(admin.set_principal_policy(k,"alice",1,1,false)==2);
+        assert(admin.set_principal_policy(k,"alice",1,2,true)==3);
+        denied=false;
+        try {store.commit(k,epoch,0,"@principal:one","1:1","counter","1","1",false,nullptr,0,&started);}
+        catch(const PrincipalPolicyChanged&) {denied=true;}
+        assert(denied && store.snapshot(k).revision==0 && store.changes_after(k,0).empty());
+        store.deny_mail(started,epoch);
+        auto terminal=store.admit_mail(k,epoch,"@principal:one","1:1","counter","alice");
+        assert(terminal.authorization_denied && terminal.dead_letter && !terminal.receipt);
+        heads=store.pending_mail();
+        auto next=store.begin_mail(heads[0],epoch,0);
+        assert(store.commit(k,epoch,0,"@principal:two","1:2","counter","2","2",false,nullptr,0,&next).revision==1);
+        assert(admin.set_principal_policy(k,"bob",1,1,false)==2);
+        denied=false;
+        try {store.admit_mail(k,epoch,"@principal:two","1:2","counter","bob");}
+        catch(const PrincipalPolicyChanged&) {denied=true;}
+        assert(denied && store.snapshot(k).bytes=="2");
+        denied=false;
+        try {store.commit(k,epoch,1,"raw","1:1","counter","3","3");}
+        catch(const PrincipalPolicyChanged&) {denied=true;}
+        assert(denied);
+        denied=false;
+        try {admin.set_principal_policy(k,"bob",1,1,true);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        SqliteActorSync reopened(strict_db);
+        denied=false;
+        try {reopened.bind_transactional_policy(false);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        reopened.bind_transactional_policy(true);
+        assert(reopened.snapshot(k).revision==1 && reopened.pending_mail().empty());
+    }
     std::filesystem::remove_all(dir);
 }
