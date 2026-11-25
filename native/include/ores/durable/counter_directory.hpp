@@ -131,17 +131,43 @@ private:
         return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
     }
+    bool alarm_authorized(const SyncAlarm& alarm) const {
+        check(alarm.key.tenant);check(alarm.key.name_space);check(alarm.key.actor_type);check(alarm.key.object_id);
+        if(alarm.key.actor_type!="Counter") throw std::logic_error("unexpected alarm actor");
+        if(!transactional_policy_) {
+            if(!alarm.principal.empty()) throw std::logic_error("strict alarm policy required");
+            validate(alarm.key);return true;
+        }
+        if(alarm.principal.empty() || alarm.grant_version<=0 || !mail_policy_)
+            throw std::logic_error("missing alarm authority");
+        return authorize_(alarm.key) && mail_policy_(alarm.principal,alarm.key,1);
+    }
+    struct AlarmPolicyDenied {};
     std::future<Reply> enqueue_alarm(SyncAlarm alarm) {
-        validate(alarm.key);
+        check(alarm.key.tenant);check(alarm.key.name_space);check(alarm.key.actor_type);check(alarm.key.object_id);
         const auto id=identity(alarm.key);
         return submit(id,[this,id,alarm=std::move(alarm)]{
-            validate(alarm.key);
             const auto epoch=activate(id,alarm.key);
             try {
-                auto r=CounterTurn::run_alarm(store_,alarm,epoch,unix_ms(),guarded_guest(alarm.key));
-                validate(alarm.key);
-                if(store_.snapshot(alarm.key).epoch!=epoch) throw std::logic_error("stale alarm publication epoch");
-                return r;
+                try {
+                    if(!alarm_authorized(alarm)) throw AlarmPolicyDenied{};
+                    auto invoke=guarded_guest(alarm.key);
+                    auto checked=[&](auto n,auto op,auto d) {
+                        if(!alarm_authorized(alarm)) throw AlarmPolicyDenied{};
+                        auto result=invoke(n,op,d);
+                        if(!alarm_authorized(alarm)) throw AlarmPolicyDenied{};
+                        return result;
+                    };
+                    auto result=CounterTurn::run_alarm(store_,alarm,epoch,unix_ms(),checked);
+                    if(!alarm_authorized(alarm)) return Reply{};
+                    if(store_.snapshot(alarm.key).epoch!=epoch) throw std::logic_error("stale alarm publication epoch");
+                    return result;
+                } catch(const PrincipalPolicyChanged&) {
+                    if(!transactional_policy_) throw;
+                    (void)store_.deny_principal_alarm(alarm,epoch,unix_ms());return Reply{};
+                } catch(const AlarmPolicyDenied&) {
+                    (void)store_.deny_principal_alarm(alarm,epoch,unix_ms());return Reply{};
+                }
             } catch(...) {
                 retire(id);throw;
             }
@@ -446,7 +472,7 @@ public:
         if(!guest_ || !authorize_ || !capacity_ || !active_limit_ ||
            !workers || workers>64 || idle_timeout_<Clock::duration::zero() ||
            alarm_interval<Clock::duration::zero() || mail_interval<Clock::duration::zero() ||
-           (principal_mode_ && (alarm_interval!=Clock::duration::zero() || (mail_interval!=Clock::duration::zero() && !mail_policy_))) ||
+           (principal_mode_ && ((alarm_interval!=Clock::duration::zero() && (!transactional_policy_ || !mail_policy_)) || (mail_interval!=Clock::duration::zero() && !mail_policy_))) ||
            (!principal_mode_ && mail_policy_) || (transactional_policy_ && !principal_mode_))
             throw std::invalid_argument("invalid directory configuration");
         // Reject changed or missing deployment before any activation or replay.
@@ -580,6 +606,34 @@ public:
     }
     // Trusted controls join the same FIFO as normal requests. A generation
     // CAS rejects stale retries, including retries following a lost reply.
+    // Trusted operator only, not an ordinary principal capability.
+    // The callback must authenticate and authorize the operator for this
+    // exact object, principal and scheduling action.
+    std::future<std::int64_t> schedule_principal_alarm(SyncKey k,std::int64_t generation,std::int64_t due,
+             std::string principal,std::string operator_id,std::function<void()> authorize_operator) {
+        if(!transactional_policy_ || !mail_policy_ || !authorize_operator)
+            throw std::logic_error("strict operator alarm authority required");
+        validate(k);check(principal);check(operator_id);
+        if(generation<0 || due<0) throw std::invalid_argument("invalid alarm schedule");
+        authorize_operator();
+        if(!mail_policy_(principal,k,1)) throw PrincipalPolicyChanged();
+        const auto id=identity(k);
+        return submit(id,[this,id,k=std::move(k),generation,due,principal=std::move(principal),
+                          operator_id=std::move(operator_id),authorize_operator=std::move(authorize_operator)]{
+            auto check_authority=[&]{
+                validate(k);authorize_operator();
+                if(!mail_policy_(principal,k,1)) throw PrincipalPolicyChanged();
+            };
+            check_authority();
+            const auto epoch=activate(id,k);
+            try {
+                const auto next=store_.set_principal_alarm(k,epoch,generation,due,principal,operator_id);
+                check_authority();
+                if(store_.snapshot(k).epoch!=epoch) throw std::logic_error("stale alarm admission epoch");
+                return next;
+            } catch(...) {retire(id);throw;}
+        });
+    }
     std::future<std::int64_t> set_alarm(SyncKey k,std::int64_t expected_generation,
                                         std::optional<std::int64_t> due_ms) {
         validate(k);
