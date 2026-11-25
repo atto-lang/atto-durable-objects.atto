@@ -144,3 +144,41 @@ then connect the real Wasm guest to a fenced turn via a bounded asynchronous
 host adapter and replace the test callback with actual guest execution.
 No distributed ownership, automatic activation, alarm, or passivation
 implementation yet.
+
+## Wave 3: process-integrated compiled guest (2026-11-24)
+
+The pinned Rust/Wasm parser requires `fi` even after a braced conditional;
+the fixture now uses that form and canonical `eq`/`neq`. Source review
+is not execution evidence.
+
+The real compiler currently exports only a zero-argument `main` for scalar
+programs. Rather than silently invent a guest ABI, the new test driver
+`native/tests/counter_guest_driver.cpp` and
+`tests/durable_counter_process_e2e.mjs` use a bounded per-turn fixture:
+a fresh trusted host process reads its fenced SQLite snapshot, emits a
+scalar guest request via a pipe, and the test runner compiles the checked-in
+AttoLang kernel plus a generated main with bounded integer inputs. It
+instantiates the actual emitted Wasm without imports and returns its
+computed value to the same process for authoritative commit. No host
+transition substitute is used in this lane. The host validates the result,
+commits or rejects, and returns only the durable receipt. The test records
+source and artifact hashes for each of seven expected guest executions.
+
+The thirteen fixture process invocations exercise activation of two
+tenant-scoped identities, ordinary commit, precommit rollback and retry,
+SIGKILL after successful commit and before publication, a fresh epoch,
+stale-owner rejection, same-request replay without guest execution even
+at the maximum count, changed-command rejection, overflow rejection, read,
+and independent same-name object in another tenant. This is a serial
+test-only harness; it does not provide automatic activation, concurrent
+mailbox scheduling, asynchronous I/O, a persistent compiler/guest instance,
+security sandboxing, or an externally accessible RPC service. Per-turn
+compilation is explicitly not a production performance strategy.
+
+CI invokes the actual pinned compiler and host driver in the guest lane.
+No guest or host test is a PASS until its exact-head run executes.
+Production next step: add a checked argument/result ABI or actor dispatch
+ABI in the compiler, then an authenticated single-owner activation manager
+that holds a per-object turn permit across suspended work and publication.
+Do not use epoch rotation as a substitute for exclusive activation or a
+lease authority. SQLite work belongs on isolated bounded I/O workers.
