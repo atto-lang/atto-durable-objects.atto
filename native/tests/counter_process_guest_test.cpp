@@ -11,9 +11,16 @@ int main(int argc,char** argv) {
     CounterProcessGuest runner(argv[1],argv[2],argv[3],argv[4],1500ms);
     assert(runner(0,1,2)==2);
     bool stopped=false;
+    const auto start=CounterDirectory::Clock::now();
     try {(void)runner(0,1,7);}
     catch(const CounterDirectory::RetryableGuestFailure&) {stopped=true;}
-    assert(stopped);
+    assert(stopped && CounterDirectory::Clock::now()-start>=1500ms);
+    CounterProcessGuest wrong(argv[1],argv[2],argv[3],std::string(64,'0'),1500ms);
+    bool invalid=false;
+    try {(void)wrong(0,1,2);}
+    catch(const CounterDirectory::RetryableGuestFailure&) {assert(false);}
+    catch(const std::runtime_error&) {invalid=true;}
+    assert(invalid);
     int status=0;
     assert(::waitpid(-1,&status,WNOHANG)==-1 && errno==ECHILD);
     char tmp[]="/tmp/atto-process-mail-XXXXXX";
