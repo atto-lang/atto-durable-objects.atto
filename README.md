@@ -376,6 +376,36 @@ Host directory ASan/UBSan and storage recovery markers also passed.
 Wave 27 remained queued at inspection. These historical results
 do not certify Wave 28.
 
+### Compiled durable Counter actor (next candidate)
+
+[Compiler PR #566](https://github.com/atto-lang/atto-source.rs/pull/566)
+now adds an opt-in `--durable-counter-actor-v1` mode at
+`d8763e35749191a9a94c68e79a40496fb50558bf`. It parses the actual
+[durable actor source](guest/durable_counter_actor.atto), validates its
+persistable state schema and exact receive AST, and uses the ordinary
+actor checker on a validation-only volatile clone. It never emits that
+clone. Only the proven single-field zero-initialized integer increment
+shape is lowered to the existing checked scalar broker ABI. Unsupported
+state, handlers, imports and extra declarations fail closed. The normal
+browser compiler still refuses durable actor runtime lowering.
+
+The process integration suite now runs twice, against the original scalar
+function and against the actual actor declaration, on separately created
+databases. Each requires seven executed Wasm transitions across thirteen
+host process invocations, one compilation, rollback, SIGKILL after commit,
+fenced restart, exact replay and tenant isolation. The existing scalar
+watchdog/fuel and other regression suites remain mandatory. No host
+transition substitute or source-only pass is accepted. Both compiler and
+integration CI are pending; no new execution claim.
+
+This is a deliberately restricted actor-to-scalar specialization, not
+general actor dispatch, user-defined message ADTs, general generated
+snapshot codecs, suspension or arbitrary durable actor execution.
+The broker still owns the counter-specific bounded domain and read
+operation, SQLite state encoding and transaction. The pinned compiler
+and host must converge with the typed actor-state and Job ingress branches
+before broader semantics or cross-backend parity can be claimed.
+
 ### Shared tenant resource reservations (Wave 27 candidate)
 
 All transient, durable mailbox, alarm and control turns now share a
