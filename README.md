@@ -55,31 +55,52 @@ progress; epoch checks alone are not an ownership election protocol.
 | Compile-once scalar Wasm entry | [Compiler PR #566](https://github.com/atto-lang/atto-source.rs/pull/566), draft, not executed |
 | Compiled guest to SQLite, hard kill after commit, replay | [Process integration fixture](tests/durable_counter_process_e2e.mjs), not executed |
 | Automatic named activation, exclusive FIFO turns, explicit passivation | [Host directory prototype](native/include/ores/durable/counter_directory.hpp), tests authored, not executed |
-| Automatic idle passivation, multi-object scheduling | Planned |
+| Automatic idle passivation, multi-object scheduling | Bounded host worker-pool prototype, tests authored (not executed) |
+| Cooperative single-host controller ownership | POSIX advisory lock prototype, competing-controller test authored |
 | Durable alarms, typed RPC and secure transport | Planned |
 | WebSocket hibernation, placement, replication and failover | Planned |
 
 ### Virtual actor directory (host prototype)
 
 [CounterDirectory](native/include/ores/durable/counter_directory.hpp) resolves
-the complete tenant/namespace/type/name tuple; a trusted authorization
-callback checks access before admission, at execution and before returning
-the receipt. A dedicated single worker drains a bounded FIFO and lazily
-allocates a durable monotonic activation epoch. Callers receive a host
-future without blocking on SQLite; the queue rejects overflow. Explicit
-passivation is an ordered barrier, so active turns are never evicted and
-the next call loads the committed snapshot under a fresh epoch.
+the full tenant/namespace/type/name tuple. Trusted authorization is checked
+at admission, execution and before returning a receipt. A fixed-size worker
+pool (1–64 workers, default 1) runs separate FIFO object lanes; a running lane
+is never scheduled twice, even if its trusted callback blocks. Rotating
+ready-object selection avoids fixed key-order starvation. SQLite transactions
+remain serialized through the shared store; distinct guest computations can
+progress concurrently. Pending admissions and active epochs have separate
+quotas. Worker threads, rather than guest carriers, perform blocking storage.
 
-This is a **single-controller** host prototype, not a production tenant
-sandbox or distributed lease manager. The external controller must own the
-store exclusively and provide thread-safe authorization and a terminating
-trusted guest runner. One worker serializes all objects; it does not yet
-prove cross-object concurrency or integrate AttoLang suspensions. Futures
-are host-only and do not grant external publication rights. Idle eviction,
-cancellation, authenticated ingress, durable inbox admission and watchdogs
-remain outstanding. [Directory test](native/tests/counter_directory_test.cpp)
-covers FIFO, quota rejection, replay, explicit passivation and reopen;
-execution is not yet verified.
+```text
+authorized request -> bounded per-object FIFO -> ready lane rotation
+    -> exclusive worker turn -> lazy persisted epoch -> guest transition
+    -> atomic state/receipt/outbox -> host future
+```
+
+Explicit passivation is a FIFO barrier. Optional monotonic-clock idle
+passivation removes only a lane with no executing or queued turn. It never
+deletes committed state; the next authorized request allocates a fresh
+persisted epoch. Idle passivation is disabled by default; configure a positive
+duration on the host. An authorized `is_active` diagnostic is observational
+only, not a lease or capability.
+
+A persistent POSIX advisory lock on the canonical database's sibling
+`.controller.lock` file prevents cooperating local controllers from opening
+the same store simultaneously. The lock spans the full worker and store
+lifetime and is never unlinked by the controller. It assumes a trusted local
+directory, stable paths, and cooperative raw-store users; not distributed
+consensus, hostile-filesystem defense or a tenant sandbox. Authorization and
+guest callbacks must be thread-safe and terminating. The host future is not
+the AttoLang suspension ABI, and does not grant network publication rights.
+
+[Directory tests](native/tests/counter_directory_test.cpp) now cover 100
+ordered turns, dedupe, backpressure, restart, explicit and idle passivation,
+cross-object progress during a held turn, no same-object overlap, and
+competing-controller rejection. CI also schedules ASan/UBSan. None of this
+new directory evidence has executed yet. Compiled guest integration in the
+directory, authenticated ingress, durable inbox, cancellation, fuel/time
+quotas and alarms remain outstanding.
 
 ### Compile-once candidate ABI
 
