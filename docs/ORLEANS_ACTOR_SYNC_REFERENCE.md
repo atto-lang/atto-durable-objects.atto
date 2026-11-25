@@ -112,3 +112,26 @@ Opening a reference store now takes a SQLite `BEGIN IMMEDIATE` transaction **aft
 Legacy SQLite files may still be in rollback-journal mode when two reference-store processes open them simultaneously. Journal-mode conversion is not permitted inside the immediate migration transaction. The constructor therefore uses a bounded five-second contention-only retry around `PRAGMA journal_mode=WAL`, validates that SQLite actually reports `wal`, and then enters the atomic DDL migration. Unexpected SQLite errors and non-WAL modes fail closed.
 
 An **isolated local SQLite probe**, not the compiled C++ repository suite, exercised two concurrent WAL conversions and schema upgrades (2/2 completed with original revision 7 preserved) plus rollback of a rejected poisoned legacy projection. The exact-header C++ migration and sanitizer tests still require stepful CI. Store construction and bounded retry are trusted host startup operations and must never run on an AttoLang scheduler carrier.
+
+
+## Crash-counted dispatch markers (Wave 12 candidate)
+
+An additive `sync_mail_attempt` table binds the immutable inbox sequence
+to the active epoch before trusted guest dispatch. The pending scan and
+exact-head CAS include the marker. A marked completion must use the same
+epoch and exact attempt; the inbox deletion cascades the marker in the
+state/receipt/outbox transaction. A stopped-guest failure clears it in the
+same transaction as the retry/dead-letter update. A newer owner can resolve
+a surviving marker once, after establishing that the prior execution is
+retired. A marker persisted before launch may conservatively consume retry
+budget. Unmarked legacy trusted host calls remain supported only on
+unmarked rows; these are not the production dispatch path.
+
+Epoch allocation is not a lease authority or proof of physical quiescence.
+The caller must hold the exclusive controller/turn permit and ensure no
+old guest can exercise authority. The scalar directory only allows the pure
+authority-free guest profile for abandoned-marker recovery. Arbitrary
+orphaned actor effects are out of scope. New fork/reopen regressions cover
+three lost dispatches, stale/duplicate token rejection, no success receipt
+or outbox on failure, and marked completion rollback/retry. No executed
+Wave 12 evidence yet.
