@@ -293,7 +293,7 @@ the registry check. General actor ABI proposal extends
 [atto-spec #63](https://github.com/atto-lang/atto-spec/pull/63);
 the scalar implementation is not that ABI.
 
-Wave 13 regressions are pending exact-head execution.
+Wave 13 guest and host regressions passed in run 45653915725 (see below).
 
 ### Signed immutable deployment identity (Wave 14 candidate)
 
@@ -326,6 +326,45 @@ checks signature/key/manifest tampering, validates scoped dispatch, verifies
 restart deduplication and pending-mail recovery under identical deployment,
 and rejects changed configuration and legacy fallback. These are authored
 tests, not a Wave 14 execution receipt.
+
+### Principal-scoped ingress (Wave 15 candidate)
+
+Wave 13 exact-head `5fedf9fe3589b1d856f118d79245232209af5f62`
+guest and host jobs passed in [run 45653915725](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45653915725).
+Wave 14 signed deployment and Wave 15 principal tests still require their
+own exact-head receipts.
+
+CounterPrincipalGateway issues opaque, process-local, exact-object and
+operation capabilities to a **previously authenticated** stable principal.
+Trusted policy is checked at issue, submission, worker entry, before and
+after guest execution, and before host receipt handoff. Grants expire in
+at most five minutes; a capability from a previous gateway instance is
+not accepted. Principal and caller request ID are canonically length-framed
+and SHA-256 scoped in a reserved receipt namespace, so two principals
+using the same client request ID cannot replay each other's receipt.
+A fresh valid grant may replay that principal's original committed request
+after restart. Conflicting command replay remains rejected by storage.
+
+Gateway startup reserves the namespace transactionally and rejects legacy
+inbox/receipt collisions; ordinary raw controller startup is denied once
+gateway mode is enabled. The raw store and authorized-send hook remain
+trusted host APIs, not network boundaries. A policy change racing the final
+SQLite transaction cannot undo a commit; post-commit revocation can
+suppress reply handoff, and external transport must recheck publication
+authority. This does not provide linearizable revocation or network token
+authentication. Principal gateway intentionally exposes transient send
+only: durable principal-bound admission, persisted policy/revocation,
+authenticated transport, alarm/control grants and key rotation are future
+work. Tests cover per-principal receipt isolation, scope denial, operation
+bounds, expiry, policy change, restart grants, replay and reserved
+namespace collision. No Wave 15 execution claim.
+
+General compiled durable actor lowering remains a separate compiler task:
+coordinate [Rust/Wasm #167](https://github.com/atto-lang/atto-source.rs/pull/167)
+(sealed state), [#402](https://github.com/atto-lang/atto-source.rs/pull/402)
+(typed Job ingress), and [#566](https://github.com/atto-lang/atto-source.rs/pull/566)
+(scalar transition) with [spec #63](https://github.com/atto-lang/atto-spec/pull/63).
+None of those independently establishes the general durable actor ABI.
 
 ### Bounded compiled guest process runner (Wave 10 — executed)
 
