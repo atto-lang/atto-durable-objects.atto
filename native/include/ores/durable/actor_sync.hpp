@@ -40,6 +40,12 @@ struct SyncCommit {
     std::string reply;
     bool duplicate;
 };
+// One durable alarm per logical actor. Generation survives cancel/consume.
+struct SyncAlarm {
+    SyncKey key;
+    std::int64_t generation;
+    std::int64_t due_ms;
+};
 class ResyncRequired final : public std::logic_error {
 public:
     ResyncRequired() : std::logic_error("sync cursor requires a fresh snapshot") {}
@@ -108,6 +114,12 @@ public:
                  "schema_fp TEXT NOT NULL, snapshot BLOB NOT NULL,"
                  "PRIMARY KEY(tenant,space,actor_type,id,revision),"
                  "FOREIGN KEY(tenant,space,actor_type,id) REFERENCES sync_objects(tenant,space,actor_type,id)) WITHOUT ROWID");
+            exec("CREATE TABLE IF NOT EXISTS sync_alarms("
+                 "tenant TEXT NOT NULL, space TEXT NOT NULL, actor_type TEXT NOT NULL, id TEXT NOT NULL,"
+                 "generation INTEGER NOT NULL CHECK(generation>0), due_ms INTEGER CHECK(due_ms>=0),"
+                 "PRIMARY KEY(tenant,space,actor_type,id),"
+                 "FOREIGN KEY(tenant,space,actor_type,id) REFERENCES sync_objects(tenant,space,actor_type,id)) WITHOUT ROWID");
+            exec("CREATE INDEX IF NOT EXISTS sync_alarm_due ON sync_alarms(due_ms,tenant,space,actor_type,id) WHERE due_ms IS NOT NULL");
             exec("CREATE TABLE IF NOT EXISTS sync_projection("
                  "consumer TEXT NOT NULL, tenant TEXT NOT NULL, space TEXT NOT NULL,"
                  "actor_type TEXT NOT NULL, id TEXT NOT NULL, epoch INTEGER NOT NULL,"
@@ -246,6 +258,67 @@ public:
         return replay;
     }
 
+    // Trusted actor-turn controller only. Replace/cancel with an exact
+    // generation CAS; NULL deadline is a retained tombstone, never reuse IDs.
+    // This control transaction is separate from state mutation in v0.
+    std::int64_t set_alarm(const SyncKey& key, std::int64_t epoch,
+                           std::int64_t expected_generation,
+                           std::optional<std::int64_t> due_ms) {
+        validate_key(key);
+        if(epoch<=0 || expected_generation<0 || (due_ms && *due_ms<0))
+            throw std::invalid_argument("invalid alarm control");
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this);
+        if(snapshot_locked(key).epoch!=epoch) throw std::logic_error("stale alarm owner");
+        std::int64_t old=0;
+        {
+            Statement read(db_,"SELECT generation FROM sync_alarms WHERE tenant=? AND space=? AND actor_type=? AND id=?");
+            bind_key(read,key);
+            if(read.step()==SQLITE_ROW) old=read.number(0);
+        }
+        if(old!=expected_generation) throw std::logic_error("alarm generation conflict");
+        if(old==std::numeric_limits<std::int64_t>::max()) throw std::overflow_error("alarm generation exhausted");
+        {
+            Statement write(db_,"INSERT INTO sync_alarms VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(tenant,space,actor_type,id) DO UPDATE SET generation=excluded.generation,due_ms=excluded.due_ms");
+            bind_key(write,key);write.i64(5,old+1);
+            if(due_ms) write.i64(6,*due_ms);
+            else if(sqlite3_bind_null(write.p,6)!=SQLITE_OK) throw std::runtime_error("alarm null bind failed");
+            write.done();
+        }
+        tx.commit();return old+1;
+    }
+
+    // Trusted scheduler: bounded indexed scan; not a claim or reservation.
+    std::vector<SyncAlarm> due_alarms(std::int64_t now_ms, std::size_t limit=64) {
+        if(now_ms<0 || limit==0 || limit>256) throw std::invalid_argument("invalid alarm scan");
+        std::lock_guard<std::mutex> lock(mu_);
+        std::vector<SyncAlarm> due;
+        Statement read(db_,"SELECT tenant,space,actor_type,id,generation,due_ms FROM sync_alarms "
+                           "WHERE due_ms IS NOT NULL AND due_ms<=? ORDER BY due_ms,tenant,space,actor_type,id LIMIT ?");
+        read.i64(1,now_ms);read.i64(2,static_cast<std::int64_t>(limit));
+        while(read.step()==SQLITE_ROW) {
+            SyncAlarm a{{read.str(0),read.str(1),read.str(2),read.str(3)},read.number(4),read.number(5)};
+            validate_key(a.key);due.push_back(std::move(a));
+        }
+        return due;
+    }
+    bool alarm_pending(const SyncAlarm& alarm, std::int64_t epoch, std::int64_t now_ms) {
+        validate_key(alarm.key);
+        if(epoch<=0 || alarm.generation<=0 || alarm.due_ms<0 || now_ms<alarm.due_ms)
+            return false;
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this,false);
+        if(snapshot_locked(alarm.key).epoch!=epoch) throw std::logic_error("stale alarm owner");
+        const bool pending=alarm_matches_locked(alarm,now_ms);
+        tx.commit();return pending;
+    }
+
+    static std::string alarm_operation_id(std::int64_t generation) {
+        if(generation<=0) throw std::invalid_argument("invalid alarm generation");
+        return "@alarm:"+std::to_string(generation);
+    }
+
     // Atomic state + exact-operation dedup + replay reply + outbox.
     // If the ACK is lost, retry with identical op_id/command; the caller must
     // not interpret a timeout as a definitely failed operation.
@@ -253,8 +326,18 @@ public:
                       std::int64_t expected_revision, std::string_view operation_id,
                       std::string_view command, std::string_view schema_fp,
                       std::string_view next_state, std::string_view reply,
-                      bool inject_precommit_failure = false) {
+                      bool inject_precommit_failure = false,
+                      const SyncAlarm* alarm = nullptr, std::int64_t now_ms = 0) {
         validate_key(key); label(operation_id); label(schema_fp);
+        if(alarm) {
+            if(alarm->key.tenant!=key.tenant || alarm->key.name_space!=key.name_space ||
+               alarm->key.actor_type!=key.actor_type || alarm->key.object_id!=key.object_id ||
+               operation_id!=alarm_operation_id(alarm->generation) ||
+               alarm->due_ms<0 || now_ms<alarm->due_ms)
+                throw std::invalid_argument("invalid alarm commit envelope");
+        } else if(operation_id.substr(0,7)=="@alarm:") {
+            throw std::invalid_argument("reserved alarm operation identity");
+        }
         bounded(command, limits_.command_bytes); bounded(next_state, limits_.state_bytes);
         bounded(reply, limits_.reply_bytes);
         if (expected_revision < 0 || epoch <= 0) throw std::invalid_argument("invalid expected revision / epoch");
@@ -274,6 +357,8 @@ public:
             }
         }
         if (replay) { tx.commit(); return *replay; }
+        if(alarm && !alarm_matches_locked(*alarm,now_ms))
+            throw std::logic_error("alarm cancelled, replaced or not due");
         if (old.revision != expected_revision) throw std::logic_error("revision conflict");
         if (count_for(key, "sync_operations") >= limits_.dedupe_entries_per_actor)
             throw std::length_error("durable operation retention quota exhausted");
@@ -298,6 +383,12 @@ public:
             Statement s(db_, "INSERT INTO sync_outbox VALUES(?,?,?,?,?,?,?,?,?)");
             bind_key(s, key); s.i64(5, revision); s.i64(6, epoch);
             s.text(7, operation_id); s.text(8, schema_fp); s.blob(9, next_state); s.done();
+        }
+        if(alarm) {
+            Statement consume(db_,"UPDATE sync_alarms SET due_ms=NULL WHERE tenant=? AND space=? AND actor_type=? AND id=? AND generation=? AND due_ms=?");
+            bind_key(consume,key);consume.i64(5,alarm->generation);consume.i64(6,alarm->due_ms);
+            consume.done();
+            if(sqlite3_changes(db_)!=1) throw std::logic_error("lost alarm generation");
         }
         if (inject_precommit_failure) throw std::runtime_error("injected failure before commit");
         tx.commit();
@@ -502,6 +593,12 @@ public:
     }
 
 private:
+    bool alarm_matches_locked(const SyncAlarm& alarm,std::int64_t now_ms) {
+        Statement read(db_,"SELECT 1 FROM sync_alarms WHERE tenant=? AND space=? AND actor_type=? AND id=? "
+                           "AND generation=? AND due_ms=? AND due_ms<=?");
+        bind_key(read,alarm.key);read.i64(5,alarm.generation);read.i64(6,alarm.due_ms);read.i64(7,now_ms);
+        return read.step()==SQLITE_ROW;
+    }
     static constexpr std::size_t max_label = 256;
     const SyncLimits limits_;
     sqlite3* db_ = nullptr;
