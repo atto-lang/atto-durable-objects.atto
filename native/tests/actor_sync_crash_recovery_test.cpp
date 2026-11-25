@@ -237,5 +237,57 @@ int main() {
         catch(const std::length_error&) {full=true;}
         assert(full);
     }
+    // Retry metadata persists, preserves FIFO, and fences stale attempts.
+    const auto retry_db=std::string(dir)+"/retry.db";
+    const SyncKey poison{"tenant","mail","Counter","poison"};
+    const SyncKey healthy{"tenant","mail","Counter","healthy"};
+    SyncMail attempt{};
+    {
+        SyncLimits limits;limits.dedupe_entries_per_actor=2;limits.outbox_entries_per_actor=2;
+        SqliteActorSync store(retry_db,limits);
+        auto epoch=store.activate_next(poison);
+        store.admit_mail(poison,epoch,"bad","1:1","counter");
+        store.admit_mail(poison,epoch,"next","1:2","counter");
+        bool reserved=false;
+        try {store.commit(poison,epoch,0,"transient","1:1","counter","1","1");}
+        catch(const std::length_error&) {reserved=true;}
+        assert(reserved);
+        auto other=store.activate_next(healthy);
+        store.admit_mail(healthy,other,"ok","1:3","counter");
+        attempt=store.pending_mail(64,0).front();
+        assert(!store.fail_mail(attempt,epoch,0));
+        bool stale=false;
+        try {store.fail_mail(attempt,epoch,0);}
+        catch(const std::logic_error&) {stale=true;}
+        assert(stale);
+        auto ready=store.pending_mail(64,99);
+        assert(ready.size()==1 && ready[0].key.object_id=="healthy");
+        auto done=store.commit(healthy,other,0,"ok","1:3","counter","3","3",false,nullptr,0,&ready[0]);
+        assert(done.revision==1);
+        assert(store.pending_mail(64,99).empty());
+    }
+    {
+        SqliteActorSync store(retry_db);
+        auto epoch=store.activate_next(poison);
+        assert(store.pending_mail(64,99).empty());
+        auto ready=store.pending_mail(64,100);
+        assert(ready.size()==1 && ready[0].failures==1);
+        assert(!store.fail_mail(ready[0],epoch,100));
+        assert(store.pending_mail(64,299).empty());
+        ready=store.pending_mail(64,300);
+        assert(ready.size()==1 && ready[0].failures==2);
+        assert(store.fail_mail(ready[0],epoch,300));
+        auto dead=store.admit_mail(poison,epoch,"bad","1:1","counter");
+        assert(dead.dead_letter && !dead.receipt && dead.sequence==attempt.sequence);
+        assert(store.snapshot(poison).revision==0);
+        bool blocked=false;
+        try {store.commit(poison,epoch,0,"bad","1:1","counter","1","1");}
+        catch(const std::logic_error&) {blocked=true;}
+        assert(blocked);
+        ready=store.pending_mail(64,300);
+        assert(ready.size()==1 && ready[0].operation_id=="next");
+        assert(store.commit(poison,epoch,0,"next","1:2","counter","2","2",false,nullptr,0,&ready[0]).revision==1);
+        assert(store.pending_mail().empty());
+    }
     std::filesystem::remove_all(dir);
 }
