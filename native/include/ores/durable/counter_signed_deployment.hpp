@@ -37,13 +37,13 @@ public:
             CounterDirectory::Clock::duration idle=CounterDirectory::Clock::duration::zero(),
             CounterDirectory::Clock::duration alarms=CounterDirectory::Clock::duration::zero(),
             CounterDirectory::Clock::duration mail=CounterDirectory::Clock::duration::zero(),
-            bool principal_mode=false,CounterDirectory::PrincipalPolicy mail_policy={}) const {
+            bool principal_mode=false,CounterDirectory::PrincipalPolicy mail_policy={},bool transactional_policy=false) const {
         if(!authorize) throw std::invalid_argument("missing trusted principal authorizer");
         auto admission=[registry=registry_,authorize=std::move(authorize)](const SyncKey& key) {
             return registry.contains(key) && authorize(key);
         };
         return std::make_unique<CounterDirectory>(db,CounterDirectory::KeyedGuest(registry_),
-            std::move(admission),capacity,active_limit,workers,idle,alarms,mail,registry_.manifest(),principal_mode,std::move(mail_policy));
+            std::move(admission),capacity,active_limit,workers,idle,alarms,mail,registry_.manifest(),principal_mode,std::move(mail_policy),transactional_policy);
     }
 };
 } // namespace ores::durable
