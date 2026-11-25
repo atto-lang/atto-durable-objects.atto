@@ -356,6 +356,10 @@ public:
         Tx tx(*this);
         const bool prior=transactional_policy_locked();
         if(prior && !enabled) throw std::logic_error("transactional principal policy required");
+        if(enabled) {
+            Statement pending(db_,"SELECT 1 FROM sync_alarms WHERE due_ms IS NOT NULL LIMIT 1");
+            if(pending.step()==SQLITE_ROW) throw std::logic_error("drain alarms before enabling transactional policy");
+        }
         if(enabled && !prior) {
             {
                 Statement mode(db_,"SELECT 1 FROM sync_principal_namespace WHERE singleton=1");
@@ -364,10 +368,6 @@ public:
             {
                 Statement pending(db_,"SELECT 1 FROM sync_inbox LIMIT 1");
                 if(pending.step()==SQLITE_ROW) throw std::logic_error("drain inbox before enabling transactional policy");
-            }
-            {
-                Statement pending(db_,"SELECT 1 FROM sync_alarms WHERE due_ms IS NOT NULL LIMIT 1");
-                if(pending.step()==SQLITE_ROW) throw std::logic_error("drain alarms before enabling transactional policy");
             }
             exec("INSERT INTO sync_policy_mode VALUES(1)");
         }
@@ -766,7 +766,7 @@ private:
                 completed=SyncCommit{read.number(2),read.blob(3),true};
             }
         }
-        if(completed){return {0,completed};}
+        if(completed){match_alarm_effect_locked(key,operation_id,nullptr);return {0,completed};}
         std::int64_t existing=0;
         bool dead=false;
         {
