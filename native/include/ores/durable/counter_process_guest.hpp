@@ -61,10 +61,15 @@ public:
                         std::string digest,std::chrono::milliseconds budget)
         :node_(std::move(node)),script_(std::move(script)),artifact_(std::move(artifact)),
          digest_(std::move(digest)),budget_(budget) {
-        path(node_);path(script_);path(artifact_);
+        path(node_);if(!script_.empty()) path(script_);path(artifact_);
         if(digest_.size()!=64 || digest_.find_first_not_of("0123456789abcdef")!=std::string::npos ||
            budget_.count()<=0 || budget_.count()>60000)
             throw std::invalid_argument("invalid guest execution budget or digest");
+    }
+    // Native fuel worker uses the same bounded IPC and reaping protocol.
+    static CounterProcessGuest fuel_worker(std::string executable,std::string artifact,
+                                           std::string digest,std::chrono::milliseconds budget) {
+        return CounterProcessGuest(std::move(executable),"",std::move(artifact),std::move(digest),budget);
     }
     std::int64_t operator()(std::int64_t n,std::int64_t op,std::int64_t d) const {
         if(n<0 || n>CounterTurn::maximum || (op!=1 && op!=2) ||
@@ -80,13 +85,18 @@ public:
         Actions::check(posix_spawn_file_actions_adddup2(&a.value,write.value,1));
         Actions::check(posix_spawn_file_actions_addopen(&a.value,2,"/dev/null",O_WRONLY,0));
         Actions::check(posix_spawn_file_actions_addclosefrom_np(&a.value,3));
-        std::string args[]={node_,script_,artifact_,digest_,std::to_string(n),std::to_string(op),std::to_string(d)};
-        char* argv[]={args[0].data(),args[1].data(),args[2].data(),args[3].data(),args[4].data(),args[5].data(),args[6].data(),nullptr};
+        std::vector<std::string> args{node_};
+        if(!script_.empty()) args.push_back(script_);
+        args.insert(args.end(),{artifact_,digest_,std::to_string(n),std::to_string(op),std::to_string(d)});
+        if(script_.empty()) args.push_back(std::to_string(::getpid()));
+        std::vector<char*> argv;
+        for(auto& arg:args) argv.push_back(arg.data());
+        argv.push_back(nullptr);
         char* env[]={nullptr};
         Child child;
         const auto deadline=CounterDirectory::Clock::now()+budget_;
         pid_t pid=-1;
-        if(posix_spawn(&pid,node_.c_str(),&a.value,nullptr,argv,env)!=0)
+        if(posix_spawn(&pid,node_.c_str(),&a.value,nullptr,argv.data(),env)!=0)
             throw std::runtime_error("guest spawn failed");
         child.pid=pid;write.close();
         std::string output;
@@ -94,7 +104,7 @@ public:
         for(;;) {
             if(CounterDirectory::Clock::now()>=deadline) {
                 if(child.pid>0) child.stop();
-                throw CounterDirectory::RetryableGuestFailure();
+                throw CounterDirectory::RetryableGuestFailure(CounterDirectory::FailureReason::deadline);
             }
             char buf[32];
             const auto count=::read(read.value,buf,sizeof(buf));
@@ -116,8 +126,9 @@ public:
                     throw std::runtime_error("guest poll failed");
             }
         }
-        if(WIFEXITED(status) && WEXITSTATUS(status)==73)
-            throw CounterDirectory::RetryableGuestFailure();
+        if(WIFEXITED(status) && (WEXITSTATUS(status)==73 || (script_.empty() && WEXITSTATUS(status)==75)))
+            throw CounterDirectory::RetryableGuestFailure(
+                WEXITSTATUS(status)==75 ? CounterDirectory::FailureReason::fuel : CounterDirectory::FailureReason::trap);
         if(!WIFEXITED(status) || WEXITSTATUS(status)!=0)
             throw std::runtime_error("guest worker failed");
         if(output.empty() || output.back()!='\n') throw std::runtime_error("guest output framing");
