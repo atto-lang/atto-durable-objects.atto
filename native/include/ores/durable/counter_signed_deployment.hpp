@@ -17,12 +17,18 @@ struct CounterFuelTenantBudget {
     std::uint64_t address_space_bytes=512ull*1024*1024;
     std::uint64_t in_flight_fuel=100000;
     std::uint64_t in_flight_cpu_seconds=4;
+    std::int64_t rolling_window_ms=60000;
+    std::uint64_t rolling_fuel=6000000;
+    std::uint64_t rolling_cpu_seconds=240;
     CounterTenantLimits limits() const {
         constexpr std::uint64_t worker_as=256ull*1024*1024,worker_fuel=50000,worker_cpu=2;
         const auto slots=std::min({address_space_bytes/worker_as,in_flight_fuel/worker_fuel,
                                    in_flight_cpu_seconds/worker_cpu,std::uint64_t{64}});
         if(!queued || !slots) throw std::invalid_argument("tenant budget cannot reserve one fuel worker");
-        return {queued,static_cast<std::size_t>(slots)};
+        const auto starts=std::min({rolling_fuel/worker_fuel,rolling_cpu_seconds/worker_cpu,std::uint64_t{4096}});
+        if(!starts || rolling_window_ms<1 || rolling_window_ms>86400000)
+            throw std::invalid_argument("invalid tenant rolling worker budget");
+        return {queued,static_cast<std::size_t>(slots),{rolling_window_ms,static_cast<std::int64_t>(starts)}};
     }
 };
 class SignedCounterDeployment final {
