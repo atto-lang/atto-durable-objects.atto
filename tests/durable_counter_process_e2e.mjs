@@ -64,9 +64,10 @@ async function turn(mode,tenant,id,epoch,request,op,delta,expected,expectedExit=
             child.once('close',(code,signal)=>res({code,signal}));
         });
         if(failure) throw failure;
-        assert.equal(result.signal,null); assert.equal(result.code,expectedExit,errors);
+        if(expectedExit==='SIGKILL') { assert.equal(result.signal,'SIGKILL'); assert.equal(result.code,null); }
+        else { assert.equal(result.signal,null); assert.equal(result.code,expectedExit,errors); }
         assert.deepEqual(lines,expected); assert.equal(executed-before,guestCount,'unexpected guest count');
-        if(expectedExit===1) assert.ok(errors.trim(),'expected rejection diagnostic');
+        if(expectedExit===1) assert.match(errors, mode==='rollback' ? /injected failure before commit/ : epoch===1 ? /stale writer epoch/ : /operation id reused/, 'expected rejection diagnostic');
     } finally {clearTimeout(timer);reader.close();child.stdin.destroy();}
 }
 try {
@@ -75,7 +76,7 @@ try {
     await turn('turn','a','same',1,'first',1,1,['COMMITTED 1 1 0']);
     await turn('rollback','a','same',1,'retry',1,2,[],1);
     await turn('turn','a','same',1,'retry',1,2,['COMMITTED 2 3 0']);
-    await turn('lose','a','same',1,'max',1,999999997,[],42);
+    await turn('lose','a','same',1,'max',1,999999997,[],'SIGKILL');
     await turn('activate','a','same',2,'-',1,1,['ACTIVATED'],0,0);
     await turn('turn','a','same',1,'max',1,999999997,[],1,0);
     await turn('turn','a','same',2,'max',1,999999997,['COMMITTED 3 1000000000 1'],0,0);
