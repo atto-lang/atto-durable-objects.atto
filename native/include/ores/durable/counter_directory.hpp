@@ -28,6 +28,8 @@ namespace ores::durable {
 class CounterDirectory final {
 public:
     using Guest = std::function<std::int64_t(std::int64_t,std::int64_t,std::int64_t)>;
+    // Trusted host callback receives the full authenticated identity.
+    using KeyedGuest = std::function<std::int64_t(const SyncKey&,std::int64_t,std::int64_t,std::int64_t)>;
     using Reply = std::optional<SyncCommit>;
     using Authorize = std::function<bool(const SyncKey&)>;
     using Clock = std::chrono::steady_clock;
@@ -76,10 +78,30 @@ private:
         ControllerLock& operator=(const ControllerLock&)=delete;
         ~ControllerLock(){if(fd_>=0)::close(fd_);}
         const std::string& path() const noexcept {return db_;}
+        int fd() const noexcept {return fd_;}
     };
     ControllerLock owner_;
     SqliteActorSync store_;
-    const Guest guest_;
+    const KeyedGuest guest_;
+    // Borrowed only while invoking a synchronous trusted guest runner.
+    // A spawned worker duplicates this open file description into its own
+    // descriptor table, retaining flock until physical process termination.
+    inline static thread_local int guest_guard_fd_=-1;
+    struct GuestGuard {
+        int previous;
+        explicit GuestGuard(int fd):previous(guest_guard_fd_) {guest_guard_fd_=fd;}
+        ~GuestGuard(){guest_guard_fd_=previous;}
+    };
+    auto guarded_guest(const SyncKey& k) {
+        return [this,&k](std::int64_t n,std::int64_t op,std::int64_t d){
+            GuestGuard guard(owner_.fd());
+            return guest_(k,n,op,d);
+        };
+    }
+    static KeyedGuest adapt(Guest guest) {
+        if(!guest) throw std::invalid_argument("missing guest runner");
+        return [guest=std::move(guest)](const SyncKey&,auto n,auto op,auto d){return guest(n,op,d);};
+    }
     const Authorize authorize_;
     const std::size_t capacity_,active_limit_;
     const Clock::duration idle_timeout_;
@@ -106,7 +128,7 @@ private:
             validate(alarm.key);
             const auto epoch=activate(id,alarm.key);
             try {
-                auto r=CounterTurn::run_alarm(store_,alarm,epoch,unix_ms(),guest_);
+                auto r=CounterTurn::run_alarm(store_,alarm,epoch,unix_ms(),guarded_guest(alarm.key));
                 validate(alarm.key);
                 if(store_.snapshot(alarm.key).epoch!=epoch) throw std::logic_error("stale alarm publication epoch");
                 return r;
@@ -157,9 +179,9 @@ private:
                 if(unix_ms()<mail.retry_at_ms || !store_.mail_pending(mail,epoch))
                     return Reply{};
                 // A surviving dispatch marker belongs to a previous activation.
-                // The cooperating controller lock excludes its former host.
-                // Only the pure, authority-free scalar guest profile is allowed
-                // here; this is not physical retirement proof for general actors.
+                // The controller lock excludes former hosts and cooperating
+                // process runners that inherit its open file description.
+                // General callbacks must still establish physical retirement.
                 if(mail.attempt_epoch!=0) {
                     if(mail.attempt_epoch>=epoch)
                         throw std::logic_error("unresolved current mailbox attempt");
@@ -169,7 +191,7 @@ private:
                 const auto started=store_.begin_mail(mail,epoch,unix_ms());
                 Reply r;
                 try {
-                    r=CounterTurn::run_mail(store_,started,epoch,guest_);
+                    r=CounterTurn::run_mail(store_,started,epoch,guarded_guest(mail.key));
                 } catch(const RetryableGuestFailure&) {
                     validate(mail.key);
                     // Only after the runner physically stops may this owner
@@ -320,7 +342,17 @@ private:
         return true;
     }
 public:
+    // Host-only borrowed descriptor; never expose to compiled guest imports.
+    static int current_guest_guard_fd() noexcept {return guest_guard_fd_;}
     CounterDirectory(const std::string& db, Guest guest, Authorize authorize,
+                     std::size_t capacity=128,std::size_t active_limit=128,
+                     std::size_t workers=1,
+                     Clock::duration idle_timeout=Clock::duration::zero(),
+                     Clock::duration alarm_interval=Clock::duration::zero(),
+                     Clock::duration mail_interval=Clock::duration::zero())
+        : CounterDirectory(db,adapt(std::move(guest)),std::move(authorize),capacity,
+                           active_limit,workers,idle_timeout,alarm_interval,mail_interval) {}
+    CounterDirectory(const std::string& db, KeyedGuest guest, Authorize authorize,
                      std::size_t capacity=128,std::size_t active_limit=128,
                      std::size_t workers=1,
                      Clock::duration idle_timeout=Clock::duration::zero(),
@@ -372,7 +404,7 @@ public:
             validate(k);
             const auto epoch=activate(id,k);
             try {
-                auto r=CounterTurn::run(store_,k,epoch,request,op,delta,guest_);
+                auto r=CounterTurn::run(store_,k,epoch,request,op,delta,guarded_guest(k));
                 validate(k);
                 if(store_.snapshot(k).epoch!=epoch) throw std::logic_error("stale publication epoch");
                 return r;
