@@ -165,5 +165,50 @@ int main() {
             assert(observer.snapshot(a).revision==4);
         }
     }
+    // Persist ACKs with dispatch disabled, restart, and drain the FIFO.
+    {
+        using namespace std::chrono_literals;
+        const auto mail_db=std::string(dir)+"/mail.db";
+        std::int64_t first_sequence=0;
+        {
+            CounterDirectory directory(mail_db,guest,auth);
+            const auto first=directory.admit(a,"durable-1",1,1).get();
+            first_sequence=first.sequence;
+            assert(first_sequence>0 && !first.receipt);
+            const auto second=directory.admit(a,"durable-2",1,2).get();
+            assert(second.sequence>first_sequence && !second.receipt);
+            assert(directory.admit(a,"durable-1",1,1).get().sequence==first_sequence);
+            rejects<std::logic_error>([&]{directory.admit(a,"durable-1",1,3).get();});
+            rejects<std::logic_error>([&]{(void)directory.admit(b,"denied",1,1);});
+            assert(directory.admit(c,"independent",1,5).get().sequence>0);
+            assert(directory.passivate(a).get()==false || !directory.is_active(a));
+        }
+        {
+            CounterDirectory directory(mail_db,guest,auth,16,4,2,10ms,0ms,10ms);
+            SqliteActorSync observer(mail_db);
+            const auto until=CounterDirectory::Clock::now()+5s;
+            while(!observer.pending_mail().empty() && CounterDirectory::Clock::now()<until)
+                std::this_thread::sleep_for(5ms);
+            assert(observer.pending_mail().empty());
+            assert(observer.snapshot(a).bytes=="3" && observer.snapshot(a).revision==2);
+            assert(observer.snapshot(c).bytes=="5");
+            auto replay=directory.admit(a,"durable-1",1,1).get();
+            assert(replay.sequence==0 && replay.receipt && replay.receipt->reply=="1");
+            assert(directory.admit(a,"durable-2",1,2).get().receipt->reply=="3");
+            assert(!directory.mail_fault());
+            // Overflow must complete with a terminal receipt and not block
+            // the later admitted read at the head of the durable FIFO.
+            assert(directory.admit(a,"fill",1,999999997).get().sequence>0);
+            assert(directory.admit(a,"overflow",1,1).get().sequence>0);
+            assert(directory.admit(a,"after-overflow",2,0).get().sequence>0);
+            const auto end=CounterDirectory::Clock::now()+5s;
+            while(!observer.pending_mail().empty() && CounterDirectory::Clock::now()<end)
+                std::this_thread::sleep_for(5ms);
+            assert(observer.pending_mail().empty());
+            assert(directory.admit(a,"overflow",1,1).get().receipt->reply=="mail_overflow");
+            assert(directory.admit(a,"after-overflow",2,0).get().receipt->reply=="1000000000");
+            assert(observer.snapshot(a).revision==5 && !directory.mail_fault());
+        }
+    }
     std::filesystem::remove_all(dir);
 }
