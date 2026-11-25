@@ -16,25 +16,35 @@ const db=join(dir,'counter.db');
 const hash=b=>createHash('sha256').update(b).digest('hex');
 let executed=0;
 const receipts=[];
-function guest(n,op,d) {
-    for(const x of [n,op,d]) assert.ok(Number.isSafeInteger(x)&&x>=0&&x<=1000000000);
-    const text=source+'\npub fnc main() -> int { return durable_counter_next('+n+', '+op+', '+d+'); }\n';
-    const input=join(dir,'turn.atto'), output=join(dir,'turn.wasm');
+// One source compilation, one reusable module, fresh instance per turn.
+// The checked compiler's opt-in export carries three i64 values and returns i64.
+const text=source+'\nfnc durable_transition(int n,int op,int d)->int { return durable_counter_next(n,op,d); }\npub fnc main()->int { return 0; }\n';
+function compileOnce() {
+    const input=join(dir,'counter.atto'), output=join(dir,'counter.wasm');
     writeFileSync(input,text); rmSync(output,{force:true});
-    const r=spawnSync(compiler,[input,'-o',output],{cwd:dir,encoding:'utf8',timeout:30000,maxBuffer:1<<20});
+    const r=spawnSync(compiler,['--durable-scalar-v1',input,'-o',output],{cwd:dir,encoding:'utf8',timeout:30000,maxBuffer:1<<20});
     assert.equal(r.error,undefined); assert.equal(r.status,0,r.stderr);
     assert.ok(existsSync(output),'real compiler did not emit artifact');
     const bytes=readFileSync(output);
     assert.ok(WebAssembly.validate(bytes));
     const mod=new WebAssembly.Module(bytes);
     assert.deepEqual(WebAssembly.Module.imports(mod),[]);
-    const inst=new WebAssembly.Instance(mod,{});
-    const value=inst.exports.main();
+    assert.deepEqual(WebAssembly.Module.exports(mod).map(x=>x.name).sort(),
+        ['atto_durable_transition_v1','main','panic_code']);
+    return {mod,sha:hash(bytes)};
+}
+let compiled;
+function guest(n,op,d) {
+    for(const x of [n,op,d]) assert.ok(Number.isSafeInteger(x)&&x>=0&&x<=1000000000);
+    const inst=new WebAssembly.Instance(compiled.mod,{});
+    const entry=inst.exports.atto_durable_transition_v1;
+    assert.equal(typeof entry,'function'); assert.equal(entry.length,3);
+    const value=entry(BigInt(n),BigInt(op),BigInt(d));
     assert.equal(typeof value,'bigint');
     assert.equal(inst.exports.panic_code.value,0);
     assert.ok(value>=-1n&&value<=1000000000n);
     executed++;
-    receipts.push({source_sha256:hash(text),wasm_sha256:hash(bytes),input:[n,op,d],result:String(value)});
+    receipts.push({source_sha256:hash(text),wasm_sha256:compiled.sha,input:[n,op,d],result:String(value)});
     return value;
 }
 async function turn(mode,tenant,id,epoch,request,op,delta,expected,expectedExit=0,guestCount=1) {
@@ -71,6 +81,7 @@ async function turn(mode,tenant,id,epoch,request,op,delta,expected,expectedExit=
     } finally {clearTimeout(timer);reader.close();child.stdin.destroy();}
 }
 try {
+    compiled=compileOnce();
     await turn('activate','a','same',1,'-',1,1,['ACTIVATED'],0,0);
     await turn('activate','b','same',1,'-',1,1,['ACTIVATED'],0,0);
     await turn('turn','a','same',1,'first',1,1,['COMMITTED 1 1 0']);
@@ -87,5 +98,5 @@ try {
     assert.equal(executed,7);
     console.log(JSON.stringify({kind:'COMPILED_SCALAR_GUEST_SQLITE_PROCESS_E2E',compiler_binary_sha256:hash(readFileSync(compiler)),
       driver_binary_sha256:hash(readFileSync(driver)),compiler_source_head_claim:process.env.ATTO_COMPILER_SOURCE_SHA??null,
-      fixture_sha256:hash(source),guest_executions:executed,process_turns:13,receipts},null,2));
+      fixture_sha256:hash(source),guest_executions:executed,compiler_invocations:1,process_turns:13,receipts},null,2));
 } finally {rmSync(dir,{recursive:true,force:true});}
