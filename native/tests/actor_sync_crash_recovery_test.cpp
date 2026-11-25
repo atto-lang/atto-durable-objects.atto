@@ -930,5 +930,74 @@ int main() {
         assert(reopened.commit(k,epoch,0,"@alarm:2","alarm:400","counter","1","1",false,&fresh,400).revision==1);
         assert(reopened.principal_alarm_authority(k)->status==SyncAlarmStatus::fired);
     }
+    // Strict mailbox effect is part of exact command identity, survives
+    // restart, and cannot commit separately from state or its grant fence.
+    {
+        const auto db2=std::string(dir)+"/mail-alarm-effect.db";
+        const SyncKey k{"tenant","mail","Counter","mail-alarm"};
+        const SyncMailAlarm effect{{0,100},"operator:one"};
+        const auto command=SqliteActorSync::encode_mail_alarm(2,effect);
+        {
+            SqliteActorSync store(db2);
+            store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+            auto epoch=store.activate_next(k);
+            store.set_principal_policy(k,"alice",1,0,true);
+            auto accepted=store.admit_mail(k,epoch,"@principal:effect",command,"counter","alice");
+            assert(accepted.sequence>0);
+            assert(store.admit_mail(k,epoch,"@principal:effect",command,"counter","alice").sequence==accepted.sequence);
+            bool rejected=false;
+            try {store.admit_mail(k,epoch,"@principal:effect","1:2","counter","alice");}
+            catch(const std::logic_error&) {rejected=true;}
+            assert(rejected);
+        }
+        SqliteActorSync store(db2),admin(db2);
+        store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+        auto epoch=store.activate_next(k);
+        auto started=store.begin_mail(store.pending_mail()[0],epoch,0);
+        bool rejected=false;
+        try {store.commit(k,epoch,0,started.operation_id,command,"counter","2","2",false,nullptr,0,&started);}
+        catch(const std::invalid_argument&) {rejected=true;}
+        assert(rejected);
+        rejected=false;
+        try {store.commit(k,epoch,0,started.operation_id,command,"counter","2","2",true,nullptr,0,&started,&effect.change);}
+        catch(const std::runtime_error&) {rejected=true;}
+        assert(rejected && store.snapshot(k).revision==0 && store.alarm_generation(k,epoch)==0);
+        assert(store.commit(k,epoch,0,started.operation_id,command,"counter","2","2",false,nullptr,0,&started,&effect.change).revision==1);
+        auto authority=store.principal_alarm_authority(k);
+        assert(authority && authority->generation==1 && authority->principal=="alice" &&
+               authority->operator_id=="operator:one" && authority->grant_version==1);
+        assert(store.admit_mail(k,epoch,"@principal:effect",command,"counter","alice").receipt->duplicate);
+        const auto second=SqliteActorSync::encode_mail_alarm(1,SyncMailAlarm{{1,200},"operator:one"});
+        store.admit_mail(k,epoch,"@principal:revoked",second,"counter","alice");
+        started=store.begin_mail(store.pending_mail()[0],epoch,0);
+        admin.set_principal_policy(k,"alice",1,1,false);
+        admin.set_principal_policy(k,"alice",1,2,true);
+        const auto parsed=SqliteActorSync::mail_alarm_effect(second);
+        rejected=false;
+        try {store.commit(k,epoch,1,started.operation_id,second,"counter","3","3",false,nullptr,0,&started,&parsed->change);}
+        catch(const PrincipalPolicyChanged&) {rejected=true;}
+        assert(rejected && store.snapshot(k).revision==1 && store.alarm_generation(k,epoch)==1);
+        store.deny_mail(started,epoch);
+        // Stale generation terminates without mutating state or alarm.
+        store.admit_mail(k,epoch,"@principal:stale",command,"counter","alice");
+        started=store.begin_mail(store.pending_mail()[0],epoch,0);
+        rejected=false;
+        try {store.commit(k,epoch,1,started.operation_id,command,"counter","4","4",false,nullptr,0,&started,&effect.change);}
+        catch(const AlarmGenerationConflict&) {rejected=true;}
+        assert(rejected && store.snapshot(k).revision==1);
+        store.deny_mail(started,epoch,false);
+        auto terminal=store.admit_mail(k,epoch,"@principal:stale",command,"counter","alice");
+        assert(terminal.dead_letter && !terminal.authorization_denied);
+        rejected=false;
+        try {store.redrive_dead_letter(k,epoch,terminal.sequence,"operator");}
+        catch(const std::logic_error&) {rejected=true;}
+        assert(rejected);
+        // Overflow consumes the command but never applies the requested alarm.
+        store.admit_mail(k,epoch,"@principal:overflow",second,"counter","alice");
+        started=store.begin_mail(store.pending_mail()[0],epoch,0);
+        assert(store.commit(k,epoch,1,started.operation_id,second,"counter","2","mail_overflow",false,nullptr,0,&started).revision==2);
+        assert(store.alarm_generation(k,epoch)==1);
+        assert(store.admit_mail(k,epoch,"@principal:overflow",second,"counter","alice").receipt->reply=="mail_overflow");
+    }
     std::filesystem::remove_all(dir);
 }
