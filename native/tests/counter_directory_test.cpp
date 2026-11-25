@@ -1,5 +1,6 @@
 // HOST_ONLY: tests directory lifecycle and scheduling, not an AttoLang guest.
 #include "ores/durable/counter_directory.hpp"
+#include "ores/durable/counter_dead_letter_admin.hpp"
 #include <cassert>
 #include <atomic>
 #include <cstdlib>
@@ -407,6 +408,50 @@ int main() {
             auto terminal=directory.admit_bound(a,"@principal:alice",1,7,"alice",[]{}).get();
             assert(terminal.authorization_denied && !terminal.receipt);
             rejects<std::logic_error>([&]{(void)directory.send_authorized(a,"raw",1,1,[]{});});
+        }
+    }
+    // Operator authority is independent of the original principal grant.
+    // A redriven exhausted message must execute only under the new identity.
+    {
+        using namespace std::chrono_literals;
+        const auto redrive_db=std::string(dir)+"/admin-redrive.db";
+        const auto policy=[](std::string_view,const SyncKey&,I){return true;};
+        const auto authorize=[](const SyncKey&){return true;};
+        std::int64_t source=0;
+        {
+            CounterDirectory directory(redrive_db,CounterDirectory::KeyedGuest(
+                [](const SyncKey&,I,I,I)->I{throw CounterDirectory::RetryableGuestFailure();}),
+                authorize,16,4,1,10ms,0ms,10ms,"",true,policy,true);
+            SqliteActorSync admin(redrive_db);
+            admin.set_principal_policy(a,"alice",1,0,true);
+            source=directory.admit_bound(a,"@principal:failed",1,2,"alice",[]{}).get().sequence;
+            const auto until=CounterDirectory::Clock::now()+5s;
+            while(!admin.pending_mail().empty() && CounterDirectory::Clock::now()<until)
+                std::this_thread::sleep_for(5ms);
+            assert(admin.pending_mail().empty() && !directory.mail_fault());
+            assert(admin.dead_letters(a).size()==1);
+        }
+        {
+            CounterDirectory directory(redrive_db,CounterDirectory::KeyedGuest(
+                [](const SyncKey&,I n,I op,I d)->I{return op==2?n:n+d;}),
+                authorize,16,4,1,10ms,0ms,10ms,"",true,policy,true);
+            SqliteActorSync store(redrive_db);
+            CounterDeadLetterAdmin admin(store,[&](std::string_view who,const SyncKey& k,CounterDeadLetterAdmin::Action action){
+                return k.tenant==a.tenant && (who=="operator" ||
+                    (who=="reader" && action==CounterDeadLetterAdmin::Action::inspect));
+            });
+            assert(admin.inspect("reader",a).size()==1);
+            rejects<std::logic_error>([&]{admin.inspect("stranger",a);});
+            rejects<std::logic_error>([&]{admin.redrive("reader",a,source);});
+            const auto replacement=admin.redrive("operator",a,source);
+            assert(replacement.new_sequence>source);
+            const auto until=CounterDirectory::Clock::now()+5s;
+            while(!store.pending_mail().empty() && CounterDirectory::Clock::now()<until)
+                std::this_thread::sleep_for(5ms);
+            assert(store.pending_mail().empty() && !directory.mail_fault());
+            assert(store.snapshot(a).revision==1 && store.snapshot(a).bytes=="2");
+            assert(admin.redrive("operator",a,source).duplicate);
+            assert(admin.inspect("reader",a)[0].redrive_sequence==replacement.new_sequence);
         }
     }
     std::filesystem::remove_all(dir);
