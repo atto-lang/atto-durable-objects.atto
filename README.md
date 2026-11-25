@@ -253,12 +253,47 @@ letters the original request without inventing a success receipt.
 
 The conservative policy counts a crash after recording the marker even if
 guest launch had not occurred. Only the cooperating single-host controller
-and pure, authority-free scalar guest are supported. Controller lock release
+and pure, authority-free scalar guest are supported. Controller lock release without inherited worker guards
 and epoch rotation are not proof of physical retirement of an arbitrary
 orphan guest, nor safe recovery of external side effects. General actor
 recovery requires a supervisor that establishes physical quiescence.
 The storage fork/reopen and directory controller-exit regressions are new;
-Wave 12 exact-head execution is pending.
+Wave 12 exact-head execution passed (receipt below).
+
+### Controller retirement and scoped deployment (Wave 13 candidate)
+
+Wave 12 guest and host integration passed on exact head
+`b8ca89bd51c691c6b32d13a4c29e606f1921dbf3`:
+[run 45653321529](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45653321529).
+The new process runner inherits the controller's locked open file description
+at reserved fd 3 while a synchronous directory callback executes. All other
+nonstandard descriptors are closed. The trusted worker must retain fd 3
+without unlocking it, including after controller death; the kernel denies
+a new cooperating controller until the worker releases it on exit.
+Standalone fixture calls have no controller guard. This is intentionally
+fail-closed: a nonterminating or stopped orphan can block takeover until
+a trusted supervisor retires it. This assumes a trusted worker and local
+filesystem; it is not containment of arbitrary native code or descendants,
+nor distributed election. The regression kills the controller, uses a
+subreaper to observe a synthetic orphan, verifies lock denial, and checks
+that a replacement can run the real compiled guest only after retirement.
+
+The immutable host-side CounterArtifactRegistry selects a pinned artifact
+and fuel runner by full tenant/namespace/type scope, never by guest input.
+Keyed callbacks receive the authenticated identity after the directory's
+authorization checks; the registry requires the scoped controller guard.
+Workers independently hash exact bytes before executing. Missing and
+duplicate scope bindings fail closed; wrong artifact digests yield no
+successful state transition. The tests use real compiled Wasm for two
+tenant scopes. This is a trusted static allowlist, not signed distribution,
+network principal authentication, durable manifest-version binding,
+or an artifact upgrade protocol. Legacy unkeyed callbacks remain host
+fixtures; production ingress must compose principal authorization with
+the registry check. General actor ABI proposal extends
+[atto-spec #63](https://github.com/atto-lang/atto-spec/pull/63);
+the scalar implementation is not that ABI.
+
+Wave 13 regressions are pending exact-head execution.
 
 ### Bounded compiled guest process runner (Wave 10 — executed)
 
@@ -317,7 +352,7 @@ an uninterruptible OS process cannot be treated as stopped until actually reaped
   policy gates require independent remediation. No cross-backend parity claim.
 
 These receipts supersede the older pending statuses for Wave 9 and earlier
-features covered by those tests. Wave 10 and Wave 11 watchdog/fuel evidence is recorded above; Wave 12 remains unverified.
+features covered by those tests. Wave 10 and Wave 11 watchdog/fuel evidence is recorded above; Wave 12 passed; Wave 13 remains unverified.
 
 ### Compile-once candidate ABI
 
