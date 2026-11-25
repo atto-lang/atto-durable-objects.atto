@@ -1,6 +1,6 @@
 #pragma once
 // Linux/glibc trusted runner prototype: one isolated OS child per turn.
-// No shell, no ambient environment, no inherited nonstandard descriptors.
+// No shell, no ambient environment, only an optional controller guard fd 3.
 // The child script and artifact directory MUST be trusted and immutable.
 // This is a wall-clock watchdog, not instruction fuel or a hostile OS sandbox.
 #include "ores/durable/counter_directory.hpp"
@@ -84,7 +84,15 @@ public:
         Actions::check(posix_spawn_file_actions_addopen(&a.value,0,"/dev/null",O_RDONLY,0));
         Actions::check(posix_spawn_file_actions_adddup2(&a.value,write.value,1));
         Actions::check(posix_spawn_file_actions_addopen(&a.value,2,"/dev/null",O_WRONLY,0));
-        Actions::check(posix_spawn_file_actions_addclosefrom_np(&a.value,3));
+        const int guard=CounterDirectory::current_guest_guard_fd();
+        // Dup the *same open file description*, not a new open of the path.
+        // The kernel keeps its flock alive even if the controller is killed.
+        // fd 3 is reserved; the trusted worker must never unlock or close it.
+        if(guard>=0) {
+            if(guard<3) throw std::logic_error("invalid controller guard descriptor");
+            Actions::check(posix_spawn_file_actions_adddup2(&a.value,guard,3));
+        }
+        Actions::check(posix_spawn_file_actions_addclosefrom_np(&a.value,guard>=0?4:3));
         std::vector<std::string> args{node_};
         if(!script_.empty()) args.push_back(script_);
         args.insert(args.end(),{artifact_,digest_,std::to_string(n),std::to_string(op),std::to_string(d)});
