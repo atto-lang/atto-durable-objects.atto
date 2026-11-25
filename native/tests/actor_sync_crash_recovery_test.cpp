@@ -428,5 +428,59 @@ int main() {
         assert(denied);
         store.bind_principal_namespace(false);
     }
+    // Tenant limits span distinct object identities, including retained
+    // dead letters, and exact retries do not consume additional capacity.
+    {
+        const auto quota_db=std::string(dir)+"/tenant-quota.db";
+        SyncLimits limits;limits.inbox_entries_per_tenant=2;limits.inbox_command_bytes_per_tenant=6;
+        const SyncKey one{"tenant-a","mail","Counter","1"},two{"tenant-a","mail","Counter","2"},
+                      three{"tenant-a","mail","Counter","3"},other{"tenant-b","mail","Counter","1"};
+        {
+            SqliteActorSync store(quota_db,limits);
+            store.activate_next(one);store.activate_next(two);store.activate_next(three);store.activate_next(other);
+            auto seq=store.admit_mail(one,1,"one","1:1","counter").sequence;
+            store.admit_mail(two,1,"two","1:2","counter");
+            assert(store.admit_mail(one,1,"one","1:1","counter").sequence==seq);
+            bool denied=false;
+            try {store.admit_mail(three,1,"three","1:3","counter");}
+            catch(const std::length_error&) {denied=true;}
+            assert(denied);
+            store.admit_mail(other,1,"other","1:5","counter");
+            auto heads=store.fair_pending_mail(2,0);
+            assert(heads.size()==2 && heads[0].key.tenant=="tenant-a" && heads[1].key.tenant=="tenant-b");
+            heads=store.fair_pending_mail(1,0,"tenant-a");
+            assert(heads.size()==1 && heads[0].key.tenant=="tenant-b");
+            heads=store.fair_pending_mail(1,0,"tenant-b");
+            assert(heads.size()==1 && heads[0].operation_id=="one");
+            // A backed-off oldest object head must not expose its successor.
+            assert(!store.fail_mail(heads[0],1,0));
+            heads=store.fair_pending_mail(2,99);
+            assert(heads.size()==2 && heads[0].operation_id=="two" && heads[1].operation_id=="other");
+        }
+        bool denied=false;
+        try {SyncLimits reduced=limits;reduced.inbox_entries_per_tenant=1;SqliteActorSync store(quota_db,reduced);}
+        catch(const std::length_error&) {denied=true;}
+        assert(denied);
+        denied=false;
+        try {SyncLimits reduced=limits;reduced.inbox_command_bytes_per_tenant=5;SqliteActorSync store(quota_db,reduced);}
+        catch(const std::length_error&) {denied=true;}
+        assert(denied);
+        SqliteActorSync store(quota_db,limits);
+        assert(store.fair_pending_mail(2,100).size()==2);
+    }
+    // More hot objects than the scan limit cannot hide a sparse tenant.
+    {
+        const auto fair_db=std::string(dir)+"/fair.db";
+        SqliteActorSync store(fair_db);
+        for(int i=0;i<260;++i) {
+            const SyncKey key{"hot","mail","Counter",std::to_string(i)};
+            store.activate_next(key);store.admit_mail(key,1,"pending","1:1","counter");
+        }
+        const SyncKey cold{"quiet","mail","Counter","1"};
+        store.activate_next(cold);store.admit_mail(cold,1,"pending","1:1","counter");
+        const auto heads=store.fair_pending_mail(2,0);
+        assert(heads.size()==2 && heads[0].key.tenant=="hot" && heads[1].key.tenant=="quiet");
+        assert(store.fair_pending_mail(1,0,"hot")[0].key.tenant=="quiet");
+    }
     std::filesystem::remove_all(dir);
 }
