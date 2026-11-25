@@ -71,5 +71,42 @@ int main() {
         release.set_value();
         assert(full && first.get()->reply=="103" && second.get()->reply=="104");
     }
+    // Two workers: distinct object B progresses while A is held; A's
+    // queued successor and passivation cannot overtake the live turn.
+    {
+        using namespace std::chrono_literals;
+        std::promise<void> entered,release;
+        auto ready=entered.get_future();auto gate=release.get_future();
+        std::atomic<int> count{0};
+        CounterDirectory directory(db,[&](I n,I,I d)->I{
+            if(n==104) {++count;entered.set_value();gate.get();}
+            return n+d;
+        },auth,16,4,2,20ms);
+        auto first=directory.send(a,"parallel-held",1,1);
+        const bool started=ready.wait_for(3s)==std::future_status::ready;
+        auto next=directory.send(a,"parallel-next",1,1);
+        auto eviction=directory.passivate(a);
+        auto independent=directory.send(c,"parallel-other",1,1);
+        const bool progressed=independent.wait_for(3s)==std::future_status::ready;
+        const bool held=next.wait_for(80ms)==std::future_status::timeout &&
+                        eviction.wait_for(0ms)==std::future_status::timeout;
+        release.set_value();
+        assert(started && progressed && held);
+        assert(first.get()->reply=="105");
+        assert(next.get()->reply=="106");
+        assert(eviction.get());
+        assert(independent.get()->reply=="2");
+        assert(count==1);
+        const auto before=directory.send(a,"idle-before",1,1).get();
+        assert(before && before->reply=="107");
+        SqliteActorSync observer(db);
+        const auto epoch=observer.snapshot(a).epoch;
+        // Idle policy uses a monotonic clock, not wall time. Poll a benign
+        // passivate on another identity to avoid racing the active object.
+        std::this_thread::sleep_for(120ms);
+        auto after=directory.send(a,"idle-after",1,1).get();
+        assert(after && after->reply=="108");
+        assert(observer.snapshot(a).epoch>epoch);
+    }
     std::filesystem::remove_all(dir);
 }
