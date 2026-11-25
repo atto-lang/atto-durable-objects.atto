@@ -61,7 +61,10 @@ public:
             committed = decode(snapshot.bytes);
         }
         const std::int64_t next = guest(committed, op, delta);
-        if (next == -1) return std::nullopt;
+        if (next == -1) {
+            if (op == 1 && delta > maximum - committed) return std::nullopt;
+            throw std::logic_error("guest rejected a valid counter command");
+        }
         if (next < 0 || next > maximum || (op == 2 && next != committed) ||
             (op == 1 && (delta > maximum - committed || next != committed + delta)))
             throw std::logic_error("invalid guest transition");
