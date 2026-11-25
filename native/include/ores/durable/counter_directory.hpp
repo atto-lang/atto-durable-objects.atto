@@ -256,6 +256,12 @@ private:
                 }
             }
         } catch(...) {if(!fault) fault=std::current_exception();}
+        // Publish a detected fatal fault before waiting for already accepted
+        // turns; supervisor observability must not depend on their duration.
+        if(fault) {
+            std::lock_guard<std::mutex> lock(mail_mu_);
+            mail_fault_=fault;
+        }
         collect(true);
         if(fault) {
             std::lock_guard<std::mutex> lock(mail_mu_);
