@@ -504,6 +504,32 @@ int main(int argc,char** argv) {
             auto replay=directory->admit_with_alarm(a,"@principal:effect",2,"alice",effect,[]{}).get();
             assert(replay.receipt && replay.receipt->duplicate && admin.due_alarms(0).empty());
         }
+        // Signed real fuel guest: a full rolling reservation survives
+        // controller restart, exact replay remains free, other tenant works.
+        {
+            const auto rate_db=std::string(tmp)+"/signed-rolling.db";
+            CounterFuelTenantBudget budget;budget.rolling_fuel=50000;budget.rolling_cpu_seconds=2;
+            assert(budget.limits().guest_rate.starts==1);
+            {
+                auto directory=signed_deployment.open(rate_db,authorize,16,8,2,100ms,0ms,0ms,false,{},false,budget);
+                assert(directory->send(a,"first",1,2).get()->reply=="2");
+                bool blocked=false;
+                try {(void)directory->send(a,"second",1,1).get();}
+                catch(const GuestRateExhausted&) {blocked=true;}
+                assert(blocked);
+            }
+            {
+                auto directory=signed_deployment.open(rate_db,authorize,16,8,2,100ms,0ms,0ms,false,{},false,budget);
+                assert(directory->send(a,"first",1,2).get()->duplicate);
+                bool blocked=false;
+                try {(void)directory->send(a,"second",1,1).get();}
+                catch(const GuestRateExhausted&) {blocked=true;}
+                assert(blocked);
+                assert(directory->send(other,"quiet",1,3).get()->reply=="3");
+                SqliteActorSync observer(rate_db);
+                assert(observer.snapshot(a).revision==1 && observer.snapshot(other).revision==1);
+            }
+        }
         // A populated legacy store must not be implicitly adopted.
         const auto legacy_db=std::string(tmp)+"/legacy-deployment.db";
         {CounterDirectory legacy(legacy_db,runner,auth);
