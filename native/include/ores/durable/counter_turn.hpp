@@ -70,14 +70,15 @@ public:
                                          std::int64_t op, std::int64_t delta, Guest&& guest,
                                          bool inject_precommit_failure = false,
                                          const SyncMail* mail = nullptr,const SyncAlarmChange* change=nullptr) {
-        if(mail && change) throw std::invalid_argument("mail alarm effect not supported");
+        const auto effect=mail?SqliteActorSync::mail_alarm_effect(mail->command):std::optional<SyncMailAlarm>{};
         if (key.actor_type != "Counter")
             throw std::invalid_argument("unexpected actor type");
         if (op != 1 && op != 2) throw std::invalid_argument("invalid counter operation");
         if ((op == 1 && (delta <= 0 || delta > maximum)) || (op == 2 && delta != 0))
             throw std::invalid_argument("invalid counter delta");
-        const auto command = std::to_string(op) + ":" + std::to_string(delta);
-        if (auto prior = store.lookup_receipt(key, epoch, request_id, command, schema,change)) {
+        const auto command = effect?SqliteActorSync::encode_mail_alarm(delta,*effect):std::to_string(op)+":"+std::to_string(delta);
+        if(mail && command!=mail->command) throw std::logic_error("invalid durable command");
+        if (!effect) if (auto prior = store.lookup_receipt(key, epoch, request_id, command, schema,change)) {
             if(prior->reply=="mail_overflow") return mail ? prior : std::nullopt;
             (void)decode(prior->reply);
             return prior;
@@ -121,10 +122,12 @@ public:
         if(mail.schema!=schema || mail.command.size()<3 || mail.command[1]!=':' ||
            (mail.command[0]!='1' && mail.command[0]!='2'))
             throw std::logic_error("invalid persisted counter command");
-        const auto delta=decode(std::string_view(mail.command).substr(2));
+        const auto effect=SqliteActorSync::mail_alarm_effect(mail.command);
+        const auto command=std::string_view(mail.command);
+        const auto delta=decode(command.substr(2,effect?command.find(":alarm:")-2:std::string_view::npos));
         const auto op=static_cast<std::int64_t>(mail.command[0]-'0');
         return run(store,mail.key,epoch,mail.operation_id,op,delta,
-                   std::forward<Guest>(guest),false,&mail);
+                   std::forward<Guest>(guest),false,&mail,effect?&effect->change:nullptr);
     }
 };
 } // namespace ores::durable
