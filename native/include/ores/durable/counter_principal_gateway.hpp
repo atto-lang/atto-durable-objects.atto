@@ -57,10 +57,11 @@ public:
     };
     CounterPrincipalGateway(const SignedCounterDeployment& deployment,const std::string& db,
                             CounterDirectory::Authorize scope,Policy policy,
-                            std::size_t capacity=128,std::size_t active=128,std::size_t workers=1)
+                            std::size_t capacity=128,std::size_t active=128,std::size_t workers=1,
+                            Clock::duration mail_interval=Clock::duration::zero())
         :authority_(std::make_shared<const Authority>(std::move(policy))),
          directory_(deployment.open(db,std::move(scope),capacity,active,workers,
-             Clock::duration::zero(),Clock::duration::zero(),Clock::duration::zero(),true)) {}
+             std::chrono::milliseconds(100),Clock::duration::zero(),mail_interval,true,authority_->policy)) {}
     // Caller MUST authenticate the principal upstream. Exact object and
     // operation are fixed at issue time; no ambient tenant supplied on send.
     Capability issue(std::string principal,SyncKey key,std::int64_t op,
@@ -71,6 +72,23 @@ public:
         if(!authority_->policy(principal,key,op)) throw std::logic_error("principal not authorized");
         return Capability(authority_,std::move(principal),std::move(key),op,Clock::now()+lifetime);
     }
+    // A live capability is required to admit or inspect a prior request.
+    // Its TTL gates submission, not the life of an already accepted row.
+    // Recovery uses the durable principal plus current trusted policy.
+    std::future<SyncAdmission> admit(const Capability& capability,std::string request,
+                                     std::int64_t delta) {
+        const auto issuer=capability.issuer_.lock();
+        if(!issuer || issuer!=authority_) throw std::logic_error("foreign capability");
+        const auto auth=[issuer,capability]{
+            if(Clock::now()>=capability.expires_ ||
+               !issuer->policy(capability.principal_,capability.key_,capability.op_))
+                throw std::logic_error("principal capability expired or revoked");
+        };
+        auth();
+        return directory_->admit_bound(capability.key_,operation_id(capability.principal_,request),
+            capability.op_,delta,capability.principal_,auth);
+    }
+    std::exception_ptr mail_fault() {return directory_->mail_fault();}
     std::future<CounterDirectory::Reply> send(const Capability& capability,std::string request,
                                                std::int64_t delta) {
         const auto issuer=capability.issuer_.lock();
