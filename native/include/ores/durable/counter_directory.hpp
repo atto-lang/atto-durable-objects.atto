@@ -156,16 +156,28 @@ private:
             try {
                 if(unix_ms()<mail.retry_at_ms || !store_.mail_pending(mail,epoch))
                     return Reply{};
-                Reply r;
-                try {
-                    r=CounterTurn::run_mail(store_,mail,epoch,guest_);
-                } catch(const RetryableGuestFailure&) {
-                    validate(mail.key);
-                    // No user exception text is persisted. Store checks the
-                    // current epoch and exact attempt before advancing budget.
+                // A surviving dispatch marker belongs to a previous activation.
+                // The cooperating controller lock excludes its former host.
+                // Only the pure, authority-free scalar guest profile is allowed
+                // here; this is not physical retirement proof for general actors.
+                if(mail.attempt_epoch!=0) {
+                    if(mail.attempt_epoch>=epoch)
+                        throw std::logic_error("unresolved current mailbox attempt");
                     (void)store_.fail_mail(mail,epoch,unix_ms());
                     return Reply{};
                 }
+                const auto started=store_.begin_mail(mail,epoch,unix_ms());
+                Reply r;
+                try {
+                    r=CounterTurn::run_mail(store_,started,epoch,guest_);
+                } catch(const RetryableGuestFailure&) {
+                    validate(mail.key);
+                    // Only after the runner physically stops may this owner
+                    // resolve its marker as a classified failure.
+                    (void)store_.fail_mail(started,epoch,unix_ms());
+                    return Reply{};
+                }
+                if(!r) throw std::logic_error("marked mailbox turn did not commit");
                 validate(mail.key);
                 if(store_.snapshot(mail.key).epoch!=epoch) throw std::logic_error("stale mail publication epoch");
                 return r;
