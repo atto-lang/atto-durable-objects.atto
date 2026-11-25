@@ -210,5 +210,40 @@ int main() {
             assert(observer.snapshot(a).revision==5 && !directory.mail_fault());
         }
     }
+    // A classified failing guest must not halt unrelated actors or block
+    // its own later mail after the bounded retry budget is exhausted.
+    {
+        using namespace std::chrono_literals;
+        const auto retry_db=std::string(dir)+"/retry.db";
+        {
+            CounterDirectory directory(retry_db,guest,auth);
+            assert(directory.admit(a,"poison",1,7).get().sequence>0);
+            assert(directory.admit(a,"next",1,2).get().sequence>0);
+            assert(directory.admit(c,"healthy",1,5).get().sequence>0);
+        }
+        std::atomic<int> failures{0};
+        {
+            CounterDirectory directory(retry_db,[&](I n,I op,I d)->I{
+                if(d==7){++failures;throw CounterDirectory::RetryableGuestFailure();}
+                return op==2?n:n+d;
+            },auth,16,4,2,10ms,0ms,10ms);
+            SqliteActorSync observer(retry_db);
+            const auto deadline=CounterDirectory::Clock::now()+5s;
+            while(!observer.pending_mail().empty() && CounterDirectory::Clock::now()<deadline)
+                std::this_thread::sleep_for(5ms);
+            assert(observer.pending_mail().empty());
+            assert(failures==3 && !directory.mail_fault());
+            assert(observer.snapshot(a).bytes=="2" && observer.snapshot(a).revision==1);
+            assert(observer.snapshot(c).bytes=="5");
+            auto dead=directory.admit(a,"poison",1,7).get();
+            assert(dead.dead_letter && !dead.receipt);
+        }
+        {
+            CounterDirectory directory(retry_db,guest,auth);
+            auto dead=directory.admit(a,"poison",1,7).get();
+            assert(dead.dead_letter && !dead.receipt);
+            rejects<std::logic_error>([&]{directory.admit(a,"poison",1,8).get();});
+        }
+    }
     std::filesystem::remove_all(dir);
 }
