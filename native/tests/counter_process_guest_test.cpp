@@ -1,5 +1,5 @@
 // Real compiled guest integration, including an intentionally looping turn.
-#include "ores/durable/counter_process_guest.hpp"
+#include "ores/durable/counter_artifact_registry.hpp"
 #include <cassert>
 #include <atomic>
 #include <filesystem>
@@ -78,6 +78,46 @@ int main(int argc,char** argv) {
         assert(directory.admit(a,"after",1,2).get().receipt->reply=="2");
     }
     assert(::waitpid(-1,&status,WNOHANG)==-1 && errno==ECHILD);
+    // Real compiled fuel worker with host-selected, tenant-scoped artifacts.
+    if(fuel) {
+        using Binding=CounterArtifactRegistry::Binding;
+        const SyncKey other{"other","counters","Counter","same"};
+        const SyncKey missing{"tenant","missing","Counter","same"};
+        const SyncKey invalid{"tenant","bad-digest","Counter","same"};
+        const std::vector<Binding> bindings{
+            {"tenant","counters","Counter",argv[2],argv[3]},
+            {"other","counters","Counter",argv[2],argv[3]},
+            {"tenant","bad-digest","Counter",argv[2],std::string(64,'0')}
+        };
+        const CounterArtifactRegistry registry(argv[1],5s,bindings);
+        bool denied=false;
+        try { (void)registry(a,0,1,1); }
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        denied=false;
+        try { CounterArtifactRegistry duplicate(argv[1],5s,{bindings[0],bindings[0]}); }
+        catch(const std::invalid_argument&) {denied=true;}
+        assert(denied);
+        const auto registry_db=std::string(tmp)+"/registry.db";
+        CounterDirectory directory(registry_db,CounterDirectory::KeyedGuest(registry),
+            [&](const SyncKey& k){return registry.contains(k);});
+        assert(directory.send(a,"same",1,2).get()->reply=="2");
+        assert(directory.send(other,"same",1,5).get()->reply=="5");
+        denied=false;
+        try {(void)directory.send(missing,"same",1,1);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        denied=false;
+        try {(void)directory.send(invalid,"same",1,1).get();}
+        catch(const CounterDirectory::RetryableGuestFailure&) {assert(false);}
+        catch(const std::runtime_error&) {denied=true;}
+        assert(denied);
+        SqliteActorSync observer(registry_db);
+        assert(observer.snapshot(invalid).revision==0);
+        assert(!observer.lookup_receipt(invalid,observer.snapshot(invalid).epoch,
+                                        "same","1:1",CounterTurn::schema));
+        assert(observer.snapshot(a).bytes=="2" && observer.snapshot(other).bytes=="5");
+    }
     // Host-only orphan test: kill the controller while its trusted worker
     // retains the inherited lock. An independent controller must fail closed
     // until the worker actually exits (no PID-based guesses).
