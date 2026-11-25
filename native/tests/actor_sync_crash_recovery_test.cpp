@@ -1,5 +1,8 @@
 #include "ores/durable/actor_sync.hpp"
 #include <cassert>
+#include <atomic>
+#include <functional>
+#include <thread>
 #include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
@@ -1023,6 +1026,68 @@ int main() {
         for(const auto& item:page) assert(item.key.tenant=="a-hot");
         page=store.fair_due_alarms(1,101,"a-hot");
         assert(page.size()==1 && page[0].key.tenant==quiet.tenant && page[0].failures==1);
+    }
+    // Rolling budget: exact expiry, cross-connection serialization,
+    // persisted clock high-water, crash consumption, and downgrade denial.
+    {
+        const auto db2=std::string(dir)+"/guest-rate.db";
+        {
+            SqliteActorSync store(db2);
+            store.bind_guest_rate({1000,2});
+            store.reserve_guest_start("hot",100);
+            store.reserve_guest_start("hot",200);
+            bool full=false;
+            try {store.reserve_guest_start("hot",1099);}
+            catch(const std::length_error&) {full=true;}
+            assert(full);
+            store.reserve_guest_start("quiet",200);
+        }
+        {
+            SqliteActorSync store(db2);
+            store.bind_guest_rate({1000,2});
+            bool denied=false;
+            try {store.bind_guest_rate({});}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            denied=false;
+            try {store.bind_guest_rate({1000,3});}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            denied=false;
+            try {store.reserve_guest_start("hot",0);}
+            catch(const std::length_error&) {denied=true;}
+            assert(denied);
+            store.reserve_guest_start("hot",1100);
+            denied=false;
+            try {store.reserve_guest_start("hot",1199);}
+            catch(const std::length_error&) {denied=true;}
+            assert(denied);
+            store.reserve_guest_start("hot",1200);
+        }
+        const pid_t child=fork();assert(child>=0);
+        if(child==0) {
+            try {
+                SqliteActorSync store(db2);
+                store.bind_guest_rate({1000,2});
+                store.reserve_guest_start("crash",1200);
+                _exit(65);
+            } catch(...) {_exit(66);}
+        }
+        check_exit(child,65);
+        SqliteActorSync one(db2),two(db2);
+        std::atomic<int> admitted{0},denied{0};
+        auto race=[&](SqliteActorSync& store){
+            try {store.reserve_guest_start("crash",1200);++admitted;}
+            catch(const std::length_error&) {++denied;}
+        };
+        std::thread a(race,std::ref(one)),b(race,std::ref(two));
+        a.join();b.join();
+        assert(admitted==1 && denied==1);
+        bool full=false;
+        try {one.reserve_guest_start("crash",2199);}
+        catch(const std::length_error&) {full=true;}
+        assert(full);
+        one.reserve_guest_start("crash",2200);
     }
     std::filesystem::remove_all(dir);
 }
