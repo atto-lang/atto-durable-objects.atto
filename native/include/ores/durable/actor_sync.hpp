@@ -54,6 +54,12 @@ struct SyncAlarm {
     std::string principal={};
     std::int64_t grant_version=0;
 };
+enum class SyncAlarmStatus : std::int64_t { pending=0,fired=1,denied=2 };
+struct SyncAlarmAuthority {
+    std::int64_t generation,grant_version;
+    std::string principal,operator_id;
+    SyncAlarmStatus status;
+};
 struct SyncMail {
     SyncKey key;
     std::int64_t sequence;
@@ -547,6 +553,16 @@ public:
             bind_key(write,key);write.i64(5,generation);write.text(6,principal);write.i64(7,grant.first);write.text(8,operator_id);write.done();
         }
         tx.commit();return generation;
+    }
+
+    // Trusted diagnostic: latest generation only, not an append-only audit.
+    std::optional<SyncAlarmAuthority> principal_alarm_authority(const SyncKey& key) {
+        validate_key(key);
+        std::lock_guard<std::mutex> lock(mu_);
+        Statement read(db_,"SELECT generation,grant_version,principal,operator_id,status FROM sync_alarm_authority WHERE tenant=? AND space=? AND actor_type=? AND id=?");
+        bind_key(read,key);
+        if(read.step()!=SQLITE_ROW) return std::nullopt;
+        return SyncAlarmAuthority{read.number(0),read.number(1),read.str(2),read.str(3),static_cast<SyncAlarmStatus>(read.number(4))};
     }
 
     // Called only by the trusted scheduler after explicit policy denial,
