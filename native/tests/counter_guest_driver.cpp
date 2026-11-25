@@ -3,6 +3,7 @@
 // The process owns the entire turn and waits on a test-only pipe.
 #include "ores/durable/counter_turn.hpp"
 #include <charconv>
+#include <csignal>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -53,7 +54,11 @@ int main(int argc,char** argv) {
             return 0;
         }
         // Simulate lost response only after the authoritative store commits.
-        if (mode=="lose") _exit(42);
+        if (mode=="lose") {
+            // Hard kill after COMMIT, before any application reply or cleanup.
+            if (::kill(::getpid(), SIGKILL)!=0) return 3;
+            _exit(3); // unreachable if the signal was delivered
+        }
         std::cout<<"COMMITTED "<<result->revision<<" "<<result->reply<<" "
                  <<(result->duplicate?1:0)<<"\n"<<std::flush;
         return 0;
