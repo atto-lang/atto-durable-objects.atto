@@ -110,7 +110,7 @@ private:
         return [guest=std::move(guest)](const SyncKey&,auto n,auto op,auto d){return guest(n,op,d);};
     }
     const Authorize authorize_;
-    const bool principal_mode_;
+    const bool principal_mode_,transactional_policy_;
     const PrincipalPolicy mail_policy_;
     struct PolicyDenied {};
     const std::size_t capacity_,active_limit_;
@@ -214,7 +214,9 @@ private:
                     (void)store_.fail_mail(mail,epoch,unix_ms());
                     return Reply{};
                 }
-                const auto started=store_.begin_mail(mail,epoch,unix_ms());
+                SyncMail started=mail;
+                try {started=store_.begin_mail(mail,epoch,unix_ms());}
+                catch(const PrincipalPolicyChanged&) {store_.deny_mail(mail,epoch);return Reply{};}
                 Reply r;
                 try {
                     auto invoke=guarded_guest(mail.key);
@@ -225,6 +227,8 @@ private:
                         return result;
                     };
                     r=CounterTurn::run_mail(store_,started,epoch,checked);
+                } catch(const PrincipalPolicyChanged&) {
+                    store_.deny_mail(started,epoch);return Reply{};
                 } catch(const PolicyDenied&) {
                     store_.deny_mail(started,epoch);return Reply{};
                 } catch(const RetryableGuestFailure&) {
@@ -434,20 +438,21 @@ public:
                      Clock::duration idle_timeout=Clock::duration::zero(),
                      Clock::duration alarm_interval=Clock::duration::zero(),
                      Clock::duration mail_interval=Clock::duration::zero(),
-                     std::string deployment_manifest={},bool principal_mode=false,PrincipalPolicy mail_policy={})
+                     std::string deployment_manifest={},bool principal_mode=false,PrincipalPolicy mail_policy={},bool transactional_policy=false)
         : owner_(db),store_(owner_.path()),guest_(std::move(guest)),
           deployment_manifest_(std::move(deployment_manifest)),authorize_(std::move(authorize)),
-          principal_mode_(principal_mode),mail_policy_(std::move(mail_policy)),
+          principal_mode_(principal_mode),transactional_policy_(transactional_policy),mail_policy_(std::move(mail_policy)),
           capacity_(capacity),active_limit_(active_limit),idle_timeout_(idle_timeout) {
         if(!guest_ || !authorize_ || !capacity_ || !active_limit_ ||
            !workers || workers>64 || idle_timeout_<Clock::duration::zero() ||
            alarm_interval<Clock::duration::zero() || mail_interval<Clock::duration::zero() ||
            (principal_mode_ && (alarm_interval!=Clock::duration::zero() || (mail_interval!=Clock::duration::zero() && !mail_policy_))) ||
-           (!principal_mode_ && mail_policy_))
+           (!principal_mode_ && mail_policy_) || (transactional_policy_ && !principal_mode_))
             throw std::invalid_argument("invalid directory configuration");
         // Reject changed or missing deployment before any activation or replay.
         store_.bind_deployment(deployment_manifest_);
         store_.bind_principal_namespace(principal_mode);
+        store_.bind_transactional_policy(transactional_policy_);
         workers_.reserve(workers);
         try {
             for(std::size_t i=0;i<workers;++i) workers_.emplace_back([this]{loop();});
@@ -490,6 +495,7 @@ public:
     // commit cannot undo it; this is not transactional revocation.
     std::future<Reply> send_authorized(SyncKey k,std::string request,std::int64_t op,
                                       std::int64_t delta,std::function<void()> authorize_request) {
+        if(transactional_policy_) throw std::logic_error("strict policy requires durable admission");
         if(!authorize_request) throw std::invalid_argument("missing request authorization");
         validate(k);check(request);
         if(request.compare(0,7,"@alarm:")==0) throw std::invalid_argument("reserved alarm operation identity");
