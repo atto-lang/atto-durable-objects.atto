@@ -59,6 +59,7 @@ progress; epoch checks alone are not an ownership election protocol.
 | Cooperative single-host controller ownership | POSIX advisory lock prototype, competing-controller test authored |
 | Durable alarms | Generation-fenced storage + optional automatic FIFO dispatch prototype; tests authored, not executed |
 | Persistent mailbox admission and restart dispatch | Bounded host prototype; tests authored, not executed |
+| Mailbox retry, dead letters and completion reservation | Persistent host prototype, tests authored, not executed |
 | Typed RPC and secure transport | Planned |
 | WebSocket hibernation, placement, replication and failover | Planned |
 
@@ -127,20 +128,56 @@ aggregate command bytes; persisted limits are checked again at reopen.
 The separate configurable mailbox poller (disabled by default) scans up to
 64 object heads and dispatches one outstanding turn at a time. The counter
 demo commits a terminal `mail_overflow` receipt with unchanged state.
-Unexpected handler/authorization faults stop dispatch visibly through
-`mail_fault()`; backpressure retains pending rows.
+Explicitly classified stopped-guest failures use the bounded persistent retry policy below; other handler/authorization faults stop dispatch visibly through `mail_fault()`; backpressure retains pending rows.
 
 An admission future is not proof of eventual completion or network
 publication. Only requests admitted through this API have restart-safe
 admission; transient sends, alarms and controls can interleave between
 durable mailbox entries. FIFO is guaranteed within the durable mailbox,
 not across these separate admission domains. Host callbacks are not
-compiled guest execution. Durable retry/dead-letter handling, quota
-reservation for completion receipts, tenant fairness, authentication of
-persisted principals and a unified durable ingress remain open. The
+compiled guest execution. Administrative dead-letter retention/requeue, crash-counted attempts, tenant fairness, authentication of persisted principals and unified durable ingress remain open. The
 regression tests cover process exit after admission, reopen, exact replay,
 stale epochs, head checks, rollback, quota rejection and drain after
 restart; new execution evidence is pending.
+
+### Durable mailbox retries and poison isolation (host prototype)
+
+The trusted runner can signal `RetryableGuestFailure` only after guest
+execution has physically stopped without committing. A separate SQLite
+retry record tracks the exact mailbox head's classified failures, next
+eligible Unix-millisecond deadline and terminal dead-letter status.
+The fixed v1 policy is:
+
+| Recorded failure | Outcome |
+| --- | --- |
+| 1 | Retry after 100 ms |
+| 2 | Retry after 200 ms |
+| 3 | Terminal dead letter; allow next live FIFO entry |
+
+A backed-off head blocks later entries for that object, but ready heads
+for other objects remain discoverable. Epoch, immutable command, schema,
+sequence, previous failure count and deadline are checked in the retry
+transaction. Dead letters retain original identity/payload and return
+`dead_letter=true` on exact admission replay; no success receipt or
+state/outbox mutation is manufactured. They remain charged against inbox
+count and byte budgets. No automatic requeue or destructive retention
+policy is provided.
+
+Admission reserves one completion receipt and outbox slot for each live
+pending entry. Other commits cannot consume those reservations. Reopen
+checks existing reservations against configured limits. Dead-lettering
+releases completion slots but not the retained inbox budget.
+
+Only explicit classified guest failures use this policy. Database,
+ownership, authorization and unexpected faults remain fail-closed;
+a process crash before a failure record is committed does not consume
+retry budget. There is no actual guest watchdog, process kill/reap or
+fuel-metering integration yet. The supervisor still dispatches one
+mailbox recovery turn at a time and a nonterminating callback can block
+it. These are not production guarantees of poison isolation or eventual
+delivery. Tests cover retry deadlines, restart, stale attempt fencing,
+dead-letter replay, healthy object progress and reserved capacity; no
+new exact-head execution receipts yet.
 
 ### Durable alarms (host prototype)
 
