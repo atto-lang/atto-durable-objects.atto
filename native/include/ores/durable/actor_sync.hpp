@@ -603,16 +603,16 @@ public:
         Tx tx(*this);
         if(!transactional_policy_locked() || snapshot_locked(key).epoch!=epoch)
             throw std::logic_error("strict policy and current epoch required for archive");
+        bool archived=false;
         {
             Statement read(db_,"SELECT archiver FROM sync_dead_archive WHERE tenant=? AND space=? AND actor_type=? AND id=? AND sequence=?");
             bind_key(read,key);read.i64(5,source);
             if(read.step()==SQLITE_ROW) {
                 if(read.str(0)!=operator_id) throw std::logic_error("archive already recorded by another operator");
-                // SELECT is finalized before commit below.
-            } else goto new_archive;
+                archived=true;
+            }
         }
-        tx.commit();return {source,true};
-        new_archive:
+        if(archived){tx.commit();return {source,true};}
         std::int64_t bytes=0;
         {
             Statement read(db_,"SELECT LENGTH(m.command) FROM sync_inbox m JOIN sync_mail_retry r ON r.sequence=m.sequence "
