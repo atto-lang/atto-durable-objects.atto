@@ -81,6 +81,58 @@ private:
     std::condition_variable wake_;
     bool closed_=false;
     std::vector<std::thread> workers_;
+    std::mutex alarm_mu_;
+    std::condition_variable alarm_wake_;
+    bool alarm_stop_=false;
+    std::exception_ptr alarm_fault_;
+    std::thread alarm_worker_;
+    static std::int64_t unix_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+    std::future<Reply> enqueue_alarm(SyncAlarm alarm) {
+        validate(alarm.key);
+        const auto id=identity(alarm.key);
+        return submit(id,[this,id,alarm=std::move(alarm)]{
+            validate(alarm.key);
+            const auto epoch=activate(id,alarm.key);
+            try {
+                auto r=CounterTurn::run_alarm(store_,alarm,epoch,unix_ms(),guest_);
+                validate(alarm.key);
+                if(store_.snapshot(alarm.key).epoch!=epoch) throw std::logic_error("stale alarm publication epoch");
+                return r;
+            } catch(...) {
+                retire(id);throw;
+            }
+        });
+    }
+    // One supervisor poller and at most one outstanding alarm turn. On
+    // unexpected fault stop dispatch and retain the pending durable alarm.
+    // Supervisor must inspect alarm_fault() and repair/reopen the controller.
+    void alarm_loop(Clock::duration interval) noexcept {
+        try {
+            for(;;) {
+                {
+                    std::unique_lock<std::mutex> lock(alarm_mu_);
+                    if(alarm_wake_.wait_for(lock,interval,[&]{return alarm_stop_;})) return;
+                }
+                for(const auto& alarm:store_.due_alarms(unix_ms(),64)) {
+                    {
+                        std::lock_guard<std::mutex> lock(alarm_mu_);
+                        if(alarm_stop_) return;
+                    }
+                    // Saturation and activation quota are backpressure:
+                    // retain deadline and retry after the next interval.
+                    try { (void)enqueue_alarm(alarm).get(); }
+                    catch(const std::length_error&) { break; }
+                }
+            }
+        } catch(...) {
+            std::lock_guard<std::mutex> lock(alarm_mu_);
+            alarm_fault_=std::current_exception();
+        }
+    }
+
     static Key identity(const SyncKey& k) {
         return {k.tenant,k.name_space,k.actor_type,k.object_id};
     }
@@ -195,15 +247,19 @@ public:
     CounterDirectory(const std::string& db, Guest guest, Authorize authorize,
                      std::size_t capacity=128,std::size_t active_limit=128,
                      std::size_t workers=1,
-                     Clock::duration idle_timeout=Clock::duration::zero())
+                     Clock::duration idle_timeout=Clock::duration::zero(),
+                     Clock::duration alarm_interval=Clock::duration::zero())
         : owner_(db),store_(owner_.path()),guest_(std::move(guest)),authorize_(std::move(authorize)),
           capacity_(capacity),active_limit_(active_limit),idle_timeout_(idle_timeout) {
         if(!guest_ || !authorize_ || !capacity_ || !active_limit_ ||
-           !workers || workers>64 || idle_timeout_<Clock::duration::zero())
+           !workers || workers>64 || idle_timeout_<Clock::duration::zero() ||
+           alarm_interval<Clock::duration::zero())
             throw std::invalid_argument("invalid directory configuration");
         workers_.reserve(workers);
         try {
             for(std::size_t i=0;i<workers;++i) workers_.emplace_back([this]{loop();});
+            if(alarm_interval!=Clock::duration::zero())
+                alarm_worker_=std::thread([this,alarm_interval]{alarm_loop(alarm_interval);});
         } catch(...) {
             {std::lock_guard<std::mutex> lock(mu_);closed_=true;}
             wake_.notify_all();
@@ -214,12 +270,16 @@ public:
     CounterDirectory(const CounterDirectory&)=delete;
     CounterDirectory& operator=(const CounterDirectory&)=delete;
     ~CounterDirectory() {
+        {std::lock_guard<std::mutex> lock(alarm_mu_);alarm_stop_=true;}
+        alarm_wake_.notify_all();
+        if(alarm_worker_.joinable()) alarm_worker_.join();
         {std::lock_guard<std::mutex> lock(mu_);closed_=true;}
         wake_.notify_all();
         for(auto& t:workers_) t.join(); // drain accepted work
     }
     std::future<Reply> send(SyncKey k,std::string request,std::int64_t op,std::int64_t delta) {
         validate(k);check(request);
+        if(request.compare(0,7,"@alarm:")==0) throw std::invalid_argument("reserved alarm operation identity");
         if((op!=1 && op!=2) || (op==1 && (delta<=0 || delta>CounterTurn::maximum)) ||
            (op==2 && delta!=0)) throw std::invalid_argument("invalid command");
         const auto id=identity(k);
@@ -235,6 +295,36 @@ public:
                 retire(id);throw;
             }
         });
+    }
+    // Trusted controls join the same FIFO as normal requests. A generation
+    // CAS rejects stale retries, including retries following a lost reply.
+    std::future<std::int64_t> set_alarm(SyncKey k,std::int64_t expected_generation,
+                                        std::optional<std::int64_t> due_ms) {
+        validate(k);
+        if(expected_generation<0 || (due_ms && *due_ms<0)) throw std::invalid_argument("invalid alarm control");
+        const auto id=identity(k);
+        return submit(id,[this,id,k=std::move(k),expected_generation,due_ms]{
+            validate(k);
+            const auto epoch=activate(id,k);
+            try {
+                auto g=store_.set_alarm(k,epoch,expected_generation,due_ms);
+                validate(k);
+                if(store_.snapshot(k).epoch!=epoch) throw std::logic_error("stale alarm publication epoch");
+                return g;
+            } catch(...) {retire(id);throw;}
+        });
+    }
+    std::future<std::int64_t> alarm_generation(SyncKey k) {
+        validate(k);
+        const auto id=identity(k);
+        return submit(id,[this,id,k=std::move(k)]{
+            validate(k);return store_.alarm_generation(k,activate(id,k));
+        });
+    }
+    // Diagnostic for trusted supervisor; empty means no terminal fault seen.
+    std::exception_ptr alarm_fault() {
+        std::lock_guard<std::mutex> lock(alarm_mu_);
+        return alarm_fault_;
     }
     // Trusted, authorized diagnostic only. Does not reserve a turn or
     // grant an ownership capability; the value may change immediately.
