@@ -59,6 +59,17 @@ struct SyncAdmission {
     bool dead_letter=false;
     bool authorization_denied=false;
 };
+struct SyncDeadLetter {
+    std::int64_t sequence;
+    std::string operation_id,principal;
+    bool authorization_denied;
+    std::int64_t redrive_sequence=0;
+};
+struct SyncRedrive {
+    std::int64_t original_sequence,new_sequence;
+    std::string operation_id;
+    bool duplicate=false;
+};
 class PrincipalPolicyChanged final : public std::logic_error {
 public:
     PrincipalPolicyChanged():std::logic_error("persisted principal policy denied or changed"){}
@@ -192,6 +203,10 @@ public:
                  "principal TEXT NOT NULL,op INTEGER NOT NULL CHECK(op IN (1,2)),"
                  "version INTEGER NOT NULL CHECK(version>0),allowed INTEGER NOT NULL CHECK(allowed IN (0,1)),"
                  "PRIMARY KEY(tenant,space,actor_type,id,principal,op)) WITHOUT ROWID");
+            exec("CREATE TABLE IF NOT EXISTS sync_dead_redrive("
+                 "source_sequence INTEGER PRIMARY KEY, new_sequence INTEGER NOT NULL UNIQUE,"
+                 "operator_id TEXT NOT NULL, new_op_id TEXT NOT NULL,"
+                 "FOREIGN KEY(source_sequence) REFERENCES sync_inbox(sequence) ON DELETE RESTRICT)");
             exec("CREATE TABLE IF NOT EXISTS sync_attempt_policy("
                  "sequence INTEGER PRIMARY KEY,version INTEGER NOT NULL CHECK(version>0),"
                  "FOREIGN KEY(sequence) REFERENCES sync_mail_attempt(sequence) ON DELETE CASCADE)");
@@ -533,6 +548,89 @@ public:
             throw std::invalid_argument("invalid mailbox admission");
         std::lock_guard<std::mutex> lock(mu_);
         Tx tx(*this);
+        if(operation_id.substr(0,19)=="@principal:redrive:")
+            throw std::invalid_argument("reserved redrive identity");
+        auto result=admit_mail_locked(key,epoch,operation_id,command,schema_fp,principal);
+        tx.commit();return result;
+    }
+
+    // Trusted administrative inspection, scoped to one exact object.
+    // No command payload or guest exception strings are exposed.
+    std::vector<SyncDeadLetter> dead_letters(const SyncKey& key,std::int64_t after=0,std::size_t limit=64) {
+        validate_key(key);
+        if(after<0 || limit==0 || limit>256) throw std::invalid_argument("invalid dead-letter page");
+        std::lock_guard<std::mutex> lock(mu_);
+        Statement read(db_,"SELECT m.sequence,m.op_id,COALESCE(p.principal,''),COALESCE(p.denied,0),COALESCE(d.new_sequence,0) "
+            "FROM sync_inbox m JOIN sync_mail_retry r ON r.sequence=m.sequence "
+            "LEFT JOIN sync_mail_principal p ON p.sequence=m.sequence LEFT JOIN sync_dead_redrive d ON d.source_sequence=m.sequence "
+            "WHERE m.tenant=? AND m.space=? AND m.actor_type=? AND m.id=? AND r.dead=1 AND m.sequence>? "
+            "ORDER BY m.sequence LIMIT ?");
+        bind_key(read,key);read.i64(5,after);read.i64(6,static_cast<std::int64_t>(limit));
+        std::vector<SyncDeadLetter> result;
+        while(read.step()==SQLITE_ROW) result.push_back({read.number(0),read.str(1),read.str(2),read.number(3)!=0,read.number(4)});
+        return result;
+    }
+
+    // Strict policy only. Trusted authenticated operator authorizes this
+    // exact object outside storage. Original principal and bytes are
+    // preserved, current persisted grant is checked inside the write tx.
+    // One redrive per original row; explicit authorization denials cannot
+    // be redriven. New operation identity and FIFO sequence are allocated.
+    SyncRedrive redrive_dead_letter(const SyncKey& key,std::int64_t epoch,std::int64_t source,
+                                    std::string_view operator_id) {
+        validate_key(key);label(operator_id);
+        if(epoch<=0 || source<=0) throw std::invalid_argument("invalid redrive envelope");
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this);
+        if(!transactional_policy_locked() || snapshot_locked(key).epoch!=epoch)
+            throw std::logic_error("strict policy and current epoch required for redrive");
+        std::string command,schema,principal;
+        {
+            Statement read(db_,"SELECT m.command,m.schema_fp,p.principal,p.denied FROM sync_inbox m "
+                "JOIN sync_mail_retry r ON r.sequence=m.sequence JOIN sync_mail_principal p ON p.sequence=m.sequence "
+                "LEFT JOIN sync_mail_attempt a ON a.sequence=m.sequence "
+                "WHERE m.tenant=? AND m.space=? AND m.actor_type=? AND m.id=? AND m.sequence=? AND r.dead=1 AND a.sequence IS NULL");
+            bind_key(read,key);read.i64(5,source);
+            if(read.step()!=SQLITE_ROW || read.number(3)!=0)
+                throw std::logic_error("redrive requires an exhausted, non-denied dead letter");
+            command=read.blob(0);schema=read.str(1);principal=read.str(2);
+        }
+        label(principal);label(schema);bounded(command,limits_.command_bytes);
+        if(!policy_locked(key,principal,policy_op(command)).second) throw PrincipalPolicyChanged();
+        std::optional<SyncRedrive> prior;
+        {
+            Statement read(db_,"SELECT new_sequence,operator_id,new_op_id FROM sync_dead_redrive WHERE source_sequence=?");
+            read.i64(1,source);
+            if(read.step()==SQLITE_ROW) {
+                if(read.str(1)!=operator_id) throw std::logic_error("redrive already recorded by another operator");
+                prior=SyncRedrive{source,read.number(0),read.str(2),true};
+            }
+        }
+        if(prior){tx.commit();return *prior;}
+        {
+            Statement count(db_,"SELECT COUNT(*) FROM sync_dead_redrive");
+            if(count.step()!=SQLITE_ROW || count.number(0)>=65536) throw std::length_error("redrive audit quota exhausted");
+        }
+        const auto op_id="@principal:redrive:"+std::to_string(source);
+        // No adoption of a pre-existing identity (including legacy raw writes).
+        for(const auto* sql:{"SELECT 1 FROM sync_inbox WHERE tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?",
+                             "SELECT 1 FROM sync_operations WHERE tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?"}) {
+            Statement read(db_,sql);bind_key(read,key);read.text(5,op_id);
+            if(read.step()==SQLITE_ROW) throw std::logic_error("redrive identity collision");
+        }
+        const auto admitted=admit_mail_locked(key,epoch,op_id,command,schema,principal);
+        if(admitted.sequence<=0 || admitted.receipt || admitted.dead_letter)
+            throw std::logic_error("redrive admission invariant");
+        {
+            Statement write(db_,"INSERT INTO sync_dead_redrive VALUES(?,?,?,?)");
+            write.i64(1,source);write.i64(2,admitted.sequence);write.text(3,operator_id);write.text(4,op_id);write.done();
+        }
+        tx.commit();return {source,admitted.sequence,op_id,false};
+    }
+
+private:
+    SyncAdmission admit_mail_locked(const SyncKey& key,std::int64_t epoch,std::string_view operation_id,
+                                  std::string_view command,std::string_view schema_fp,std::string_view principal) {
         if(snapshot_locked(key).epoch!=epoch) throw std::logic_error("stale mailbox owner");
         {
             Statement mode(db_,"SELECT 1 FROM sync_principal_namespace WHERE singleton=1");
@@ -554,7 +652,7 @@ public:
                 completed=SyncCommit{read.number(2),read.blob(3),true};
             }
         }
-        if(completed){tx.commit();return {0,completed};}
+        if(completed){return {0,completed};}
         std::int64_t existing=0;
         bool dead=false;
         {
@@ -570,7 +668,7 @@ public:
         if(existing){
             auto binding=mail_principal_locked(existing);
             if(binding.first!=principal) throw std::logic_error("pending mail principal mismatch");
-            tx.commit();return {existing,std::nullopt,dead,binding.second};
+            return {existing,std::nullopt,dead,binding.second};
         }
         // Reserve one receipt and outbox slot for each live admitted turn.
         const auto live=live_mail_count(key);
@@ -612,9 +710,10 @@ public:
             Statement bind(db_,"INSERT INTO sync_mail_principal(sequence,principal) VALUES(?,?)");
             bind.i64(1,seq);bind.text(2,principal);bind.done();
         }
-        tx.commit();return {seq,std::nullopt};
+        return {seq,std::nullopt};
     }
 
+public:
     // Oldest pending record per object, globally ordered by admission.
     // The scan is a hint; consume checks identity, epoch and head again.
     std::vector<SyncMail> pending_mail(std::size_t limit=64,
@@ -1154,6 +1253,7 @@ private:
         };
         validate("SELECT COUNT(*) FROM sync_objects",limits_.actor_keys_per_database);
         validate("SELECT COUNT(*) FROM sync_principal_policy",65536);
+        validate("SELECT COUNT(*) FROM sync_dead_redrive",65536);
         // Reject an older database with more live promises than completion
         // capacity. Reconfiguration must not silently abandon accepted mail.
         validate("SELECT COALESCE(MAX(n),0) FROM (SELECT "
