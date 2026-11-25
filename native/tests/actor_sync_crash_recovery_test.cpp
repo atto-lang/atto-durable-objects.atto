@@ -811,5 +811,58 @@ int main() {
         catch(const std::logic_error&) {denied=true;}
         assert(denied && store.due_alarms(0).size()==1);
     }
+    // A strict alarm captures the exact grant version when scheduled.
+    // Revocation/regrant invalidates that generation across restart.
+    {
+        const auto db2=std::string(dir)+"/principal-alarm.db";
+        const SyncKey k{"tenant","mail","Counter","strict-alarm"};
+        {
+            SqliteActorSync store(db2);
+            store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+            auto epoch=store.activate_next(k);
+            bool denied=false;
+            try {store.set_principal_alarm(k,epoch,0,0,"alice","operator");}
+            catch(const PrincipalPolicyChanged&) {denied=true;}
+            assert(denied && store.alarm_generation(k,epoch)==0);
+            store.set_principal_policy(k,"alice",1,0,true);
+            assert(store.set_principal_alarm(k,epoch,0,0,"alice","operator")==1);
+            auto info=store.principal_alarm_authority(k);
+            assert(info && info->principal=="alice" && info->operator_id=="operator" &&
+                   info->grant_version==1 && info->status==SyncAlarmStatus::pending);
+        }
+        SqliteActorSync store(db2),admin(db2);
+        store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+        auto epoch=store.activate_next(k);
+        auto alarm=store.due_alarms(0)[0];
+        assert(store.alarm_pending(alarm,epoch,0));
+        auto forged=alarm;forged.principal="bob";
+        bool denied=false;
+        try {store.alarm_pending(forged,epoch,0);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        admin.set_principal_policy(k,"alice",1,1,false);
+        admin.set_principal_policy(k,"alice",1,2,true);
+        denied=false;
+        try {store.commit(k,epoch,0,"@alarm:1","alarm:0","counter","1","1",false,&alarm,0);}
+        catch(const PrincipalPolicyChanged&) {denied=true;}
+        assert(denied && store.snapshot(k).revision==0 && store.changes_after(k,0).empty());
+        assert(store.deny_principal_alarm(alarm,epoch,0));
+        assert(!store.deny_principal_alarm(alarm,epoch,0));
+        assert(store.principal_alarm_authority(k)->status==SyncAlarmStatus::denied);
+        assert(store.due_alarms(0).empty());
+        assert(store.set_principal_alarm(k,epoch,1,0,"alice","operator")==2);
+        auto next=store.due_alarms(0)[0];
+        assert(next.grant_version==3 && !store.deny_principal_alarm(alarm,epoch,0));
+        denied=false;
+        try {store.commit(k,epoch,0,"@alarm:2","alarm:0","counter","1","1",true,&next,0);}
+        catch(const std::runtime_error&) {denied=true;}
+        assert(denied && store.alarm_pending(next,epoch,0));
+        assert(store.principal_alarm_authority(k)->status==SyncAlarmStatus::pending);
+        assert(store.commit(k,epoch,0,"@alarm:2","alarm:0","counter","1","1",false,&next,0).revision==1);
+        assert(store.principal_alarm_authority(k)->status==SyncAlarmStatus::fired);
+        assert(store.due_alarms(0).empty() && store.snapshot(k).bytes=="1");
+        admin.set_principal_policy(k,"alice",1,3,false);
+        assert(store.snapshot(k).revision==1);
+    }
     std::filesystem::remove_all(dir);
 }
