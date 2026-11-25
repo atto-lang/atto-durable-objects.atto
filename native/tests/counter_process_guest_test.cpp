@@ -21,6 +21,20 @@ int main(int argc,char** argv) {
         return std::filesystem::exists(marker+".release")?0:49;
     }
     assert(argc==5 || argc==4);
+    {
+        const CounterFuelTenantBudget defaults;
+        assert(defaults.limits().queued==32 && defaults.limits().running==2);
+        auto one=defaults;one.address_space_bytes=256ull*1024*1024;
+        assert(one.limits().running==1);
+        one=defaults;one.in_flight_fuel=50000;
+        assert(one.limits().running==1);
+        one=defaults;one.in_flight_cpu_seconds=2;
+        assert(one.limits().running==1);
+        one.in_flight_cpu_seconds=1;
+        bool rejected=false;
+        try {(void)one.limits();}catch(const std::invalid_argument&){rejected=true;}
+        assert(rejected);
+    }
     const bool fuel=argc==4;
     auto make_runner=[&](std::string digest){
         if(fuel) return CounterProcessGuest::fuel_worker(argv[1],argv[2],std::move(digest),5s);
@@ -479,7 +493,8 @@ int main(int argc,char** argv) {
             assert(replay.receipt && replay.receipt->duplicate && replay.receipt->reply=="2");
         }
         {
-            auto directory=signed_deployment.open(atomic_strict_db,authorize,128,128,2,100ms,10ms,0ms,true,alarm_policy,true);
+            auto directory=signed_deployment.open(atomic_strict_db,authorize,128,128,2,100ms,10ms,0ms,true,alarm_policy,true,
+                CounterFuelTenantBudget{8,256ull*1024*1024,50000,2});
             SqliteActorSync admin(atomic_strict_db);
             const auto until=CounterDirectory::Clock::now()+5s;
             while(!admin.due_alarms(0).empty() && CounterDirectory::Clock::now()<until)
