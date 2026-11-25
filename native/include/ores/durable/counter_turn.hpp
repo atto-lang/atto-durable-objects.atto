@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace ores::durable {
 // Trusted host integration seam only. Caller MUST authenticate key, acquire
@@ -67,7 +68,8 @@ public:
     static std::optional<SyncCommit> run(SqliteActorSync& store, const SyncKey& key,
                                          std::int64_t epoch, std::string_view request_id,
                                          std::int64_t op, std::int64_t delta, Guest&& guest,
-                                         bool inject_precommit_failure = false) {
+                                         bool inject_precommit_failure = false,
+                                         const SyncMail* mail = nullptr) {
         if (key.actor_type != "Counter")
             throw std::invalid_argument("unexpected actor type");
         if (op != 1 && op != 2) throw std::invalid_argument("invalid counter operation");
@@ -75,9 +77,11 @@ public:
             throw std::invalid_argument("invalid counter delta");
         const auto command = std::to_string(op) + ":" + std::to_string(delta);
         if (auto prior = store.lookup_receipt(key, epoch, request_id, command, schema)) {
+            if(prior->reply=="mail_overflow") return mail ? prior : std::nullopt;
             (void)decode(prior->reply);
             return prior;
         }
+        if(mail && !store.mail_pending(*mail,epoch)) return std::nullopt;
         const auto snapshot = store.snapshot(key);
         if (snapshot.epoch != epoch) throw std::logic_error("stale counter owner");
         std::int64_t committed = 0;
@@ -91,7 +95,11 @@ public:
         }
         const std::int64_t next = guest(committed, op, delta);
         if (next == -1) {
-            if (op == 1 && delta > maximum - committed) return std::nullopt;
+            if (op == 1 && delta > maximum - committed) {
+                if(!mail) return std::nullopt;
+                return store.commit(key,epoch,snapshot.revision,request_id,command,schema,
+                    std::to_string(committed),"mail_overflow",inject_precommit_failure,nullptr,0,mail);
+            }
             throw std::logic_error("guest rejected a valid counter command");
         }
         if (next < 0 || next > maximum || (op == 2 && next != committed) ||
@@ -101,9 +109,21 @@ public:
         // CAS and immutable receipt check are repeated inside SQLite commit.
         // Return only the store's committed reply, never the speculative one.
         auto receipt = store.commit(key, epoch, snapshot.revision, request_id,
-                                    command, schema, proposed, proposed, inject_precommit_failure);
+                                    command, schema, proposed, proposed, inject_precommit_failure,nullptr,0,mail);
         (void)decode(receipt.reply);
         return receipt;
+    }
+    // Durable command encoding is canonical and bounded before guest entry.
+    template<class Guest>
+    static std::optional<SyncCommit> run_mail(SqliteActorSync& store,const SyncMail& mail,
+                                             std::int64_t epoch,Guest&& guest) {
+        if(mail.schema!=schema || mail.command.size()<3 || mail.command[1]!=':' ||
+           (mail.command[0]!='1' && mail.command[0]!='2'))
+            throw std::logic_error("invalid persisted counter command");
+        const auto delta=decode(std::string_view(mail.command).substr(2));
+        const auto op=static_cast<std::int64_t>(mail.command[0]-'0');
+        return run(store,mail.key,epoch,mail.operation_id,op,delta,
+                   std::forward<Guest>(guest),false,&mail);
     }
 };
 } // namespace ores::durable
