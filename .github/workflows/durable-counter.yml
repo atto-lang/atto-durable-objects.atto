@@ -48,7 +48,7 @@ jobs:
           ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" node tests/durable_counter_guest.mjs
       - name: Compile host driver and execute real guest-to-SQLite process test
         env:
-          STORAGE_SHA: c7c1170dc61ccbb87f4c70bb1561c073c7db566b
+          STORAGE_SHA: e97c8fc15efad1e35be3c908b2e88319f864bd70
           ATTO_COMPILER_SOURCE_SHA: 1d6e8e31453064b6530c5c82679aef3cc9db489b
         run: |
           set -euo pipefail
@@ -75,7 +75,7 @@ jobs:
       - name: Execute host-only storage seam against pinned PR 9
         env:
           EXPECTED: ${{ github.event.pull_request.head.sha }}
-          STORAGE_SHA: c7c1170dc61ccbb87f4c70bb1561c073c7db566b
+          STORAGE_SHA: e97c8fc15efad1e35be3c908b2e88319f864bd70
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED"
@@ -105,3 +105,8 @@ jobs:
           ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
             timeout 90 "$RUNNER_TEMP/counter-directory-sanitized"
           echo 'HOST_ONLY_COUNTER_DIRECTORY_ASAN_UBSAN_PASS'
+          g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
+            -I"$RUNNER_TEMP/storage/native/include" "$RUNNER_TEMP/storage/native/tests/actor_sync_crash_recovery_test.cpp" \
+            -lsqlite3 -o "$RUNNER_TEMP/actor-sync-crash-test"
+          timeout 60 "$RUNNER_TEMP/actor-sync-crash-test"
+          echo 'HOST_ONLY_ACTOR_SYNC_ALARM_RECOVERY_PASS'
