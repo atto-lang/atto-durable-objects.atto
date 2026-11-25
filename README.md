@@ -295,6 +295,38 @@ the scalar implementation is not that ABI.
 
 Wave 13 regressions are pending exact-head execution.
 
+### Signed immutable deployment identity (Wave 14 candidate)
+
+The trusted artifact registry canonicalizes the complete scope set using
+length-framed exact bytes sorted by tenant/namespace/type. Its v1 identity
+includes each artifact SHA-256, the scalar engine/fuel profile and wall
+budget, rather than the machine-local path. The new SQLite deployment
+record binds those exact bytes transactionally before any worker starts.
+Reopening with reordered identical bindings is allowed; changed artifact,
+scope, budget or absent manifest is denied, even for a receipt replay.
+A populated legacy store cannot be silently adopted. No in-place upgrade,
+key revocation, or removal of pending mail is offered.
+
+The host-only SignedCounterDeployment path verifies a detached Ed25519
+signature over that exact canonical manifest via OpenSSL EVP and an
+operator-provisioned trusted public key. No private signing key is required
+at runtime. An immutable verified registry supplies both dispatch and
+scope admission, composed with an independent trusted ingress authorizer.
+The registry checks its controller-bound deployment before executing, and
+the fuel worker independently checks the actual artifact digest. Host
+fixture constructors remain trusted low-level APIs; they are not a secure
+network boundary. The trusted runner executable and filesystem are still
+operator-controlled, not independently attested by this manifest. Signed
+manifest verification is not principal authentication, revocation or
+anti-rollback across a restored/deleted database. Persisted artifact
+upgrades require an explicit quiescent migration and receipt policy.
+
+The compiled-fuel regression generates an ephemeral test-only Ed25519 key,
+checks signature/key/manifest tampering, validates scoped dispatch, verifies
+restart deduplication and pending-mail recovery under identical deployment,
+and rejects changed configuration and legacy fallback. These are authored
+tests, not a Wave 14 execution receipt.
+
 ### Bounded compiled guest process runner (Wave 10 — executed)
 
 [Exact-head run 45534083712](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45534083712)
