@@ -324,6 +324,39 @@ restart deduplication and pending-mail recovery under identical deployment,
 and rejects changed configuration and legacy fallback. These are authored
 tests, not a Wave 14 execution receipt.
 
+### Concurrent tenant-aware alarm dispatch (Wave 26 candidate)
+
+The alarm poller now submits up to the configured worker count of distinct
+object futures and independently reaps completed turns, rather than
+waiting synchronously for each alarm. The bounded eligible scan ranks
+alarms within tenants before LIMIT and rotates from the last attempted
+tenant. Retry-delayed and exhausted generations are excluded. Object
+lanes remain exclusive across alarm, mailbox and other host work. Queue
+or activation saturation is backpressure; unexpected faults stop new
+dispatch and drain already accepted futures. This is tenant-aware
+candidate selection, not a reservation of CPU time or guaranteed fairness
+under arbitrary saturation. Alarm and mailbox pollers share the existing
+worker pool; aggregate per-tenant resource limits are separate work.
+
+Storage regression schedules 260 hot-tenant objects and verifies a quiet
+tenant remains visible before the page limit, including rotation and
+retry eligibility. Host regression holds an alarm and requires a
+different tenant to progress before releasing it, with a same-object
+successor unable to overtake the held turn. The compiled watchdog
+fixture additionally loops when committed state is 11 and the actual
+alarm increment is 1; both Node deadline and wasmi fuel workers are
+expected to exhaust exactly three alarm attempts, retain unchanged
+state, permit the healthy alarm and reap all children. No substituted
+host operation is used. These are authored regressions, not executed
+Wave 26 evidence. Storage pin: `878101271489a7167cad807c8f946f28911e65cd`.
+
+Wave 23 original CI failed to fetch a mistyped storage SHA, not a guest
+semantic failure. The corrected cumulative Wave 24
+[run 45675549581](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45675549581)
+and Wave 25 [run 45676354679](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45676354679)
+both completed guest and host jobs successfully. They are historical
+receipts and do not certify Wave 26.
+
 ### Authorized atomic mailbox and alarm effects (Wave 25 candidate)
 
 Strict signed-deployment hosts may use `admit_with_alarm` with a trusted
