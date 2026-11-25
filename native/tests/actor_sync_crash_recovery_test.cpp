@@ -165,5 +165,77 @@ int main() {
         assert(replay.duplicate && replay.reply=="1" && store.snapshot(alarm_key).bytes=="1");
         assert(store.set_alarm(alarm_key,epoch,4,400)==5);
     }
+    // An admission ACK survives loss of the admitting process before execution.
+    const SyncKey mailbox{"tenant","mail","Counter","mailbox"};
+    {
+        SqliteActorSync store(db);
+        store.activate_next(mailbox);
+    }
+    const pid_t admitted=fork();
+    assert(admitted>=0);
+    if(admitted==0) {
+        try {
+            SqliteActorSync store(db);
+            auto first=store.admit_mail(mailbox,1,"m1","1:1","counter");
+            auto second=store.admit_mail(mailbox,1,"m2","1:2","counter");
+            if(first.sequence<=0 || second.sequence<=first.sequence) _exit(17);
+            _exit(44);
+        } catch(...) {_exit(18);}
+    }
+    check_exit(admitted,44);
+    {
+        SqliteActorSync store(db);
+        const auto epoch=store.activate_next(mailbox);
+        const auto heads=store.pending_mail();
+        assert(heads.size()==1 && heads[0].operation_id=="m1");
+        const auto first=heads[0];
+        assert(store.admit_mail(mailbox,epoch,"m1","1:1","counter").sequence==first.sequence);
+        bool conflict=false;
+        try {store.admit_mail(mailbox,epoch,"m1","1:2","counter");}
+        catch(const std::logic_error&) {conflict=true;}
+        assert(conflict);
+        const auto second=store.admit_mail(mailbox,epoch,"m2","1:2","counter");
+        SyncMail later{mailbox,second.sequence,"m2","1:2","counter"};
+        assert(!store.mail_pending(later,epoch));
+        for(int mode=0;mode<3;++mode) {
+            bool denied=false;
+            try {
+                if(mode==0) store.commit(mailbox,epoch,0,"m1","1:1","counter","1","1");
+                if(mode==1) store.commit(mailbox,epoch,0,"m2","1:2","counter","2","2",false,nullptr,0,&later);
+                if(mode==2) store.commit(mailbox,epoch-1,0,"m1","1:1","counter","1","1",false,nullptr,0,&first);
+            } catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+        }
+        bool rolled=false;
+        try {store.commit(mailbox,epoch,0,"m1","1:1","counter","1","1",true,nullptr,0,&first);}
+        catch(const std::runtime_error&) {rolled=true;}
+        assert(rolled && store.snapshot(mailbox).revision==0 && store.mail_pending(first,epoch));
+        auto result=store.commit(mailbox,epoch,0,"m1","1:1","counter","1","1",false,nullptr,0,&first);
+        assert(result.revision==1 && !result.duplicate);
+        auto replay=store.admit_mail(mailbox,epoch,"m1","1:1","counter");
+        assert(replay.sequence==0 && replay.receipt && replay.receipt->reply=="1");
+        assert(store.mail_pending(later,epoch));
+    }
+    {
+        SqliteActorSync store(db);
+        auto heads=store.pending_mail();
+        assert(heads.size()==1 && heads[0].operation_id=="m2");
+        const auto epoch=store.activate_next(mailbox);
+        auto r=store.commit(mailbox,epoch,1,"m2","1:2","counter","3","3",false,nullptr,0,&heads[0]);
+        assert(r.revision==2 && store.pending_mail().empty());
+        assert(store.snapshot(mailbox).bytes=="3");
+    }
+    {
+        SyncLimits limits;limits.inbox_entries_per_actor=1;limits.inbox_entries_per_database=1;
+        SqliteActorSync store(db,limits);
+        const auto epoch=store.activate_next(mailbox);
+        auto first=store.admit_mail(mailbox,epoch,"q1","1:1","counter");
+        assert(first.sequence>0);
+        assert(store.admit_mail(mailbox,epoch,"q1","1:1","counter").sequence==first.sequence);
+        bool full=false;
+        try {store.admit_mail(mailbox,epoch,"q2","1:1","counter");}
+        catch(const std::length_error&) {full=true;}
+        assert(full);
+    }
     std::filesystem::remove_all(dir);
 }
