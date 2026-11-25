@@ -41,6 +41,12 @@ struct SyncCommit {
     bool duplicate;
 };
 // One durable alarm per logical actor. Generation survives cancel/consume.
+// Optional mutation in the same commit as state/receipt/outbox.
+// Absent mutation means leave alarm unchanged; null deadline means cancel.
+struct SyncAlarmChange {
+    std::int64_t expected_generation;
+    std::optional<std::int64_t> due_ms;
+};
 struct SyncAlarm {
     SyncKey key;
     std::int64_t generation;
@@ -179,6 +185,11 @@ public:
                  "PRIMARY KEY(tenant,space,actor_type,id),"
                  "FOREIGN KEY(tenant,space,actor_type,id) REFERENCES sync_objects(tenant,space,actor_type,id)) WITHOUT ROWID");
             exec("CREATE INDEX IF NOT EXISTS sync_alarm_due ON sync_alarms(due_ms,tenant,space,actor_type,id) WHERE due_ms IS NOT NULL");
+            exec("CREATE TABLE IF NOT EXISTS sync_alarm_effects("
+                 "tenant TEXT NOT NULL,space TEXT NOT NULL,actor_type TEXT NOT NULL,id TEXT NOT NULL,op_id TEXT NOT NULL,"
+                 "expected_generation INTEGER NOT NULL CHECK(expected_generation>=0),due_ms INTEGER CHECK(due_ms>=0),"
+                 "PRIMARY KEY(tenant,space,actor_type,id,op_id),"
+                 "FOREIGN KEY(tenant,space,actor_type,id,op_id) REFERENCES sync_operations(tenant,space,actor_type,id,op_id)) WITHOUT ROWID");
             exec("CREATE TABLE IF NOT EXISTS sync_inbox("
                  "sequence INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT NOT NULL, space TEXT NOT NULL,"
                  "actor_type TEXT NOT NULL, id TEXT NOT NULL, op_id TEXT NOT NULL, command BLOB NOT NULL,"
@@ -354,6 +365,10 @@ public:
                 Statement pending(db_,"SELECT 1 FROM sync_inbox LIMIT 1");
                 if(pending.step()==SQLITE_ROW) throw std::logic_error("drain inbox before enabling transactional policy");
             }
+            {
+                Statement pending(db_,"SELECT 1 FROM sync_alarms WHERE due_ms IS NOT NULL LIMIT 1");
+                if(pending.step()==SQLITE_ROW) throw std::logic_error("drain alarms before enabling transactional policy");
+            }
             exec("INSERT INTO sync_policy_mode VALUES(1)");
         }
         tx.commit();
@@ -457,8 +472,10 @@ public:
     std::optional<SyncCommit> lookup_receipt(const SyncKey& key, std::int64_t epoch,
                                             std::string_view operation_id,
                                             std::string_view command,
-                                            std::string_view schema_fp) {
+                                            std::string_view schema_fp,
+                                            const SyncAlarmChange* change=nullptr) {
         validate_key(key); label(operation_id); label(schema_fp);
+        validate_alarm_change(change);
         bounded(command, limits_.command_bytes);
         if (epoch <= 0) throw std::invalid_argument("invalid epoch");
         std::lock_guard<std::mutex> lock(mu_);
@@ -475,6 +492,7 @@ public:
                 replay = SyncCommit{s.number(2), s.blob(3), true};
             }
         }
+        if(replay) match_alarm_effect_locked(key,operation_id,change);
         tx.commit();
         return replay;
     }
@@ -491,23 +509,9 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         Tx tx(*this);
         if(snapshot_locked(key).epoch!=epoch) throw std::logic_error("stale alarm owner");
-        std::int64_t old=0;
-        {
-            Statement read(db_,"SELECT generation FROM sync_alarms WHERE tenant=? AND space=? AND actor_type=? AND id=?");
-            bind_key(read,key);
-            if(read.step()==SQLITE_ROW) old=read.number(0);
-        }
-        if(old!=expected_generation) throw std::logic_error("alarm generation conflict");
-        if(old==std::numeric_limits<std::int64_t>::max()) throw std::overflow_error("alarm generation exhausted");
-        {
-            Statement write(db_,"INSERT INTO sync_alarms VALUES(?,?,?,?,?,?) "
-                "ON CONFLICT(tenant,space,actor_type,id) DO UPDATE SET generation=excluded.generation,due_ms=excluded.due_ms");
-            bind_key(write,key);write.i64(5,old+1);
-            if(due_ms) write.i64(6,*due_ms);
-            else if(sqlite3_bind_null(write.p,6)!=SQLITE_OK) throw std::runtime_error("alarm null bind failed");
-            write.done();
-        }
-        tx.commit();return old+1;
+        if(transactional_policy_locked()) throw PrincipalPolicyChanged();
+        const auto generation=set_alarm_locked(key,expected_generation,due_ms);
+        tx.commit();return generation;
     }
 
     std::int64_t alarm_generation(const SyncKey& key,std::int64_t epoch) {
@@ -988,8 +992,14 @@ public:
                       std::string_view next_state, std::string_view reply,
                       bool inject_precommit_failure = false,
                       const SyncAlarm* alarm = nullptr, std::int64_t now_ms = 0,
-                      const SyncMail* mail = nullptr) {
+                      const SyncMail* mail = nullptr,const SyncAlarmChange* change=nullptr) {
         validate_key(key); label(operation_id); label(schema_fp);
+        validate_alarm_change(change);
+        // Durable mailbox scheduling must bind the effect at admission.
+        // This slice permits trusted transient and alarm-handler turns only.
+        if(change && mail) throw std::invalid_argument("mail alarm effect requires durable admission binding");
+        if(change && alarm && change->expected_generation!=alarm->generation)
+            throw std::invalid_argument("alarm replacement must fence consumed generation");
         if(mail && (alarm || mail->sequence<=0 ||
             mail->key.tenant!=key.tenant || mail->key.name_space!=key.name_space ||
             mail->key.actor_type!=key.actor_type || mail->key.object_id!=key.object_id ||
@@ -1039,7 +1049,7 @@ public:
                 replay = SyncCommit{s.number(2), s.blob(3), true};
             }
         }
-        if (replay) { tx.commit(); return *replay; }
+        if (replay) { match_alarm_effect_locked(key,operation_id,change);tx.commit();return *replay; }
         if(mail && ((mail->attempt_epoch!=0 && mail->attempt_epoch!=epoch) || !mail_matches_locked(*mail)))
             throw std::logic_error("mail is not the current FIFO head");
         if(!mail) {
@@ -1093,6 +1103,14 @@ public:
             Statement consume(db_,"DELETE FROM sync_inbox WHERE sequence=? AND tenant=? AND space=? AND actor_type=? AND id=?");
             consume.i64(1,mail->sequence);bind_key(consume,key,2);consume.done();
             if(sqlite3_changes(db_)!=1) throw std::logic_error("lost mailbox head");
+        }
+        if(change) {
+            (void)set_alarm_locked(key,change->expected_generation,change->due_ms);
+            Statement write(db_,"INSERT INTO sync_alarm_effects VALUES(?,?,?,?,?,?,?)");
+            bind_key(write,key);write.text(5,operation_id);write.i64(6,change->expected_generation);
+            if(change->due_ms) write.i64(7,*change->due_ms);
+            else if(sqlite3_bind_null(write.p,7)!=SQLITE_OK) throw std::runtime_error("alarm effect null bind failed");
+            write.done();
         }
         if (inject_precommit_failure) throw std::runtime_error("injected failure before commit");
         tx.commit();
@@ -1334,6 +1352,40 @@ private:
         return read.step()==SQLITE_ROW && read.number(0)==mail.sequence &&
             read.str(1)==mail.operation_id && read.blob(2)==mail.command && read.str(3)==mail.schema &&
             read.number(4)==mail.failures && read.number(5)==mail.retry_at_ms && read.number(6)==mail.attempt_epoch && mail_principal_locked(mail.sequence).first==mail.principal;
+    }
+    static void validate_alarm_change(const SyncAlarmChange* change) {
+        if(change && (change->expected_generation<0 || (change->due_ms && *change->due_ms<0)))
+            throw std::invalid_argument("invalid atomic alarm change");
+    }
+    std::int64_t set_alarm_locked(const SyncKey& key,std::int64_t expected_generation,
+                                  std::optional<std::int64_t> due_ms) {
+        std::int64_t old=0;
+        {
+            Statement read(db_,"SELECT generation FROM sync_alarms WHERE tenant=? AND space=? AND actor_type=? AND id=?");
+            bind_key(read,key);
+            if(read.step()==SQLITE_ROW) old=read.number(0);
+        }
+        if(old!=expected_generation) throw std::logic_error("alarm generation conflict");
+        if(old==std::numeric_limits<std::int64_t>::max()) throw std::overflow_error("alarm generation exhausted");
+        {
+            Statement write(db_,"INSERT INTO sync_alarms VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(tenant,space,actor_type,id) DO UPDATE SET generation=excluded.generation,due_ms=excluded.due_ms");
+            bind_key(write,key);write.i64(5,old+1);
+            if(due_ms) write.i64(6,*due_ms);
+            else if(sqlite3_bind_null(write.p,6)!=SQLITE_OK) throw std::runtime_error("alarm null bind failed");
+            write.done();
+        }
+        return old+1;
+    }
+    void match_alarm_effect_locked(const SyncKey& key,std::string_view operation_id,const SyncAlarmChange* change) {
+        Statement read(db_,"SELECT expected_generation,due_ms FROM sync_alarm_effects WHERE tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?");
+        bind_key(read,key);read.text(5,operation_id);
+        const bool exists=read.step()==SQLITE_ROW;
+        if(exists!=static_cast<bool>(change)) throw std::logic_error("alarm effect replay mismatch");
+        if(exists && (read.number(0)!=change->expected_generation ||
+            (sqlite3_column_type(read.p,1)==SQLITE_NULL)!=!change->due_ms ||
+            (change->due_ms && read.number(1)!=*change->due_ms)))
+            throw std::logic_error("alarm effect replay mismatch");
     }
     bool alarm_matches_locked(const SyncAlarm& alarm,std::int64_t now_ms) {
         Statement read(db_,"SELECT 1 FROM sync_alarms WHERE tenant=? AND space=? AND actor_type=? AND id=? "
