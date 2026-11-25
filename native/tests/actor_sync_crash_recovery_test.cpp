@@ -116,5 +116,54 @@ int main() {
         catch(const std::logic_error&) { denied=true; }
         assert(denied);
     }
+    // Alarm generation survives cancellation, consumption and reopen.
+    {
+        SqliteActorSync store(db);
+        const SyncKey alarm_key{"tenant","timers","Counter","one"};
+        const auto epoch=store.activate_next(alarm_key);
+        assert(store.alarm_generation(alarm_key,epoch)==0);
+        assert(store.set_alarm(alarm_key,epoch,0,100)==1);
+        assert(store.due_alarms(99).empty());
+        auto due=store.due_alarms(100);
+        assert(due.size()==1 && due[0].generation==1);
+        assert(store.set_alarm(alarm_key,epoch,1,200)==2);
+        assert(!store.alarm_pending(due[0],epoch,200));
+        bool stale=false;
+        try { store.set_alarm(alarm_key,epoch,1,std::nullopt); }
+        catch(const std::logic_error&) {stale=true;}
+        assert(stale);
+        assert(store.set_alarm(alarm_key,epoch,2,std::nullopt)==3);
+        assert(store.due_alarms(200).empty());
+        assert(store.set_alarm(alarm_key,epoch,3,300)==4);
+        bool reserved=false;
+        try { store.commit(alarm_key,epoch,0,"@alarm:4","alarm:300","counter","1","1"); }
+        catch(const std::invalid_argument&) {reserved=true;}
+        assert(reserved);
+        due=store.due_alarms(300);
+        assert(due.size()==1);
+        bool rolled=false;
+        try { store.commit(alarm_key,epoch,0,"@alarm:4","alarm:300","counter","1","1",true,&due[0],300); }
+        catch(const std::runtime_error&) {rolled=true;}
+        assert(rolled && store.snapshot(alarm_key).revision==0);
+        assert(store.alarm_pending(due[0],epoch,300));
+    }
+    {
+        SqliteActorSync store(db);
+        const SyncKey alarm_key{"tenant","timers","Counter","one"};
+        auto due=store.due_alarms(300);
+        assert(due.size()==1 && due[0].generation==4);
+        const auto epoch=store.activate_next(alarm_key);
+        bool stale=false;
+        try { store.commit(alarm_key,epoch-1,0,"@alarm:4","alarm:300","counter","1","1",false,&due[0],300); }
+        catch(const std::logic_error&) {stale=true;}
+        assert(stale);
+        const auto receipt=store.commit(alarm_key,epoch,0,"@alarm:4","alarm:300","counter","1","1",false,&due[0],300);
+        assert(!receipt.duplicate && receipt.revision==1);
+        assert(store.due_alarms(300).empty());
+        assert(store.alarm_generation(alarm_key,epoch)==4);
+        const auto replay=store.commit(alarm_key,epoch,0,"@alarm:4","alarm:300","counter","bad","bad",false,&due[0],300);
+        assert(replay.duplicate && replay.reply=="1" && store.snapshot(alarm_key).bytes=="1");
+        assert(store.set_alarm(alarm_key,epoch,4,400)==5);
+    }
     std::filesystem::remove_all(dir);
 }
