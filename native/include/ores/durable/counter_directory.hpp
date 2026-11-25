@@ -146,11 +146,18 @@ private:
     std::future<Reply> enqueue_alarm(SyncAlarm alarm) {
         check(alarm.key.tenant);check(alarm.key.name_space);check(alarm.key.actor_type);check(alarm.key.object_id);
         const auto id=identity(alarm.key);
-        return submit(id,[this,id,alarm=std::move(alarm)]{
+        return submit(id,[this,id,alarm=std::move(alarm)]() mutable {
             const auto epoch=activate(id,alarm.key);
             try {
                 try {
                     if(!alarm_authorized(alarm)) throw AlarmPolicyDenied{};
+                    const auto now=unix_ms();
+                    if(!store_.alarm_pending(alarm,epoch,now)) return Reply{};
+                    if(alarm.attempt_epoch!=0) {
+                        if(alarm.attempt_epoch>=epoch) throw std::logic_error("unresolved current alarm attempt");
+                        (void)store_.fail_alarm(alarm,epoch,now);return Reply{};
+                    }
+                    alarm=store_.begin_alarm(alarm,epoch,now);
                     auto invoke=guarded_guest(alarm.key);
                     auto checked=[&](auto n,auto op,auto d) {
                         if(!alarm_authorized(alarm)) throw AlarmPolicyDenied{};
@@ -162,6 +169,18 @@ private:
                     if(!alarm_authorized(alarm)) return Reply{};
                     if(store_.snapshot(alarm.key).epoch!=epoch) throw std::logic_error("stale alarm publication epoch");
                     return result;
+                } catch(const RetryableGuestFailure&) {
+                    // Only the classified runner contract guarantees the
+                    // guest has physically stopped when this is thrown.
+                    if(!alarm_authorized(alarm)) {
+                        (void)store_.deny_principal_alarm(alarm,epoch,unix_ms());return Reply{};
+                    }
+                    try {(void)store_.fail_alarm(alarm,epoch,unix_ms());}
+                    catch(const PrincipalPolicyChanged&) {
+                        if(!transactional_policy_) throw;
+                        (void)store_.deny_principal_alarm(alarm,epoch,unix_ms());
+                    }
+                    return Reply{};
                 } catch(const PrincipalPolicyChanged&) {
                     if(!transactional_policy_) throw;
                     (void)store_.deny_principal_alarm(alarm,epoch,unix_ms());return Reply{};
