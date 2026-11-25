@@ -366,5 +366,48 @@ int main() {
         }
         assert(order.size()==13 && order[0]=="hot" && order[1]=="quiet");
     }
+    // Hold a real scheduler turn while an independent trusted admin
+    // changes the persisted grant. External callback policy stays true:
+    // only the transactional fence can reject the proposed result.
+    {
+        using namespace std::chrono_literals;
+        const auto strict_db=std::string(dir)+"/strict-directory.db";
+        const auto policy=[](std::string_view,const SyncKey&,I){return true;};
+        const auto authorize=[](const SyncKey&){return true;};
+        {
+            CounterDirectory directory(strict_db,CounterDirectory::KeyedGuest(
+                [](const SyncKey&,I n,I op,I d)->I{return op==2?n:n+d;}),
+                authorize,16,4,1,10ms,0ms,0ms,"",true,policy,true);
+            SqliteActorSync admin(strict_db);
+            assert(admin.set_principal_policy(a,"alice",1,0,true)==1);
+            assert(admin.set_principal_policy(a,"bob",1,0,true)==1);
+            assert(directory.admit_bound(a,"@principal:alice",1,7,"alice",[]{}).get().sequence>0);
+            assert(directory.admit_bound(a,"@principal:bob",1,2,"bob",[]{}).get().sequence>0);
+        }
+        std::promise<void> entered,release;
+        auto ready=entered.get_future();auto gate=release.get_future();
+        {
+            CounterDirectory directory(strict_db,CounterDirectory::KeyedGuest(
+                [&](const SyncKey&,I n,I op,I d)->I{
+                    if(d==7){entered.set_value();gate.wait();}
+                    return op==2?n:n+d;
+                }),authorize,16,4,1,10ms,0ms,10ms,"",true,policy,true);
+            SqliteActorSync admin(strict_db);
+            const bool began=ready.wait_for(3s)==std::future_status::ready;
+            try {
+                assert(admin.set_principal_policy(a,"alice",1,1,false)==2);
+                assert(admin.set_principal_policy(a,"alice",1,2,true)==3);
+            } catch(...) {release.set_value();throw;}
+            release.set_value();assert(began);
+            const auto deadline=CounterDirectory::Clock::now()+5s;
+            while(!admin.pending_mail().empty() && CounterDirectory::Clock::now()<deadline)
+                std::this_thread::sleep_for(5ms);
+            assert(admin.pending_mail().empty() && !directory.mail_fault());
+            assert(admin.snapshot(a).bytes=="2" && admin.snapshot(a).revision==1);
+            auto terminal=directory.admit_bound(a,"@principal:alice",1,7,"alice",[]{}).get();
+            assert(terminal.authorization_denied && !terminal.receipt);
+            rejects<std::logic_error>([&]{(void)directory.send_authorized(a,"raw",1,1,[]{});});
+        }
+    }
     std::filesystem::remove_all(dir);
 }
