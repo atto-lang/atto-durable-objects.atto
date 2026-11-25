@@ -114,6 +114,15 @@ public:
                  "schema_fp TEXT NOT NULL, snapshot BLOB NOT NULL,"
                  "PRIMARY KEY(tenant,space,actor_type,id,revision),"
                  "FOREIGN KEY(tenant,space,actor_type,id) REFERENCES sync_objects(tenant,space,actor_type,id)) WITHOUT ROWID");
+            // Older stores allowed arbitrary operation IDs. Fail closed
+            // before introducing the reserved alarm receipt namespace.
+            {
+                Statement table(db_,"SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_alarms'");
+                if(table.step()!=SQLITE_ROW) {
+                    Statement legacy(db_,"SELECT 1 FROM sync_operations WHERE substr(op_id,1,7)='@alarm:' LIMIT 1");
+                    if(legacy.step()==SQLITE_ROW) throw std::logic_error("legacy reserved alarm receipt requires migration");
+                }
+            }
             exec("CREATE TABLE IF NOT EXISTS sync_alarms("
                  "tenant TEXT NOT NULL, space TEXT NOT NULL, actor_type TEXT NOT NULL, id TEXT NOT NULL,"
                  "generation INTEGER NOT NULL CHECK(generation>0), due_ms INTEGER CHECK(due_ms>=0),"
@@ -287,6 +296,20 @@ public:
             write.done();
         }
         tx.commit();return old+1;
+    }
+
+    std::int64_t alarm_generation(const SyncKey& key,std::int64_t epoch) {
+        validate_key(key);
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this,false);
+        if(snapshot_locked(key).epoch!=epoch) throw std::logic_error("stale alarm owner");
+        std::int64_t generation=0;
+        {
+            Statement read(db_,"SELECT generation FROM sync_alarms WHERE tenant=? AND space=? AND actor_type=? AND id=?");
+            bind_key(read,key);
+            if(read.step()==SQLITE_ROW) generation=read.number(0);
+        }
+        tx.commit();return generation;
     }
 
     // Trusted scheduler: bounded indexed scan; not a claim or reservation.
