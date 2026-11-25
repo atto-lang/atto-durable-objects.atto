@@ -169,6 +169,8 @@ public:
             exec("CREATE TABLE IF NOT EXISTS sync_deployment("
                  "singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
                  "manifest BLOB NOT NULL CHECK(length(manifest)>0 AND length(manifest)<=4194304))");
+            exec("CREATE TABLE IF NOT EXISTS sync_principal_namespace("
+                 "singleton INTEGER PRIMARY KEY CHECK(singleton=1))");
             exec("CREATE TABLE IF NOT EXISTS sync_projection("
                  "consumer TEXT NOT NULL, tenant TEXT NOT NULL, space TEXT NOT NULL,"
                  "actor_type TEXT NOT NULL, id TEXT NOT NULL, epoch INTEGER NOT NULL,"
@@ -244,6 +246,32 @@ public:
             }
             Statement insert(db_,"INSERT INTO sync_deployment VALUES(1,?)");
             insert.blob(1,manifest);insert.done();
+        }
+        tx.commit();
+    }
+
+    // Only the trusted principal gateway can enable this mode at startup.
+    // Reject legacy receipts/inbox using the reserved prefix before claiming
+    // the namespace. A raw controller cannot reopen a gateway-mode store.
+    void bind_principal_namespace(bool enabled) {
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this);
+        bool prior=false;
+        {
+            Statement read(db_,"SELECT 1 FROM sync_principal_namespace WHERE singleton=1");
+            prior=read.step()==SQLITE_ROW;
+        }
+        if(prior && !enabled) throw std::logic_error("principal gateway required");
+        if(enabled && !prior) {
+            {
+                Statement read(db_,"SELECT 1 FROM sync_operations WHERE substr(op_id,1,11)='@principal:' LIMIT 1");
+                if(read.step()==SQLITE_ROW) throw std::logic_error("legacy principal receipt requires migration");
+            }
+            {
+                Statement read(db_,"SELECT 1 FROM sync_inbox WHERE substr(op_id,1,11)='@principal:' LIMIT 1");
+                if(read.step()==SQLITE_ROW) throw std::logic_error("legacy principal inbox requires migration");
+            }
+            exec("INSERT INTO sync_principal_namespace VALUES(1)");
         }
         tx.commit();
     }
