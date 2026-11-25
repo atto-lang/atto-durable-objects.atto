@@ -324,6 +324,45 @@ restart deduplication and pending-mail recovery under identical deployment,
 and rejects changed configuration and legacy fallback. These are authored
 tests, not a Wave 14 execution receipt.
 
+### Atomic state and alarm scheduling (Wave 22 candidate)
+
+The trusted scalar counter host may submit an exclusive non-principal turn
+with `send_with_alarm(key, request, op, delta, SyncAlarmChange{generation, due})`.
+A missing effect leaves the current alarm unchanged; an explicit null
+deadline cancels it. SQLite validates the expected generation and commits
+state, receipt, outbox, and alarm generation/deadline in one transaction.
+The effect is bound to the operation receipt: exact replay never reschedules
+an already consumed/replaced alarm, and omission or modification of the
+effect on replay fails closed (including ordinary mailbox admission).
+The storage seam also supports consuming a due alarm and installing its
+next generation atomically. A failed transaction leaves the previous
+snapshot, receipt history, outbox and alarm unchanged.
+
+This is a trusted host-proposed alarm effect, not a new compiled guest
+effect ABI or a durable mailbox scheduling command. The compiled scalar
+guest still only computes the counter transition. The principal gateway
+does not expose the new API. Strict transactional policy rejects standalone
+alarm mutations and startup with pending alarms, as well as alarm state
+commits; the next authorization design must persist the scheduling principal,
+exact alarm grant and generation, and revalidate at firing/commit.
+Do not use older writer binaries or bypass the trusted host boundary.
+
+Storage tests cover injected rollback, a fork exiting after commit before
+acknowledgement, effect replay/conflicts, consume-and-replace, stale
+generation rollback, cancellation and strict mode rejection. Compiled
+guest integration schedules an alarm with a real Wasm transition, restarts,
+replays the original operation, rejects changed effects, then fires the
+persisted alarm. These are authored tests, not executed Wave 22 evidence.
+Storage pin: `445307999926c5d7dc359faac4d54972107c9439`.
+
+Wave 20 [run 45668736104](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45668736104)
+and Wave 21 [run 45669610810](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45669610810)
+completed both host and compiled guest integration jobs successfully.
+The committed fuel-worker dependency lockfile was used in those runs.
+Wave 19 [run 45665677376](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45665677376)
+also completed both jobs. Receipts are historical exact-head evidence,
+not certification of the current candidate.
+
 ### Bounded dead-letter archival (Wave 21 candidate)
 
 A separately authorized operator can archive terminal principal mail in
