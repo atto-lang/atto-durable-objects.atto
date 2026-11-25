@@ -212,28 +212,54 @@ private:
             } catch(...) {retire(id);throw;}
         });
     }
-    // Bounded supervisor scans, at most one outstanding recovery turn.
-    // Backpressure preserves pending rows; other failures stop the poller
-    // and are visible to the supervisor rather than silently dropping mail.
-    void mail_loop(Clock::duration interval) noexcept {
+    // At most one outstanding durable mail turn per object and at most
+    // worker_count total. Reap ready futures without waiting behind an
+    // unrelated slow guest. Stop admitting on unexpected faults, but drain
+    // already submitted turns before leaving the supervisor.
+    void mail_loop(Clock::duration interval,std::size_t worker_count) noexcept {
+        std::map<Key,std::future<Reply>> in_flight;
+        std::exception_ptr fault;
+        auto collect=[&](bool drain) {
+            for(auto it=in_flight.begin();it!=in_flight.end();) {
+                if(!drain && it->second.wait_for(Clock::duration::zero())!=std::future_status::ready) {
+                    ++it;continue;
+                }
+                try {(void)it->second.get();}
+                catch(const std::length_error&) {/* durable backpressure */}
+                catch(...) {if(!fault) fault=std::current_exception();}
+                it=in_flight.erase(it);
+            }
+        };
         try {
             for(;;) {
                 {
                     std::unique_lock<std::mutex> lock(mail_mu_);
-                    if(mail_wake_.wait_for(lock,interval,[&]{return mail_stop_;})) return;
+                    if(mail_wake_.wait_for(lock,interval,[&]{return mail_stop_;})) break;
                 }
-                for(const auto& mail:store_.pending_mail(64,unix_ms())) {
+                collect(false);
+                if(fault) break;
+                if(in_flight.size()>=worker_count) continue;
+                for(const auto& mail:store_.pending_mail(256,unix_ms())) {
                     {
                         std::lock_guard<std::mutex> lock(mail_mu_);
-                        if(mail_stop_) return;
+                        if(mail_stop_) break;
                     }
-                    try {(void)enqueue_mail(mail).get();}
-                    catch(const std::length_error&) {continue;}
+                    if(in_flight.size()>=worker_count) break;
+                    const auto id=identity(mail.key);
+                    if(in_flight.find(id)!=in_flight.end()) continue;
+                    // Allocate tracking before enqueue, so allocation failure
+                    // cannot leave an untracked accepted future.
+                    auto inserted=in_flight.try_emplace(id);
+                    try {inserted.first->second=enqueue_mail(mail);}
+                    catch(const std::length_error&) {in_flight.erase(inserted.first);}
+                    catch(...) {in_flight.erase(inserted.first);throw;}
                 }
             }
-        } catch(...) {
+        } catch(...) {if(!fault) fault=std::current_exception();}
+        collect(true);
+        if(fault) {
             std::lock_guard<std::mutex> lock(mail_mu_);
-            mail_fault_=std::current_exception();
+            mail_fault_=fault;
         }
     }
 
@@ -384,7 +410,7 @@ public:
             if(alarm_interval!=Clock::duration::zero())
                 alarm_worker_=std::thread([this,alarm_interval]{alarm_loop(alarm_interval);});
             if(mail_interval!=Clock::duration::zero())
-                mail_worker_=std::thread([this,mail_interval]{mail_loop(mail_interval);});
+                mail_worker_=std::thread([this,mail_interval,workers]{mail_loop(mail_interval,workers);});
         } catch(...) {
             {std::lock_guard<std::mutex> lock(alarm_mu_);alarm_stop_=true;}
             alarm_wake_.notify_all();
