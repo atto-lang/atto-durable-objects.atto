@@ -53,8 +53,9 @@ struct SyncAlarm {
     std::int64_t due_ms;
     std::string principal={};
     std::int64_t grant_version=0;
+    std::int64_t failures=0,retry_at_ms=0,attempt_epoch=0;
 };
-enum class SyncAlarmStatus : std::int64_t { pending=0,fired=1,denied=2 };
+enum class SyncAlarmStatus : std::int64_t { pending=0,fired=1,denied=2,failed=3 };
 struct SyncAlarmAuthority {
     std::int64_t generation,grant_version;
     std::string principal,operator_id;
@@ -193,6 +194,13 @@ public:
                  "PRIMARY KEY(tenant,space,actor_type,id),"
                  "FOREIGN KEY(tenant,space,actor_type,id) REFERENCES sync_objects(tenant,space,actor_type,id)) WITHOUT ROWID");
             exec("CREATE INDEX IF NOT EXISTS sync_alarm_due ON sync_alarms(due_ms,tenant,space,actor_type,id) WHERE due_ms IS NOT NULL");
+            exec("CREATE TABLE IF NOT EXISTS sync_alarm_retry("
+                 "tenant TEXT NOT NULL,space TEXT NOT NULL,actor_type TEXT NOT NULL,id TEXT NOT NULL,"
+                 "generation INTEGER NOT NULL CHECK(generation>0),failures INTEGER NOT NULL CHECK(failures BETWEEN 0 AND 3),"
+                 "retry_at_ms INTEGER NOT NULL CHECK(retry_at_ms>=0),attempt_epoch INTEGER NOT NULL CHECK(attempt_epoch>=0),"
+                 "CHECK(failures<3 OR (attempt_epoch=0 AND retry_at_ms=0)),"
+                 "PRIMARY KEY(tenant,space,actor_type,id),"
+                 "FOREIGN KEY(tenant,space,actor_type,id) REFERENCES sync_alarms(tenant,space,actor_type,id)) WITHOUT ROWID");
             exec("CREATE TABLE IF NOT EXISTS sync_alarm_authority("
                  "tenant TEXT NOT NULL,space TEXT NOT NULL,actor_type TEXT NOT NULL,id TEXT NOT NULL,"
                  "generation INTEGER NOT NULL CHECK(generation>0),principal TEXT NOT NULL,grant_version INTEGER NOT NULL CHECK(grant_version>0),"
@@ -559,7 +567,9 @@ public:
     std::optional<SyncAlarmAuthority> principal_alarm_authority(const SyncKey& key) {
         validate_key(key);
         std::lock_guard<std::mutex> lock(mu_);
-        Statement read(db_,"SELECT generation,grant_version,principal,operator_id,status FROM sync_alarm_authority WHERE tenant=? AND space=? AND actor_type=? AND id=?");
+        Statement read(db_,"SELECT p.generation,p.grant_version,p.principal,p.operator_id,CASE WHEN COALESCE(r.failures,0)=3 THEN 3 ELSE p.status END "
+            "FROM sync_alarm_authority p LEFT JOIN sync_alarm_retry r ON p.tenant=r.tenant AND p.space=r.space AND p.actor_type=r.actor_type AND p.id=r.id AND p.generation=r.generation "
+            "WHERE p.tenant=? AND p.space=? AND p.actor_type=? AND p.id=?");
         bind_key(read,key);
         if(read.step()!=SQLITE_ROW) return std::nullopt;
         return SyncAlarmAuthority{read.number(0),read.number(1),read.str(2),read.str(3),static_cast<SyncAlarmStatus>(read.number(4))};
@@ -576,6 +586,7 @@ public:
         if(!alarm_matches_locked(alarm,now_ms)){tx.commit();return false;}
         if(!alarm_binding_matches_locked(alarm)) throw std::logic_error("invalid alarm authority binding");
         finish_alarm_authority_locked(alarm,2);
+        clear_alarm_retry_locked(alarm.key);
         {
             Statement clear(db_,"UPDATE sync_alarms SET due_ms=NULL WHERE tenant=? AND space=? AND actor_type=? AND id=? AND generation=?");
             bind_key(clear,alarm.key);clear.i64(5,alarm.generation);clear.done();
@@ -604,12 +615,14 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         std::vector<SyncAlarm> due;
         Statement read(db_,"SELECT a.tenant,a.space,a.actor_type,a.id,a.generation,a.due_ms,"
-                           "COALESCE(p.principal,''),COALESCE(p.grant_version,0) FROM sync_alarms a "
+                           "COALESCE(p.principal,''),COALESCE(p.grant_version,0),COALESCE(r.failures,0),COALESCE(r.retry_at_ms,0),COALESCE(r.attempt_epoch,0) FROM sync_alarms a "
                            "LEFT JOIN sync_alarm_authority p ON a.tenant=p.tenant AND a.space=p.space AND a.actor_type=p.actor_type AND a.id=p.id AND a.generation=p.generation "
-                           "WHERE a.due_ms IS NOT NULL AND a.due_ms<=? ORDER BY a.due_ms,a.tenant,a.space,a.actor_type,a.id LIMIT ?");
-        read.i64(1,now_ms);read.i64(2,static_cast<std::int64_t>(limit));
+                           "LEFT JOIN sync_alarm_retry r ON a.tenant=r.tenant AND a.space=r.space AND a.actor_type=r.actor_type AND a.id=r.id AND a.generation=r.generation "
+                           "WHERE a.due_ms IS NOT NULL AND a.due_ms<=? AND COALESCE(r.retry_at_ms,0)<=? AND COALESCE(r.failures,0)<3 "
+                           "ORDER BY a.due_ms,a.tenant,a.space,a.actor_type,a.id LIMIT ?");
+        read.i64(1,now_ms);read.i64(2,now_ms);read.i64(3,static_cast<std::int64_t>(limit));
         while(read.step()==SQLITE_ROW) {
-            SyncAlarm a{{read.str(0),read.str(1),read.str(2),read.str(3)},read.number(4),read.number(5),read.str(6),read.number(7)};
+            SyncAlarm a{{read.str(0),read.str(1),read.str(2),read.str(3)},read.number(4),read.number(5),read.str(6),read.number(7),read.number(8),read.number(9),read.number(10)};
             validate_key(a.key);due.push_back(std::move(a));
         }
         return due;
@@ -624,6 +637,47 @@ public:
         const bool pending=alarm_matches_locked(alarm,now_ms);
         if(pending && transactional_policy_locked()) require_alarm_grant_locked(alarm);
         tx.commit();return pending;
+    }
+
+    // Persist the attempt before invoking a pure guest. The caller must
+    // hold the exclusive object lane and physical retirement authority.
+    SyncAlarm begin_alarm(const SyncAlarm& alarm,std::int64_t epoch,std::int64_t now_ms) {
+        validate_key(alarm.key);
+        if(epoch<=0 || alarm.attempt_epoch!=0 || now_ms<0)
+            throw std::invalid_argument("invalid alarm attempt");
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this);
+        if(snapshot_locked(alarm.key).epoch!=epoch || !alarm_matches_locked(alarm,now_ms))
+            throw std::logic_error("stale alarm attempt");
+        if(transactional_policy_locked()) require_alarm_grant_locked(alarm);
+        auto started=alarm;started.attempt_epoch=epoch;
+        write_alarm_retry_locked(started);
+        tx.commit();return started;
+    }
+
+    // Only a physically stopped classified failure or an abandoned older
+    // controller attempt may consume budget. Unknown failures stay pending.
+    bool fail_alarm(const SyncAlarm& alarm,std::int64_t epoch,std::int64_t now_ms) {
+        validate_key(alarm.key);
+        if(epoch<=0 || alarm.attempt_epoch<=0 || alarm.attempt_epoch>epoch ||
+           alarm.failures<0 || alarm.failures>=3 || now_ms<0 ||
+           now_ms>std::numeric_limits<std::int64_t>::max()-200)
+            throw std::invalid_argument("invalid alarm failure");
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this);
+        if(snapshot_locked(alarm.key).epoch!=epoch || !alarm_matches_locked(alarm,now_ms))
+            throw std::logic_error("stale alarm failure token");
+        if(transactional_policy_locked()) require_alarm_grant_locked(alarm);
+        auto next=alarm;++next.failures;next.attempt_epoch=0;
+        const bool exhausted=next.failures==3;
+        next.retry_at_ms=exhausted?0:now_ms+100*next.failures;
+        write_alarm_retry_locked(next);
+        if(exhausted) {
+            Statement clear(db_,"UPDATE sync_alarms SET due_ms=NULL WHERE tenant=? AND space=? AND actor_type=? AND id=? AND generation=?");
+            bind_key(clear,alarm.key);clear.i64(5,alarm.generation);clear.done();
+            if(sqlite3_changes(db_)!=1) throw std::logic_error("lost exhausted alarm");
+        }
+        tx.commit();return exhausted;
     }
 
     static std::string alarm_operation_id(std::int64_t generation) {
@@ -1135,7 +1189,7 @@ public:
             bind_key(pending,key);pending.text(5,operation_id);
             if(pending.step()==SQLITE_ROW) throw std::logic_error("mailbox completion required");
         }
-        if(alarm && !alarm_matches_locked(*alarm,now_ms))
+        if(alarm && ((alarm->attempt_epoch!=0 && alarm->attempt_epoch!=epoch) || !alarm_matches_locked(*alarm,now_ms)))
             throw std::logic_error("alarm cancelled, replaced or not due");
         if (old.revision != expected_revision) throw std::logic_error("revision conflict");
         // Non-mail commits cannot take capacity reserved by accepted mail.
@@ -1173,6 +1227,7 @@ public:
         }
         if(alarm) {
             if(transactional_policy_locked()) finish_alarm_authority_locked(*alarm,1);
+            clear_alarm_retry_locked(alarm->key);
             Statement consume(db_,"UPDATE sync_alarms SET due_ms=NULL WHERE tenant=? AND space=? AND actor_type=? AND id=? AND generation=? AND due_ms=?");
             bind_key(consume,key);consume.i64(5,alarm->generation);consume.i64(6,alarm->due_ms);
             consume.done();
@@ -1454,6 +1509,7 @@ private:
             else if(sqlite3_bind_null(write.p,6)!=SQLITE_OK) throw std::runtime_error("alarm null bind failed");
             write.done();
         }
+        clear_alarm_retry_locked(key);
         return old+1;
     }
     void match_alarm_effect_locked(const SyncKey& key,std::string_view operation_id,const SyncAlarmChange* change) {
@@ -1483,11 +1539,24 @@ private:
         write.i64(1,status);bind_key(write,alarm.key,2);write.i64(6,alarm.generation);write.done();
         if(sqlite3_changes(db_)!=1) throw std::logic_error("lost alarm authority");
     }
+    void clear_alarm_retry_locked(const SyncKey& key) {
+        Statement clear(db_,"DELETE FROM sync_alarm_retry WHERE tenant=? AND space=? AND actor_type=? AND id=?");
+        bind_key(clear,key);clear.done();
+    }
+    void write_alarm_retry_locked(const SyncAlarm& alarm) {
+        Statement write(db_,"INSERT INTO sync_alarm_retry VALUES(?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(tenant,space,actor_type,id) DO UPDATE SET generation=excluded.generation,"
+            "failures=excluded.failures,retry_at_ms=excluded.retry_at_ms,attempt_epoch=excluded.attempt_epoch");
+        bind_key(write,alarm.key);write.i64(5,alarm.generation);write.i64(6,alarm.failures);
+        write.i64(7,alarm.retry_at_ms);write.i64(8,alarm.attempt_epoch);write.done();
+    }
     bool alarm_matches_locked(const SyncAlarm& alarm,std::int64_t now_ms) {
-        Statement read(db_,"SELECT 1 FROM sync_alarms WHERE tenant=? AND space=? AND actor_type=? AND id=? "
-                           "AND generation=? AND due_ms=? AND due_ms<=?");
-        bind_key(read,alarm.key);read.i64(5,alarm.generation);read.i64(6,alarm.due_ms);read.i64(7,now_ms);
-        return read.step()==SQLITE_ROW;
+        Statement read(db_,"SELECT COALESCE(r.failures,0),COALESCE(r.retry_at_ms,0),COALESCE(r.attempt_epoch,0) "
+            "FROM sync_alarms a LEFT JOIN sync_alarm_retry r ON a.tenant=r.tenant AND a.space=r.space AND a.actor_type=r.actor_type AND a.id=r.id AND a.generation=r.generation "
+            "WHERE a.tenant=? AND a.space=? AND a.actor_type=? AND a.id=? AND a.generation=? AND a.due_ms=? AND a.due_ms<=? "
+            "AND COALESCE(r.retry_at_ms,0)<=? AND COALESCE(r.failures,0)<3");
+        bind_key(read,alarm.key);read.i64(5,alarm.generation);read.i64(6,alarm.due_ms);read.i64(7,now_ms);read.i64(8,now_ms);
+        return read.step()==SQLITE_ROW && read.number(0)==alarm.failures && read.number(1)==alarm.retry_at_ms && read.number(2)==alarm.attempt_epoch;
     }
     static constexpr std::size_t max_label = 256;
     const SyncLimits limits_;
