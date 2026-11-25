@@ -999,5 +999,30 @@ int main() {
         assert(store.alarm_generation(k,epoch)==1);
         assert(store.admit_mail(k,epoch,"@principal:overflow",second,"counter","alice").receipt->reply=="mail_overflow");
     }
+    // Rank across tenants before limiting the due scan; a hot tenant
+    // with more than a full page cannot hide the next tenant.
+    {
+        const auto db2=std::string(dir)+"/fair-alarms.db";
+        SqliteActorSync store(db2);
+        const SyncKey quiet{"z-quiet","mail","Counter","one"};
+        for(int i=0;i<260;++i) {
+            const SyncKey hot{"a-hot","mail","Counter",std::to_string(i)};
+            const auto epoch=store.activate_next(hot);
+            store.set_alarm(hot,epoch,0,0);
+        }
+        const auto epoch=store.activate_next(quiet);
+        store.set_alarm(quiet,epoch,0,1);
+        auto page=store.fair_due_alarms(2,1);
+        assert(page.size()==2 && page[0].key.tenant=="a-hot" && page[1].key.tenant==quiet.tenant);
+        page=store.fair_due_alarms(1,1,"a-hot");
+        assert(page.size()==1 && page[0].key.tenant==quiet.tenant);
+        const auto attempted=store.begin_alarm(page[0],epoch,1);
+        assert(!store.fail_alarm(attempted,epoch,1));
+        page=store.fair_due_alarms(256,100,"a-hot");
+        assert(page.size()==256);
+        for(const auto& item:page) assert(item.key.tenant=="a-hot");
+        page=store.fair_due_alarms(1,101,"a-hot");
+        assert(page.size()==1 && page[0].key.tenant==quiet.tenant && page[0].failures==1);
+    }
     std::filesystem::remove_all(dir);
 }
