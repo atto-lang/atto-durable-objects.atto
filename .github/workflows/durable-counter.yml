@@ -51,7 +51,7 @@ jobs:
           ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" node tests/durable_counter_guest.mjs
       - name: Compile host driver and execute real guest-to-SQLite process test
         env:
-          STORAGE_SHA: e4133470f18d7c2c9a0bf250df6b86096488b9b3
+          STORAGE_SHA: f2ec96f2ea5544698e86ec877eb640c2514823d8
           ATTO_COMPILER_SOURCE_SHA: 1d6e8e31453064b6530c5c82679aef3cc9db489b
         run: |
           set -euo pipefail
@@ -97,7 +97,7 @@ jobs:
       - name: Execute host-only storage seam against pinned PR 9
         env:
           EXPECTED: ${{ github.event.pull_request.head.sha }}
-          STORAGE_SHA: e4133470f18d7c2c9a0bf250df6b86096488b9b3
+          STORAGE_SHA: f2ec96f2ea5544698e86ec877eb640c2514823d8
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED"
