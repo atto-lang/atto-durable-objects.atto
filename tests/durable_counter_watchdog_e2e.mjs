@@ -25,4 +25,13 @@ try {
       wasm_sha256:digest,compiler_binary_sha256:hash(readFileSync(compiler)),
       worker_sha256:hash(readFileSync(worker)),driver_sha256:hash(readFileSync(test)),
       node:process.version,timeout_ms:1500,expected_reaped_timeout_children:4}));
+    if(process.env.COUNTER_FUEL_WORKER) {
+        const native=resolve(process.env.COUNTER_FUEL_WORKER);
+        const metered=spawnSync(test,[native,artifact,digest],{encoding:'utf8',timeout:60000,maxBuffer:1<<20});
+        assert.equal(metered.error,undefined);assert.equal(metered.status,0,metered.stderr);
+        console.log(JSON.stringify({kind:'COMPILED_COUNTER_FUEL_WORKER_PASS',compiler_invocations:1,
+          wasm_sha256:digest,source_sha256:hash(source),fuel_worker_sha256:hash(readFileSync(native)),
+          driver_sha256:hash(readFileSync(test)),engine:'wasmi-0.31.2',fuel_budget:50000,
+          address_space_bytes:268435456,cpu_seconds:2,expected_reaped_fuel_failures:4}));
+    }
 } finally {rmSync(dir,{recursive:true,force:true});}
