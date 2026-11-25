@@ -324,6 +324,49 @@ restart deduplication and pending-mail recovery under identical deployment,
 and rejects changed configuration and legacy fallback. These are authored
 tests, not a Wave 14 execution receipt.
 
+### Transactional principal authorization (Wave 19 candidate)
+
+An opt-in strict mode adds a persisted, exact-object principal/operation
+grant with a monotonic version. The trusted operator sets grants through
+`SqliteActorSync::set_principal_policy(key, principal, op, expected_version, allowed)`;
+version zero means absent, and each successful update advances the version.
+Missing grants deny by default. Revocation retains a versioned tombstone;
+regranting cannot recreate a stale attempt's grant version. The policy
+table is bounded to 65,536 rows. This API is a trusted administrative
+boundary, not exposed to guest code or a network caller.
+
+The same SQLite transaction that admits a message or returns its replay
+checks the current grant. Starting an attempt persists its grant version
+with the attempt marker. State/receipt/outbox/inbox consumption checks
+that exact version and current permission inside BEGIN IMMEDIATE.
+A revocation committed first therefore prevents the old attempt's
+state commit, even if the grant was restored before guest return.
+A state commit ordered first remains committed; later revocation denies
+future replay through durable admission until a current grant permits it.
+An invalidated attempt becomes a retained terminal authorization denial
+in a subsequent fenced transaction. A crash between failed commit and
+terminal denial is recovered through the existing durable attempt protocol;
+it never retroactively commits that rejected attempt.
+
+Strict mode is irreversible for the database and must be enabled on
+a drained inbox. Configure a signed principal gateway with transactional
+policy enabled and recovery disabled, provision exact grants through a
+trusted operator, then restart with recovery enabled. Transient/raw/alarm
+state commits are rejected in strict mode; network transport and
+transactional alarm/control grants are not implemented. Existing non-strict
+mode retains its earlier external-policy race limitation. Only the
+persisted grant is serialized with commit, not an arbitrary external
+policy callback, identity-provider revocation, transport handoff or
+external side effect. Use exclusive deployment and do not reopen the
+database with older binaries that do not enforce the new mode.
+
+Regression tests cover default denial, stale grant updates, revocation
+followed by regrant during a held guest turn, commit-before-revocation,
+replay denial, strict-mode downgrade rejection, and subsequent authorized
+FIFO progress. A compiled scalar guest test covers strict grant recovery
+after restart. Tests are authored, not execution-verified at this head.
+CI pins storage head `cf147f32d1ef6e1924b3d40377ae0a68309d752d`.
+
 ### Durable principal-bound ingress (Wave 18 candidate)
 
 The signed-deployment gateway now provides `admit(capability, request, delta)`
