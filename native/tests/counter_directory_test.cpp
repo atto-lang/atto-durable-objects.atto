@@ -27,6 +27,12 @@ int main() {
     };
     {
         CounterDirectory directory(db,guest,auth,128,1);
+        // The same canonical store cannot be owned by two cooperating
+        // directory instances, even through a relative path alias.
+        rejects<std::logic_error>([&]{
+            CounterDirectory competing(std::string(dir)+"/./actor.db",guest,auth);
+        });
+
         rejects<std::logic_error>([&]{(void)directory.send(b,"denied",1,1);});
         std::vector<std::future<CounterDirectory::Reply>> futures;
         for(int i=0;i<100;++i) futures.push_back(directory.send(a,"inc-"+std::to_string(i),1,1));
