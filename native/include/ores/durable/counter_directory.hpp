@@ -272,6 +272,8 @@ private:
                         return result;
                     };
                     r=CounterTurn::run_mail(store_,started,epoch,checked);
+                } catch(const AlarmGenerationConflict&) {
+                    store_.deny_mail(started,epoch,false);return Reply{};
                 } catch(const PrincipalPolicyChanged&) {
                     store_.deny_mail(started,epoch);return Reply{};
                 } catch(const PolicyDenied&) {
@@ -588,9 +590,20 @@ public:
     }
     // Trusted gateway supplies the authenticated principal and a live
     // capability check. The durable policy is separate from capability TTL.
+    // Trusted operator-mediated ingress. The callback must check both
+    // authenticated principal admission and exact operator alarm authority.
+    // Ordinary gateway capabilities do not expose this path.
+    std::future<SyncAdmission> admit_with_alarm(SyncKey k,std::string request,std::int64_t delta,
+            std::string principal,SyncMailAlarm effect,std::function<void()> authorize_operator_and_principal) {
+        return admit_bound(std::move(k),std::move(request),1,delta,std::move(principal),
+                           std::move(authorize_operator_and_principal),std::move(effect));
+    }
     std::future<SyncAdmission> admit_bound(SyncKey k,std::string request,std::int64_t op,std::int64_t delta,
-                                            std::string principal,std::function<void()> authorize_request) {
+                                            std::string principal,std::function<void()> authorize_request,
+                                            std::optional<SyncMailAlarm> effect=std::nullopt) {
         validate(k);check(request);
+        if(effect && (!transactional_policy_ || principal.empty() || op!=1))
+            throw std::logic_error("strict operator alarm admission required");
         if(!authorize_request || principal_mode_!=!principal.empty() ||
            (!principal.empty() && (!mail_policy_ || request.compare(0,11,"@principal:")!=0)))
             throw std::logic_error("invalid principal admission");
@@ -598,13 +611,14 @@ public:
         if(request.compare(0,7,"@alarm:")==0 || (principal.empty() && request.compare(0,11,"@principal:")==0) || (op!=1 && op!=2) ||
            (op==1 && (delta<=0 || delta>CounterTurn::maximum)) || (op==2 && delta!=0))
             throw std::invalid_argument("invalid mailbox command");
+        const auto command=effect?SqliteActorSync::encode_mail_alarm(delta,*effect):std::to_string(op)+":"+std::to_string(delta);
         auto check_policy=[this,&principal,&k,op] {
             if(!principal.empty() && !mail_policy_(principal,k,op)) throw std::logic_error("principal policy denied");
         };
         authorize_request();check_policy();
         const auto id=identity(k);
         return submit(id,[this,id,k=std::move(k),request=std::move(request),op,delta,
-                          principal=std::move(principal),authorize_request=std::move(authorize_request)]{
+                          principal=std::move(principal),authorize_request=std::move(authorize_request),command]{
             auto authorized=[&]{
                 validate(k);authorize_request();
                 if(!principal.empty() && !mail_policy_(principal,k,op)) throw std::logic_error("principal policy denied");
@@ -612,7 +626,7 @@ public:
             authorized();
             const auto epoch=activate(id,k);
             try {
-                auto r=store_.admit_mail(k,epoch,request,std::to_string(op)+":"+std::to_string(delta),CounterTurn::schema,principal);
+                auto r=store_.admit_mail(k,epoch,request,command,CounterTurn::schema,principal);
                 authorized();
                 if(store_.snapshot(k).epoch!=epoch) throw std::logic_error("stale admission epoch");
                 return r;
