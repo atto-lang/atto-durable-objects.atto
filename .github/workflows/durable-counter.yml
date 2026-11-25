@@ -75,8 +75,17 @@ jobs:
           g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
             -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/counter_process_guest_test.cpp \
             -lsqlite3 -o "$RUNNER_TEMP/counter-process-test"
+          # Resolve once, record the dependency graph, then build exactly that lock.
+          # Direct versions are pinned; commit the resolved lock after CI review.
+          cargo +1.85.1 generate-lockfile --manifest-path guest/fuel-worker/Cargo.toml
+          sha256sum guest/fuel-worker/Cargo.lock
+          cargo +1.85.1 tree --locked --manifest-path guest/fuel-worker/Cargo.toml
+          cargo +1.85.1 build --locked --release --manifest-path guest/fuel-worker/Cargo.toml \
+            --target-dir "$RUNNER_TEMP/fuel-target"
           ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" \
-            COUNTER_PROCESS_TEST="$RUNNER_TEMP/counter-process-test" node tests/durable_counter_watchdog_e2e.mjs
+            COUNTER_PROCESS_TEST="$RUNNER_TEMP/counter-process-test" \
+            COUNTER_FUEL_WORKER="$RUNNER_TEMP/fuel-target/release/atto-durable-fuel-worker" \
+            node tests/durable_counter_watchdog_e2e.mjs
   host-seam:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
