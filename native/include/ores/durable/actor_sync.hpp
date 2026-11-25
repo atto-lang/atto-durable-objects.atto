@@ -844,6 +844,17 @@ private:
                 throw std::length_error("persisted actor sync database exceeds configured limits");
         };
         validate("SELECT COUNT(*) FROM sync_objects",limits_.actor_keys_per_database);
+        // Reject an older database with more live promises than completion
+        // capacity. Reconfiguration must not silently abandon accepted mail.
+        validate("SELECT COALESCE(MAX(n),0) FROM (SELECT "
+            "(SELECT COUNT(*) FROM sync_operations o WHERE o.tenant=k.tenant AND o.space=k.space AND o.actor_type=k.actor_type AND o.id=k.id)+"
+            "(SELECT COUNT(*) FROM sync_inbox m LEFT JOIN sync_mail_retry r ON r.sequence=m.sequence WHERE m.tenant=k.tenant AND m.space=k.space AND m.actor_type=k.actor_type AND m.id=k.id AND COALESCE(r.dead,0)=0) AS n FROM sync_objects k)",
+            limits_.dedupe_entries_per_actor);
+        validate("SELECT COALESCE(MAX(n),0) FROM (SELECT "
+            "(SELECT COUNT(*) FROM sync_outbox o WHERE o.tenant=k.tenant AND o.space=k.space AND o.actor_type=k.actor_type AND o.id=k.id)+"
+            "(SELECT COUNT(*) FROM sync_inbox m LEFT JOIN sync_mail_retry r ON r.sequence=m.sequence WHERE m.tenant=k.tenant AND m.space=k.space AND m.actor_type=k.actor_type AND m.id=k.id AND COALESCE(r.dead,0)=0) AS n FROM sync_objects k)",
+            limits_.outbox_entries_per_actor);
+
         validate("SELECT COUNT(*) FROM sync_inbox",limits_.inbox_entries_per_database);
         validate("SELECT COALESCE(SUM(LENGTH(command)),0) FROM sync_inbox",limits_.inbox_command_bytes_per_database);
         validate("SELECT COALESCE(MAX(n),0) FROM (SELECT COUNT(*) AS n FROM sync_inbox GROUP BY tenant,space,actor_type,id)",limits_.inbox_entries_per_actor);
