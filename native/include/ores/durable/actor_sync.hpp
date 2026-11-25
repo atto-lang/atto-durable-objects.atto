@@ -51,6 +51,8 @@ struct SyncAlarm {
     SyncKey key;
     std::int64_t generation;
     std::int64_t due_ms;
+    std::string principal={};
+    std::int64_t grant_version=0;
 };
 struct SyncMail {
     SyncKey key;
@@ -185,6 +187,12 @@ public:
                  "PRIMARY KEY(tenant,space,actor_type,id),"
                  "FOREIGN KEY(tenant,space,actor_type,id) REFERENCES sync_objects(tenant,space,actor_type,id)) WITHOUT ROWID");
             exec("CREATE INDEX IF NOT EXISTS sync_alarm_due ON sync_alarms(due_ms,tenant,space,actor_type,id) WHERE due_ms IS NOT NULL");
+            exec("CREATE TABLE IF NOT EXISTS sync_alarm_authority("
+                 "tenant TEXT NOT NULL,space TEXT NOT NULL,actor_type TEXT NOT NULL,id TEXT NOT NULL,"
+                 "generation INTEGER NOT NULL CHECK(generation>0),principal TEXT NOT NULL,grant_version INTEGER NOT NULL CHECK(grant_version>0),"
+                 "operator_id TEXT NOT NULL,status INTEGER NOT NULL CHECK(status IN (0,1,2)),"
+                 "PRIMARY KEY(tenant,space,actor_type,id),"
+                 "FOREIGN KEY(tenant,space,actor_type,id) REFERENCES sync_alarms(tenant,space,actor_type,id)) WITHOUT ROWID");
             exec("CREATE TABLE IF NOT EXISTS sync_alarm_effects("
                  "tenant TEXT NOT NULL,space TEXT NOT NULL,actor_type TEXT NOT NULL,id TEXT NOT NULL,op_id TEXT NOT NULL,"
                  "expected_generation INTEGER NOT NULL CHECK(expected_generation>=0),due_ms INTEGER CHECK(due_ms>=0),"
@@ -357,8 +365,10 @@ public:
         const bool prior=transactional_policy_locked();
         if(prior && !enabled) throw std::logic_error("transactional principal policy required");
         if(enabled) {
-            Statement pending(db_,"SELECT 1 FROM sync_alarms WHERE due_ms IS NOT NULL LIMIT 1");
-            if(pending.step()==SQLITE_ROW) throw std::logic_error("drain alarms before enabling transactional policy");
+            Statement pending(db_,"SELECT 1 FROM sync_alarms a LEFT JOIN sync_alarm_authority p "
+                "ON a.tenant=p.tenant AND a.space=p.space AND a.actor_type=p.actor_type AND a.id=p.id AND a.generation=p.generation "
+                "WHERE a.due_ms IS NOT NULL AND (p.generation IS NULL OR p.status<>0) LIMIT 1");
+            if(pending.step()==SQLITE_ROW) throw std::logic_error("unbound pending alarm requires migration");
         }
         if(enabled && !prior) {
             {
@@ -514,6 +524,50 @@ public:
         tx.commit();return generation;
     }
 
+    // Trusted operator scheduling API. This scalar handler increments by
+    // one, so it captures the principal's exact persisted op=1 grant.
+    // Scheduling authority itself is established by the upstream operator.
+    std::int64_t set_principal_alarm(const SyncKey& key,std::int64_t epoch,
+                                    std::int64_t expected_generation,std::int64_t due_ms,
+                                    std::string_view principal,std::string_view operator_id) {
+        validate_key(key);label(principal);label(operator_id);
+        if(epoch<=0 || expected_generation<0 || due_ms<0)
+            throw std::invalid_argument("invalid principal alarm");
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this);
+        if(!transactional_policy_locked() || snapshot_locked(key).epoch!=epoch)
+            throw std::logic_error("strict policy and current epoch required");
+        const auto grant=policy_locked(key,principal,1);
+        if(!grant.second) throw PrincipalPolicyChanged();
+        const auto generation=set_alarm_locked(key,expected_generation,due_ms);
+        {
+            Statement write(db_,"INSERT INTO sync_alarm_authority VALUES(?,?,?,?,?,?,?,?,0) "
+                "ON CONFLICT(tenant,space,actor_type,id) DO UPDATE SET generation=excluded.generation,"
+                "principal=excluded.principal,grant_version=excluded.grant_version,operator_id=excluded.operator_id,status=0");
+            bind_key(write,key);write.i64(5,generation);write.text(6,principal);write.i64(7,grant.first);write.text(8,operator_id);write.done();
+        }
+        tx.commit();return generation;
+    }
+
+    // Called only by the trusted scheduler after explicit policy denial,
+    // and after any guest has physically stopped. No success receipt.
+    bool deny_principal_alarm(const SyncAlarm& alarm,std::int64_t epoch,std::int64_t now_ms) {
+        validate_key(alarm.key);label(alarm.principal);
+        std::lock_guard<std::mutex> lock(mu_);
+        Tx tx(*this);
+        if(!transactional_policy_locked() || snapshot_locked(alarm.key).epoch!=epoch)
+            throw std::logic_error("strict policy and current epoch required");
+        if(!alarm_matches_locked(alarm,now_ms)){tx.commit();return false;}
+        if(!alarm_binding_matches_locked(alarm)) throw std::logic_error("invalid alarm authority binding");
+        finish_alarm_authority_locked(alarm,2);
+        {
+            Statement clear(db_,"UPDATE sync_alarms SET due_ms=NULL WHERE tenant=? AND space=? AND actor_type=? AND id=? AND generation=?");
+            bind_key(clear,alarm.key);clear.i64(5,alarm.generation);clear.done();
+            if(sqlite3_changes(db_)!=1) throw std::logic_error("lost denied alarm");
+        }
+        tx.commit();return true;
+    }
+
     std::int64_t alarm_generation(const SyncKey& key,std::int64_t epoch) {
         validate_key(key);
         std::lock_guard<std::mutex> lock(mu_);
@@ -533,11 +587,13 @@ public:
         if(now_ms<0 || limit==0 || limit>256) throw std::invalid_argument("invalid alarm scan");
         std::lock_guard<std::mutex> lock(mu_);
         std::vector<SyncAlarm> due;
-        Statement read(db_,"SELECT tenant,space,actor_type,id,generation,due_ms FROM sync_alarms "
-                           "WHERE due_ms IS NOT NULL AND due_ms<=? ORDER BY due_ms,tenant,space,actor_type,id LIMIT ?");
+        Statement read(db_,"SELECT a.tenant,a.space,a.actor_type,a.id,a.generation,a.due_ms,"
+                           "COALESCE(p.principal,''),COALESCE(p.grant_version,0) FROM sync_alarms a "
+                           "LEFT JOIN sync_alarm_authority p ON a.tenant=p.tenant AND a.space=p.space AND a.actor_type=p.actor_type AND a.id=p.id AND a.generation=p.generation "
+                           "WHERE a.due_ms IS NOT NULL AND a.due_ms<=? ORDER BY a.due_ms,a.tenant,a.space,a.actor_type,a.id LIMIT ?");
         read.i64(1,now_ms);read.i64(2,static_cast<std::int64_t>(limit));
         while(read.step()==SQLITE_ROW) {
-            SyncAlarm a{{read.str(0),read.str(1),read.str(2),read.str(3)},read.number(4),read.number(5)};
+            SyncAlarm a{{read.str(0),read.str(1),read.str(2),read.str(3)},read.number(4),read.number(5),read.str(6),read.number(7)};
             validate_key(a.key);due.push_back(std::move(a));
         }
         return due;
@@ -550,6 +606,7 @@ public:
         Tx tx(*this,false);
         if(snapshot_locked(alarm.key).epoch!=epoch) throw std::logic_error("stale alarm owner");
         const bool pending=alarm_matches_locked(alarm,now_ms);
+        if(pending && transactional_policy_locked()) require_alarm_grant_locked(alarm);
         tx.commit();return pending;
     }
 
@@ -1028,15 +1085,20 @@ public:
             if(read.step()==SQLITE_ROW) throw std::logic_error("archived terminal identity cannot commit");
         }
         // BEGIN IMMEDIATE serializes this check with policy administration.
-        // No transient/raw/alarm state commits in strict principal mode.
+        // No transient/raw commits or unbound alarm effects in strict mode.
         if(transactional_policy_locked()) {
-            if(!mail || mail->principal.empty() || mail->attempt_epoch!=epoch || !mail_matches_locked(*mail))
-                throw PrincipalPolicyChanged();
-            const auto grant=policy_locked(key,mail->principal,policy_op(command));
-            Statement attempt(db_,"SELECT version FROM sync_attempt_policy WHERE sequence=?");
-            attempt.i64(1,mail->sequence);
-            if(!grant.second || attempt.step()!=SQLITE_ROW || attempt.number(0)!=grant.first)
-                throw PrincipalPolicyChanged();
+            if(alarm) {
+                if(change || !alarm_matches_locked(*alarm,now_ms)) throw PrincipalPolicyChanged();
+                require_alarm_grant_locked(*alarm);
+            } else {
+                if(!mail || mail->principal.empty() || mail->attempt_epoch!=epoch || !mail_matches_locked(*mail))
+                    throw PrincipalPolicyChanged();
+                const auto grant=policy_locked(key,mail->principal,policy_op(command));
+                Statement attempt(db_,"SELECT version FROM sync_attempt_policy WHERE sequence=?");
+                attempt.i64(1,mail->sequence);
+                if(!grant.second || attempt.step()!=SQLITE_ROW || attempt.number(0)!=grant.first)
+                    throw PrincipalPolicyChanged();
+            }
         }
         std::optional<SyncCommit> replay;
         {
@@ -1094,6 +1156,7 @@ public:
             s.text(7, operation_id); s.text(8, schema_fp); s.blob(9, next_state); s.done();
         }
         if(alarm) {
+            if(transactional_policy_locked()) finish_alarm_authority_locked(*alarm,1);
             Statement consume(db_,"UPDATE sync_alarms SET due_ms=NULL WHERE tenant=? AND space=? AND actor_type=? AND id=? AND generation=? AND due_ms=?");
             bind_key(consume,key);consume.i64(5,alarm->generation);consume.i64(6,alarm->due_ms);
             consume.done();
@@ -1386,6 +1449,23 @@ private:
             (sqlite3_column_type(read.p,1)==SQLITE_NULL)!=!change->due_ms ||
             (change->due_ms && read.number(1)!=*change->due_ms)))
             throw std::logic_error("alarm effect replay mismatch");
+    }
+    bool alarm_binding_matches_locked(const SyncAlarm& alarm) {
+        if(alarm.principal.empty() || alarm.grant_version<=0) return false;
+        Statement read(db_,"SELECT principal,grant_version FROM sync_alarm_authority WHERE tenant=? AND space=? AND actor_type=? AND id=? AND generation=? AND status=0");
+        bind_key(read,alarm.key);read.i64(5,alarm.generation);
+        return read.step()==SQLITE_ROW && read.str(0)==alarm.principal && read.number(1)==alarm.grant_version;
+    }
+    void require_alarm_grant_locked(const SyncAlarm& alarm) {
+        if(!alarm_binding_matches_locked(alarm)) throw std::logic_error("invalid alarm authority binding");
+        const auto grant=policy_locked(alarm.key,alarm.principal,1);
+        if(!grant.second || grant.first!=alarm.grant_version) throw PrincipalPolicyChanged();
+    }
+    void finish_alarm_authority_locked(const SyncAlarm& alarm,std::int64_t status) {
+        if(!alarm_binding_matches_locked(alarm)) throw std::logic_error("invalid alarm authority binding");
+        Statement write(db_,"UPDATE sync_alarm_authority SET status=? WHERE tenant=? AND space=? AND actor_type=? AND id=? AND generation=? AND status=0");
+        write.i64(1,status);bind_key(write,alarm.key,2);write.i64(6,alarm.generation);write.done();
+        if(sqlite3_changes(db_)!=1) throw std::logic_error("lost alarm authority");
     }
     bool alarm_matches_locked(const SyncAlarm& alarm,std::int64_t now_ms) {
         Statement read(db_,"SELECT 1 FROM sync_alarms WHERE tenant=? AND space=? AND actor_type=? AND id=? "
