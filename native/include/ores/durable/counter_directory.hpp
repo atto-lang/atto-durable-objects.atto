@@ -39,6 +39,7 @@ private:
     const Clock::duration idle_timeout_;
     std::map<Key,Lane> lanes_; // protected by mu_; running lanes cannot be erased
     std::size_t queued_=0,active_=0;
+    std::optional<Key> last_scheduled_;
     std::mutex mu_;
     std::condition_variable wake_;
     bool closed_=false;
@@ -67,9 +68,12 @@ private:
         }
     }
     auto runnable() {
-        return std::find_if(lanes_.begin(),lanes_.end(),[](const auto& p){
-            return !p.second.running && !p.second.queue.empty();
-        });
+        const auto start=last_scheduled_ ? lanes_.upper_bound(*last_scheduled_) : lanes_.begin();
+        const auto ready=[](const auto& p){return !p.second.running && !p.second.queue.empty();};
+        auto it=std::find_if(start,lanes_.end(),ready);
+        if(it!=lanes_.end()) return it;
+        it=std::find_if(lanes_.begin(),start,ready);
+        return it==start ? lanes_.end() : it;
     }
     void loop() {
         for(;;) {
@@ -82,6 +86,7 @@ private:
                     auto it=runnable();
                     if(it!=lanes_.end()) {
                         id=it->first;
+                        last_scheduled_=id;
                         auto& l=it->second;
                         l.running=true;
                         job=std::move(l.queue.front());l.queue.pop_front();--queued_;
