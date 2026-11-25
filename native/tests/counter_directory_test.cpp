@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <vector>
 #include <unistd.h>
+#include <sys/wait.h>
 using namespace ores::durable;
 using I=std::int64_t;
 template<class E,class F> void rejects(F f) {
@@ -243,6 +244,54 @@ int main() {
             auto dead=directory.admit(a,"poison",1,7).get();
             assert(dead.dead_letter && !dead.receipt);
             rejects<std::logic_error>([&]{directory.admit(a,"poison",1,8).get();});
+        }
+    }
+    // Controller death inside the host-only guest callback must count once
+    // on recovery, without running that abandoned attempt again.
+    {
+        using namespace std::chrono_literals;
+        const auto crash_db=std::string(dir)+"/controller-crash.db";
+        {
+            CounterDirectory directory(crash_db,guest,auth);
+            assert(directory.admit(a,"crash",1,7).get().sequence>0);
+            assert(directory.admit(a,"next",1,2).get().sequence>0);
+            assert(directory.admit(c,"healthy",1,5).get().sequence>0);
+        }
+        const pid_t child=fork();
+        assert(child>=0);
+        if(child==0) {
+            try {
+                CounterDirectory directory(crash_db,[](I n,I op,I d)->I {
+                    if(d==7) _exit(46);
+                    return op==2?n:n+d;
+                },auth,16,4,2,10ms,0ms,10ms);
+                std::this_thread::sleep_for(3s);
+                _exit(47);
+            } catch(...) {_exit(48);}
+        }
+        int status=0;
+        assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==46);
+        {
+            SqliteActorSync observer(crash_db);
+            const auto heads=observer.pending_mail();
+            assert(!heads.empty() && heads.front().operation_id=="crash" &&
+                   heads.front().failures==0 && heads.front().attempt_epoch>0);
+            assert(observer.snapshot(a).revision==0);
+        }
+        std::atomic<int> retries{0};
+        {
+            CounterDirectory directory(crash_db,[&](I n,I op,I d)->I {
+                if(d==7){++retries;throw CounterDirectory::RetryableGuestFailure();}
+                return op==2?n:n+d;
+            },auth,16,4,2,10ms,0ms,10ms);
+            SqliteActorSync observer(crash_db);
+            const auto deadline=CounterDirectory::Clock::now()+5s;
+            while(!observer.pending_mail().empty() && CounterDirectory::Clock::now()<deadline)
+                std::this_thread::sleep_for(5ms);
+            assert(observer.pending_mail().empty() && retries==2 && !directory.mail_fault());
+            assert(directory.admit(a,"crash",1,7).get().dead_letter);
+            assert(observer.snapshot(a).revision==1 && observer.snapshot(a).bytes=="2");
+            assert(observer.snapshot(c).revision==1 && observer.snapshot(c).bytes=="5");
         }
     }
     std::filesystem::remove_all(dir);
