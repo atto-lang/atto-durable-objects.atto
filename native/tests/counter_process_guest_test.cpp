@@ -4,9 +4,22 @@
 #include <atomic>
 #include <filesystem>
 #include <cstdlib>
+#include <fstream>
+#include <sys/prctl.h>
 using namespace ores::durable;
 using namespace std::chrono_literals;
 int main(int argc,char** argv) {
+    // Trusted synthetic worker intentionally ignores parent death. It keeps
+    // fd 3 open until it exits, allowing a deterministic orphan regression.
+    if(argc==7) {
+        assert(::fcntl(3,F_GETFD)>=0);
+        const std::string marker=argv[1];
+        {std::ofstream ready(marker+".ready");ready<<::getpid();}
+        const auto limit=CounterDirectory::Clock::now()+10s;
+        while(!std::filesystem::exists(marker+".release") &&
+              CounterDirectory::Clock::now()<limit) std::this_thread::sleep_for(5ms);
+        return std::filesystem::exists(marker+".release")?0:49;
+    }
     assert(argc==5 || argc==4);
     const bool fuel=argc==4;
     auto make_runner=[&](std::string digest){
@@ -65,6 +78,48 @@ int main(int argc,char** argv) {
         assert(directory.admit(a,"after",1,2).get().receipt->reply=="2");
     }
     assert(::waitpid(-1,&status,WNOHANG)==-1 && errno==ECHILD);
+    // Host-only orphan test: kill the controller while its trusted worker
+    // retains the inherited lock. An independent controller must fail closed
+    // until the worker actually exits (no PID-based guesses).
+    assert(::prctl(PR_SET_CHILD_SUBREAPER,1)==0);
+    const auto orphan_db=std::string(tmp)+"/orphan.db";
+    const auto marker=std::string(tmp)+"/orphan";
+    const auto self=std::filesystem::canonical("/proc/self/exe").string();
+    const pid_t controller=fork();
+    assert(controller>=0);
+    if(controller==0) {
+        try {
+            auto fake=CounterProcessGuest::fuel_worker(self,marker,std::string(64,'0'),15s);
+            CounterDirectory directory(orphan_db,fake,auth);
+            (void)directory.send(a,"orphan",1,1).get();
+            _exit(50);
+        } catch(...) {_exit(51);}
+    }
+    const auto ready_deadline=CounterDirectory::Clock::now()+5s;
+    while(!std::filesystem::exists(marker+".ready") &&
+          CounterDirectory::Clock::now()<ready_deadline) std::this_thread::sleep_for(5ms);
+    assert(std::filesystem::exists(marker+".ready"));
+    assert(::kill(controller,SIGKILL)==0);
+    assert(::waitpid(controller,&status,0)==controller && WIFSIGNALED(status));
+    bool blocked=false;
+    try {CounterDirectory replacement(orphan_db,runner,auth);}
+    catch(const std::logic_error&) {blocked=true;}
+    assert(blocked);
+    {std::ofstream release(marker+".release");release<<"release";}
+    // Subreaper adopts the former controller's still-running worker.
+    const auto orphan_deadline=CounterDirectory::Clock::now()+5s;
+    pid_t retired=0;
+    do {
+        retired=::waitpid(-1,&status,WNOHANG);
+        if(retired==0) std::this_thread::sleep_for(5ms);
+    } while(retired==0 && CounterDirectory::Clock::now()<orphan_deadline);
+    assert(retired>0 && WIFEXITED(status) && WEXITSTATUS(status)==0);
+    {
+        CounterDirectory replacement(orphan_db,runner,auth);
+        assert(replacement.send(a,"orphan",1,1).get()->reply=="1");
+    }
+    assert(::waitpid(-1,&status,WNOHANG)==-1 && errno==ECHILD);
+    assert(::prctl(PR_SET_CHILD_SUBREAPER,0)==0);
     std::filesystem::remove_all(tmp);
     return 0;
 }
