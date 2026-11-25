@@ -5,6 +5,9 @@ on:
       - 'guest/**'
       - 'native/include/ores/durable/counter_turn.hpp'
       - 'native/tests/counter_turn_test.cpp'
+      - 'native/include/ores/durable/counter_directory.hpp'
+      - 'native/tests/counter_directory_test.cpp'
+      - 'README.md'
       - 'tests/durable_counter_guest.mjs'
       - 'tests/durable_counter_process_e2e.mjs'
       - 'native/tests/counter_guest_driver.cpp'
@@ -45,7 +48,7 @@ jobs:
           ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" node tests/durable_counter_guest.mjs
       - name: Compile host driver and execute real guest-to-SQLite process test
         env:
-          STORAGE_SHA: 57c15af3b9dfa31c32dbbb459ee824ebb5b06390
+          STORAGE_SHA: c7c1170dc61ccbb87f4c70bb1561c073c7db566b
           ATTO_COMPILER_SOURCE_SHA: 1d6e8e31453064b6530c5c82679aef3cc9db489b
         run: |
           set -euo pipefail
@@ -72,7 +75,7 @@ jobs:
       - name: Execute host-only storage seam against pinned PR 9
         env:
           EXPECTED: ${{ github.event.pull_request.head.sha }}
-          STORAGE_SHA: 57c15af3b9dfa31c32dbbb459ee824ebb5b06390
+          STORAGE_SHA: c7c1170dc61ccbb87f4c70bb1561c073c7db566b
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED"
@@ -90,3 +93,8 @@ jobs:
             -lsqlite3 -o "$RUNNER_TEMP/counter-turn-test"
           "$RUNNER_TEMP/counter-turn-test"
           echo 'HOST_ONLY_COUNTER_TURN_PASS'
+          g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
+            -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/counter_directory_test.cpp \
+            -lsqlite3 -o "$RUNNER_TEMP/counter-directory-test"
+          timeout 60 "$RUNNER_TEMP/counter-directory-test"
+          echo 'HOST_ONLY_COUNTER_DIRECTORY_PASS'
