@@ -69,14 +69,15 @@ public:
                                          std::int64_t epoch, std::string_view request_id,
                                          std::int64_t op, std::int64_t delta, Guest&& guest,
                                          bool inject_precommit_failure = false,
-                                         const SyncMail* mail = nullptr) {
+                                         const SyncMail* mail = nullptr,const SyncAlarmChange* change=nullptr) {
+        if(mail && change) throw std::invalid_argument("mail alarm effect not supported");
         if (key.actor_type != "Counter")
             throw std::invalid_argument("unexpected actor type");
         if (op != 1 && op != 2) throw std::invalid_argument("invalid counter operation");
         if ((op == 1 && (delta <= 0 || delta > maximum)) || (op == 2 && delta != 0))
             throw std::invalid_argument("invalid counter delta");
         const auto command = std::to_string(op) + ":" + std::to_string(delta);
-        if (auto prior = store.lookup_receipt(key, epoch, request_id, command, schema)) {
+        if (auto prior = store.lookup_receipt(key, epoch, request_id, command, schema,change)) {
             if(prior->reply=="mail_overflow") return mail ? prior : std::nullopt;
             (void)decode(prior->reply);
             return prior;
@@ -109,7 +110,7 @@ public:
         // CAS and immutable receipt check are repeated inside SQLite commit.
         // Return only the store's committed reply, never the speculative one.
         auto receipt = store.commit(key, epoch, snapshot.revision, request_id,
-                                    command, schema, proposed, proposed, inject_precommit_failure,nullptr,0,mail);
+                                    command, schema, proposed, proposed, inject_precommit_failure,nullptr,0,mail,change);
         (void)decode(receipt.reply);
         return receipt;
     }
