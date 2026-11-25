@@ -78,10 +78,15 @@ jobs:
           g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
             -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/counter_process_guest_test.cpp \
             -lsqlite3 -lcrypto -o "$RUNNER_TEMP/counter-process-test"
-          # Resolve once, record the dependency graph, then build exactly that lock.
-          # Direct versions are pinned; commit the resolved lock after CI review.
-          cargo +1.85.1 generate-lockfile --manifest-path guest/fuel-worker/Cargo.toml
+          # Capture the complete non-secret resolved lock, not just the graph.
+          # If a lock is committed, never silently regenerate it.
+          if test ! -f guest/fuel-worker/Cargo.lock; then
+            cargo +1.85.1 generate-lockfile --manifest-path guest/fuel-worker/Cargo.toml
+          fi
           sha256sum guest/fuel-worker/Cargo.lock
+          echo 'BEGIN_FUEL_WORKER_CARGO_LOCK'
+          cat guest/fuel-worker/Cargo.lock
+          echo 'END_FUEL_WORKER_CARGO_LOCK'
           cargo +1.85.1 tree --locked --manifest-path guest/fuel-worker/Cargo.toml
           cargo +1.85.1 build --locked --release --manifest-path guest/fuel-worker/Cargo.toml \
             --target-dir "$RUNNER_TEMP/fuel-target"
