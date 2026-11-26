@@ -1,5 +1,6 @@
 #pragma once
 #include "ores/durable/scalar_checkpoint_v1.hpp"
+#include "ores/durable/bounded_checkpoint_v2.hpp"
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -12,20 +13,22 @@ namespace ores::durable {
 // schema manifest and artifact, owns a non-reentrant turn permit and invokes
 // a bounded isolated worker. No guest callback runs under a SQLite lock.
 // This initial lane has a checkpoint-valued reply; no mailbox/alarm effects.
-class ScalarTurnV1 final {
-    const ScalarCheckpointV1 codec_;
+template<class Codec,unsigned Version>
+class CheckpointTurn final {
+    static_assert(Version==1||Version==2,"unsupported checkpoint version");
+    const Codec codec_;
     const std::string actor_, schema_, initial_;
     static std::string label(std::string_view digest,std::uint64_t fingerprint) {
         if(digest.size()!=64)throw std::invalid_argument("invalid trusted schema manifest digest");
         for(char c:digest)if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')))
             throw std::invalid_argument("invalid trusted schema manifest digest");
-        std::string out="atto.scalar.v1.";out+=digest;out+='.';
+        std::string out=Version==1?"atto.scalar.v1.":"atto.bounded.v2.";out+=digest;out+='.';
         for(int i=60;i>=0;i-=4)out+="0123456789abcdef"[(fingerprint>>i)&15];
         return out;
     }
     void validate(std::string_view bytes) const { (void)codec_.decode(bytes); }
 public:
-    ScalarTurnV1(std::string actor,std::vector<ScalarCheckpointV1::Field> fields,
+    CheckpointTurn(std::string actor,std::vector<typename Codec::Field> fields,
                  std::string_view manifest_digest,std::string initial)
         :codec_(actor,std::move(fields)),actor_(std::move(actor)),
          schema_(label(manifest_digest,codec_.fingerprint())),initial_(std::move(initial)) {
@@ -68,4 +71,7 @@ public:
         return receipt;
     }
 };
+using ScalarTurnV1=CheckpointTurn<ScalarCheckpointV1,1>;
+// Proposed v2 format; existing actors need an explicit migration, never fallback.
+using BoundedTurnV2=CheckpointTurn<BoundedCheckpointV2,2>;
 } // namespace ores::durable
