@@ -594,14 +594,17 @@ public:
                                             std::string_view operation_id,
                                             std::string_view command,
                                             std::string_view schema_fp,
-                                            const SyncAlarmChange* change=nullptr) {
+                                            const SyncAlarmChange* change=nullptr,
+                                            const SyncSnapshot* expected_snapshot=nullptr) {
         validate_key(key); label(operation_id); label(schema_fp);
         validate_alarm_change(change);
         bounded(command, limits_.command_bytes);
         if (epoch <= 0) throw std::invalid_argument("invalid epoch");
         std::lock_guard<std::mutex> lock(mu_);
         Tx tx(*this, false);
-        if (snapshot_locked(key).epoch != epoch) throw std::logic_error("stale writer epoch");
+        const auto observed=snapshot_locked(key);
+        if (observed.epoch != epoch) throw std::logic_error("stale writer epoch");
+        require_snapshot_identity(observed,expected_snapshot);
         std::optional<SyncCommit> replay;
         {
             Statement s(db_, "SELECT command,schema_fp,revision,reply FROM sync_operations WHERE "
@@ -1286,7 +1289,8 @@ public:
                       std::string_view next_state, std::string_view reply,
                       bool inject_precommit_failure = false,
                       const SyncAlarm* alarm = nullptr, std::int64_t now_ms = 0,
-                      const SyncMail* mail = nullptr,const SyncAlarmChange* change=nullptr) {
+                      const SyncMail* mail = nullptr,const SyncAlarmChange* change=nullptr,
+                      const SyncSnapshot* expected_snapshot=nullptr) {
         validate_key(key); label(operation_id); label(schema_fp);
         validate_alarm_change(change);
         const auto effect=mail?mail_alarm_effect(command):std::optional<SyncMailAlarm>{};
@@ -1320,6 +1324,7 @@ public:
         Tx tx(*this);
         const auto old = snapshot_locked(key);
         if (old.epoch != epoch) throw std::logic_error("stale writer epoch");
+        require_snapshot_identity(old,expected_snapshot);
         {
             Statement read(db_,"SELECT 1 FROM sync_dead_archive WHERE tenant=? AND space=? AND actor_type=? AND id=? AND op_id=?");
             bind_key(read,key);read.text(5,operation_id);
@@ -1909,6 +1914,13 @@ private:
     };
     static void bind_key(Statement& s, const SyncKey& key, int i=1) {
         s.text(i,key.tenant); s.text(i+1,key.name_space); s.text(i+2,key.actor_type); s.text(i+3,key.object_id);
+    }
+    // Trusted caller's read token, checked inside the same transaction as
+    // replay or commit. Epoch/revision alone cannot detect in-place repair.
+    static void require_snapshot_identity(const SyncSnapshot& observed,const SyncSnapshot* expected) {
+        if(expected && (observed.epoch!=expected->epoch || observed.revision!=expected->revision ||
+                        observed.schema!=expected->schema || observed.bytes!=expected->bytes))
+            throw std::logic_error("snapshot identity changed during actor turn");
     }
     SyncSnapshot snapshot_locked(const SyncKey& key) {
         Statement s(db_, snapshot_admission_v1::query);
