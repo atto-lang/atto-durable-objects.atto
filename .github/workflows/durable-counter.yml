@@ -33,7 +33,7 @@ jobs:
       - name: Verify guest source and build pinned public Rust compiler
         env:
           EXPECTED: ${{ github.event.pull_request.head.sha }}
-          COMPILER_SHA: d8763e35749191a9a94c68e79a40496fb50558bf
+          COMPILER_SHA: 96664d383d8779e2f732648cee9e42aac71c08b1
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED"
@@ -43,20 +43,21 @@ jobs:
           git -C "$RUNNER_TEMP/atto-compiler" fetch --depth=1 https://github.com/atto-lang/atto-source.rs.git "$COMPILER_SHA"
           git -C "$RUNNER_TEMP/atto-compiler" checkout --detach FETCH_HEAD
           test "$(git -C "$RUNNER_TEMP/atto-compiler" rev-parse HEAD)" = "$COMPILER_SHA"
-          git -C "$RUNNER_TEMP/atto-compiler" rev-parse HEAD^{tree}
+          test "$(git -C "$RUNNER_TEMP/atto-compiler" rev-parse HEAD^{tree})" = 425c3a1d3f5af829772d4309e447eda0953b3c9e
+          git -C "$RUNNER_TEMP/atto-compiler" fsck --full
           rustup toolchain install 1.85.1 --profile minimal
           cd "$RUNNER_TEMP/atto-compiler"
           cargo +1.85.1 build --locked --release --bin attoc
       - name: Execute compiled counter Wasm and compiler negative
         env:
-          ATTO_COMPILER_SOURCE_SHA: d8763e35749191a9a94c68e79a40496fb50558bf
+          ATTO_COMPILER_SOURCE_SHA: 96664d383d8779e2f732648cee9e42aac71c08b1
         run: |
           set -euo pipefail
           ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" node tests/durable_counter_guest.mjs
       - name: Compile host driver and execute real guest-to-SQLite process test
         env:
           STORAGE_SHA: 5822a39cbd8fe49200961dcd0d396827c379d16b
-          ATTO_COMPILER_SOURCE_SHA: d8763e35749191a9a94c68e79a40496fb50558bf
+          ATTO_COMPILER_SOURCE_SHA: 96664d383d8779e2f732648cee9e42aac71c08b1
         run: |
           set -euo pipefail
           git init "$RUNNER_TEMP/storage"
@@ -73,9 +74,17 @@ jobs:
             COUNTER_DRIVER="$RUNNER_TEMP/counter-guest-driver" node tests/durable_counter_process_e2e.mjs
           DURABLE_ACTOR_PROFILE=1 ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" \
             COUNTER_DRIVER="$RUNNER_TEMP/counter-guest-driver" node tests/durable_counter_process_e2e.mjs
+          git init "$RUNNER_TEMP/atto-js"
+          GIT_TERMINAL_PROMPT=0 git -C "$RUNNER_TEMP/atto-js" -c credential.helper= fetch --depth=1 https://github.com/atto-lang/atto-source.js.git 6dabe21e9c506212edb8ddb0248083430b500957
+          git -C "$RUNNER_TEMP/atto-js" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/atto-js" rev-parse HEAD)" = 6dabe21e9c506212edb8ddb0248083430b500957
+          test "$(git -C "$RUNNER_TEMP/atto-js" rev-parse HEAD^{tree})" = f40977b90687fbbdf199e70bd49c1f3bdfcfc3b7
+          git -C "$RUNNER_TEMP/atto-js" fsck --full
+          DURABLE_ACTOR_PROFILE=1 DURABLE_JS_COMPILER="$RUNNER_TEMP/atto-js/src/transpile-worker.mjs" ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" \
+            COUNTER_DRIVER="$RUNNER_TEMP/counter-guest-driver" node tests/durable_counter_process_e2e.mjs
       - name: Execute compiled looping guest with process watchdog and durable mailbox recovery
         env:
-          ATTO_COMPILER_SOURCE_SHA: d8763e35749191a9a94c68e79a40496fb50558bf
+          ATTO_COMPILER_SOURCE_SHA: 96664d383d8779e2f732648cee9e42aac71c08b1
         run: |
           set -euo pipefail
           g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
