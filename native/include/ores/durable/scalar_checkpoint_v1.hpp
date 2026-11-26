@@ -21,7 +21,7 @@ private:
     std::vector<Field> fields_;
     std::uint64_t fingerprint_=0;
     std::size_t size_=27;
-    static void deny(){throw std::logic_error("invalid scalar checkpoint or schema");}
+    [[noreturn]] static void deny(){throw std::logic_error("invalid scalar checkpoint or schema");}
     static bool name_ok(std::string_view n) {
         if(n.empty()||n.size()>128)return false;
         auto alpha=[](unsigned char c){return (c>='A'&&c<='Z')||(c>='a'&&c<='z')||c=='_';};
@@ -64,6 +64,12 @@ public:
         if(size_>4096)deny();
         fingerprint_=hash(sig);
     }
+    // Preserve the schema/size/fingerprint invariant; a moved-from schema
+    // must never be usable to emit an inconsistent checkpoint.
+    ScalarCheckpointV1(const ScalarCheckpointV1&)=default;
+    ScalarCheckpointV1(ScalarCheckpointV1&&)=delete;
+    ScalarCheckpointV1& operator=(const ScalarCheckpointV1&)=delete;
+    ScalarCheckpointV1& operator=(ScalarCheckpointV1&&)=delete;
     std::uint64_t fingerprint() const noexcept {return fingerprint_;}
     std::string encode(const std::vector<Value>& values) const {
         if(values.size()!=fields_.size())deny();
