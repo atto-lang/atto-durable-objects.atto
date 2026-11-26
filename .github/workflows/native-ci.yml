@@ -34,6 +34,7 @@ jobs:
       - name: Build and execute native sanitizer test
         env:
           CXX: ${{ matrix.compiler }}
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1
         run: |
@@ -43,6 +44,33 @@ jobs:
             -Inative/include native/tenant_runtime.cpp native/tests/durable_isolate_queues_test.cpp \
             -lsqlite3 -o "$RUNNER_TEMP/durable-native-test"
           "$RUNNER_TEMP/durable-native-test"
+          "$CXX" -std=c++17 -pthread -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG \
+            -fno-omit-frame-pointer -fsanitize=address,undefined \
+            -Inative/include native/tests/actor_sync_test.cpp -lsqlite3 \
+            -o "$RUNNER_TEMP/actor-sync-native-test"
+          "$RUNNER_TEMP/actor-sync-native-test"
+          "$CXX" -std=c++17 -pthread -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG \
+            -fno-omit-frame-pointer -fsanitize=address,undefined \
+            -Inative/include native/tests/actor_sync_hardening_test.cpp -lsqlite3 \
+            -o "$RUNNER_TEMP/actor-sync-hardening-test"
+          "$RUNNER_TEMP/actor-sync-hardening-test"
+          "$CXX" -std=c++17 -pthread -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG \
+            -fno-omit-frame-pointer -fsanitize=address,undefined \
+            -Inative/include native/tests/actor_sync_crash_recovery_test.cpp -lsqlite3 \
+            -o "$RUNNER_TEMP/actor-sync-crash-test"
+          "$RUNNER_TEMP/actor-sync-crash-test"
+          "$CXX" -std=c++17 -pthread -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG \
+            -fno-omit-frame-pointer -fsanitize=address,undefined \
+            -Inative/include native/tests/actor_sync_cart_e2e_test.cpp -lsqlite3 \
+            -o "$RUNNER_TEMP/actor-sync-cart-test"
+          "$RUNNER_TEMP/actor-sync-cart-test"
+          "$CXX" -std=c++17 -pthread -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG \
+            -fno-omit-frame-pointer -fsanitize=address,undefined \
+            -Inative/include native/tests/actor_sync_projection_migration_test.cpp -lsqlite3 \
+            -o "$RUNNER_TEMP/actor-sync-migration-test"
+          "$RUNNER_TEMP/actor-sync-migration-test"
+          echo "ACTOR_SYNC_TWO_PROCESS_ASAN_UBSAN_PASS=$EXPECTED_SHA"
+          echo "ACTOR_SYNC_HARDENING_ASAN_UBSAN_PASS=$EXPECTED_SHA"
           echo "EXACT_HEAD_NATIVE_ASAN_UBSAN_PASS=${{ github.event.pull_request.head.sha || github.sha }}"
   thread-sanitizer:
     name: GCC ThreadSanitizer

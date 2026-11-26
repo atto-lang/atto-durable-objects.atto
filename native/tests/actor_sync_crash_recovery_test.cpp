@@ -1,0 +1,1125 @@
+#include "ores/durable/actor_sync.hpp"
+#include <cassert>
+#include <atomic>
+#include <functional>
+#include <thread>
+#include <cstdlib>
+#include <filesystem>
+#include <stdexcept>
+#include <string>
+#include <sys/wait.h>
+#include <unistd.h>
+
+using namespace ores::durable;
+namespace {
+void check_exit(pid_t child, int expected) {
+    int status=0;
+    assert(waitpid(child,&status,0)==child);
+    assert(WIFEXITED(status));
+    assert(WEXITSTATUS(status)==expected);
+}
+}
+int main() {
+    char dir[]="/tmp/ores-sync-recovery-XXXXXX";
+    assert(mkdtemp(dir)!=nullptr);
+    const std::string db=std::string(dir)+"/actor.db";
+    const SyncKey key{"tenant","orders","Order","42"};
+    {
+        SqliteActorSync initial(db);
+        initial.activate(key,1);
+    }
+
+    // A process exits after the transaction committed but BEFORE the
+    // application receives the commit result. The caller must retry the
+    // identical operation id without making a second state transition.
+    pid_t committed=fork();
+    assert(committed>=0);
+    if(committed==0) {
+        try {
+            SqliteActorSync writer(db);
+            const auto result=writer.commit(key,1,0,"request-1","charge-10","order.v1","charged","receipt-1");
+            if(result.duplicate || result.revision!=1) _exit(11);
+            // No guest reply is sent. The process disappears after COMMIT.
+            _exit(42);
+        } catch(...) { _exit(12); }
+    }
+    check_exit(committed,42);
+    {
+        SqliteActorSync recovered(db);
+        assert(recovered.snapshot(key).revision==1);
+        assert(recovered.snapshot(key).bytes=="charged");
+        const auto found=recovered.lookup_receipt(key,1,"request-1","charge-10","order.v1");
+        assert(found && found->duplicate && found->revision==1 && found->reply=="receipt-1");
+        assert(!recovered.lookup_receipt(key,1,"unseen","charge-10","order.v1"));
+        for (const auto& mismatch : {std::pair<const char*,const char*>{"charge-11","order.v1"},
+                                     {"charge-10","order.v2"}}) {
+            bool denied=false;
+            try { (void)recovered.lookup_receipt(key,1,"request-1",mismatch.first,mismatch.second); }
+            catch(const std::logic_error&) { denied=true; }
+            assert(denied);
+        }
+        const auto retry=recovered.commit(key,1,0,"request-1","charge-10","order.v1","duplicate","bad-receipt");
+        assert(retry.duplicate && retry.revision==1 && retry.reply=="receipt-1");
+        bool rejected=false;
+        try { recovered.commit(key,1,1,"request-1","charge-11","order.v1","corrupt","bad"); }
+        catch(const std::logic_error&) { rejected=true; }
+        assert(rejected);
+        const auto events=recovered.changes_after(key,0);
+        assert(events.size()==1 && events[0].revision==1 && events[0].operation_id=="request-1");
+    }
+
+    // Pre-commit injected failure must roll back all three durable records.
+    // The failed worker then exits, and a new process replays the command.
+    pid_t aborted=fork();
+    assert(aborted>=0);
+    if(aborted==0) {
+        try {
+            SqliteActorSync writer(db);
+            writer.commit(key,1,1,"request-2","credit-2","order.v1","credited","receipt-2",true);
+            _exit(13);
+        } catch(const std::runtime_error&) { _exit(43); }
+        catch(...) { _exit(14); }
+    }
+    check_exit(aborted,43);
+    {
+        SqliteActorSync recovered(db);
+        assert(recovered.snapshot(key).revision==1);
+        assert(recovered.changes_after(key,0).size()==1);
+        const auto result=recovered.commit(key,1,1,"request-2","credit-2","order.v1","credited","receipt-2");
+        assert(!result.duplicate && result.revision==2);
+        assert(recovered.changes_after(key,0).size()==2);
+        recovered.activate(key,2);
+        bool rejected=false;
+        try { recovered.commit(key,1,2,"request-3","stale","order.v1","bad","bad"); }
+        catch(const std::logic_error&) { rejected=true; }
+        assert(rejected);
+        // The idempotency key remains scoped to the stable logical actor,
+        // not to the transient epoch of its latest activation.
+        bool stale_lookup=false;
+        try { (void)recovered.lookup_receipt(key,1,"request-2","credit-2","order.v1"); }
+        catch(const std::logic_error&) { stale_lookup=true; }
+        assert(stale_lookup);
+        const auto current=recovered.lookup_receipt(key,2,"request-2","credit-2","order.v1");
+        assert(current && current->reply=="receipt-2" && current->revision==2);
+        const auto replay=recovered.commit(key,2,0,"request-2","credit-2","order.v1","bad","bad");
+        assert(replay.duplicate && replay.revision==2 && replay.reply=="receipt-2");
+    }
+    // Trusted controller allocates epochs atomically without resetting state.
+    {
+        SqliteActorSync first(db), second(db);
+        assert(first.activate_next(key)==3);
+        assert(second.activate_next(key)==4);
+        assert(first.snapshot(key).epoch==4);
+        assert(first.snapshot(key).revision==2);
+        const SyncKey fresh{"tenant","orders","Order","fresh"};
+        assert(second.activate_next(fresh)==1);
+        assert(first.snapshot(fresh).revision==0);
+        bool denied=false;
+        try { (void)first.lookup_receipt(key,3,"request-2","credit-2","order.v1"); }
+        catch(const std::logic_error&) { denied=true; }
+        assert(denied);
+    }
+    // Alarm generation survives cancellation, consumption and reopen.
+    {
+        SqliteActorSync store(db);
+        const SyncKey alarm_key{"tenant","timers","Counter","one"};
+        const auto epoch=store.activate_next(alarm_key);
+        assert(store.alarm_generation(alarm_key,epoch)==0);
+        assert(store.set_alarm(alarm_key,epoch,0,100)==1);
+        assert(store.due_alarms(99).empty());
+        auto due=store.due_alarms(100);
+        assert(due.size()==1 && due[0].generation==1);
+        assert(store.set_alarm(alarm_key,epoch,1,200)==2);
+        assert(!store.alarm_pending(due[0],epoch,200));
+        bool stale=false;
+        try { store.set_alarm(alarm_key,epoch,1,std::nullopt); }
+        catch(const std::logic_error&) {stale=true;}
+        assert(stale);
+        assert(store.set_alarm(alarm_key,epoch,2,std::nullopt)==3);
+        assert(store.due_alarms(200).empty());
+        assert(store.set_alarm(alarm_key,epoch,3,300)==4);
+        bool reserved=false;
+        try { store.commit(alarm_key,epoch,0,"@alarm:4","alarm:300","counter","1","1"); }
+        catch(const std::invalid_argument&) {reserved=true;}
+        assert(reserved);
+        due=store.due_alarms(300);
+        assert(due.size()==1);
+        bool rolled=false;
+        try { store.commit(alarm_key,epoch,0,"@alarm:4","alarm:300","counter","1","1",true,&due[0],300); }
+        catch(const std::runtime_error&) {rolled=true;}
+        assert(rolled && store.snapshot(alarm_key).revision==0);
+        assert(store.alarm_pending(due[0],epoch,300));
+    }
+    {
+        SqliteActorSync store(db);
+        const SyncKey alarm_key{"tenant","timers","Counter","one"};
+        auto due=store.due_alarms(300);
+        assert(due.size()==1 && due[0].generation==4);
+        const auto epoch=store.activate_next(alarm_key);
+        bool stale=false;
+        try { store.commit(alarm_key,epoch-1,0,"@alarm:4","alarm:300","counter","1","1",false,&due[0],300); }
+        catch(const std::logic_error&) {stale=true;}
+        assert(stale);
+        const auto receipt=store.commit(alarm_key,epoch,0,"@alarm:4","alarm:300","counter","1","1",false,&due[0],300);
+        assert(!receipt.duplicate && receipt.revision==1);
+        assert(store.due_alarms(300).empty());
+        assert(store.alarm_generation(alarm_key,epoch)==4);
+        const auto replay=store.commit(alarm_key,epoch,0,"@alarm:4","alarm:300","counter","bad","bad",false,&due[0],300);
+        assert(replay.duplicate && replay.reply=="1" && store.snapshot(alarm_key).bytes=="1");
+        assert(store.set_alarm(alarm_key,epoch,4,400)==5);
+    }
+    // An admission ACK survives loss of the admitting process before execution.
+    const SyncKey mailbox{"tenant","mail","Counter","mailbox"};
+    {
+        SqliteActorSync store(db);
+        store.activate_next(mailbox);
+    }
+    const pid_t admitted=fork();
+    assert(admitted>=0);
+    if(admitted==0) {
+        try {
+            SqliteActorSync store(db);
+            auto first=store.admit_mail(mailbox,1,"m1","1:1","counter");
+            auto second=store.admit_mail(mailbox,1,"m2","1:2","counter");
+            if(first.sequence<=0 || second.sequence<=first.sequence) _exit(17);
+            _exit(44);
+        } catch(...) {_exit(18);}
+    }
+    check_exit(admitted,44);
+    {
+        SqliteActorSync store(db);
+        const auto epoch=store.activate_next(mailbox);
+        const auto heads=store.pending_mail();
+        assert(heads.size()==1 && heads[0].operation_id=="m1");
+        const auto first=heads[0];
+        assert(store.admit_mail(mailbox,epoch,"m1","1:1","counter").sequence==first.sequence);
+        bool conflict=false;
+        try {store.admit_mail(mailbox,epoch,"m1","1:2","counter");}
+        catch(const std::logic_error&) {conflict=true;}
+        assert(conflict);
+        const auto second=store.admit_mail(mailbox,epoch,"m2","1:2","counter");
+        SyncMail later{mailbox,second.sequence,"m2","1:2","counter"};
+        assert(!store.mail_pending(later,epoch));
+        for(int mode=0;mode<3;++mode) {
+            bool denied=false;
+            try {
+                if(mode==0) store.commit(mailbox,epoch,0,"m1","1:1","counter","1","1");
+                if(mode==1) store.commit(mailbox,epoch,0,"m2","1:2","counter","2","2",false,nullptr,0,&later);
+                if(mode==2) store.commit(mailbox,epoch-1,0,"m1","1:1","counter","1","1",false,nullptr,0,&first);
+            } catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+        }
+        bool rolled=false;
+        try {store.commit(mailbox,epoch,0,"m1","1:1","counter","1","1",true,nullptr,0,&first);}
+        catch(const std::runtime_error&) {rolled=true;}
+        assert(rolled && store.snapshot(mailbox).revision==0 && store.mail_pending(first,epoch));
+        auto result=store.commit(mailbox,epoch,0,"m1","1:1","counter","1","1",false,nullptr,0,&first);
+        assert(result.revision==1 && !result.duplicate);
+        auto replay=store.admit_mail(mailbox,epoch,"m1","1:1","counter");
+        assert(replay.sequence==0 && replay.receipt && replay.receipt->reply=="1");
+        assert(store.mail_pending(later,epoch));
+    }
+    {
+        SqliteActorSync store(db);
+        auto heads=store.pending_mail();
+        assert(heads.size()==1 && heads[0].operation_id=="m2");
+        const auto epoch=store.activate_next(mailbox);
+        auto r=store.commit(mailbox,epoch,1,"m2","1:2","counter","3","3",false,nullptr,0,&heads[0]);
+        assert(r.revision==2 && store.pending_mail().empty());
+        assert(store.snapshot(mailbox).bytes=="3");
+    }
+    {
+        SyncLimits limits;limits.inbox_entries_per_actor=1;limits.inbox_entries_per_database=1;
+        SqliteActorSync store(db,limits);
+        const auto epoch=store.activate_next(mailbox);
+        auto first=store.admit_mail(mailbox,epoch,"q1","1:1","counter");
+        assert(first.sequence>0);
+        assert(store.admit_mail(mailbox,epoch,"q1","1:1","counter").sequence==first.sequence);
+        bool full=false;
+        try {store.admit_mail(mailbox,epoch,"q2","1:1","counter");}
+        catch(const std::length_error&) {full=true;}
+        assert(full);
+    }
+    // Retry metadata persists, preserves FIFO, and fences stale attempts.
+    const auto retry_db=std::string(dir)+"/retry.db";
+    const SyncKey poison{"tenant","mail","Counter","poison"};
+    const SyncKey healthy{"tenant","mail","Counter","healthy"};
+    SyncMail attempt{};
+    {
+        SyncLimits limits;limits.dedupe_entries_per_actor=2;limits.outbox_entries_per_actor=2;
+        SqliteActorSync store(retry_db,limits);
+        auto epoch=store.activate_next(poison);
+        store.admit_mail(poison,epoch,"bad","1:1","counter");
+        store.admit_mail(poison,epoch,"next","1:2","counter");
+        bool reserved=false;
+        try {store.commit(poison,epoch,0,"transient","1:1","counter","1","1");}
+        catch(const std::length_error&) {reserved=true;}
+        assert(reserved);
+        auto other=store.activate_next(healthy);
+        store.admit_mail(healthy,other,"ok","1:3","counter");
+        attempt=store.pending_mail(64,0).front();
+        assert(!store.fail_mail(attempt,epoch,0));
+        bool stale=false;
+        try {store.fail_mail(attempt,epoch,0);}
+        catch(const std::logic_error&) {stale=true;}
+        assert(stale);
+        auto ready=store.pending_mail(64,99);
+        assert(ready.size()==1 && ready[0].key.object_id=="healthy");
+        auto done=store.commit(healthy,other,0,"ok","1:3","counter","3","3",false,nullptr,0,&ready[0]);
+        assert(done.revision==1);
+        assert(store.pending_mail(64,99).empty());
+    }
+    {
+        SqliteActorSync store(retry_db);
+        auto epoch=store.activate_next(poison);
+        assert(store.pending_mail(64,99).empty());
+        auto ready=store.pending_mail(64,100);
+        assert(ready.size()==1 && ready[0].failures==1);
+        assert(!store.fail_mail(ready[0],epoch,100));
+        assert(store.pending_mail(64,299).empty());
+        ready=store.pending_mail(64,300);
+        assert(ready.size()==1 && ready[0].failures==2);
+        assert(store.fail_mail(ready[0],epoch,300));
+        auto dead=store.admit_mail(poison,epoch,"bad","1:1","counter");
+        assert(dead.dead_letter && !dead.receipt && dead.sequence==attempt.sequence);
+        assert(store.snapshot(poison).revision==0);
+        bool blocked=false;
+        try {store.commit(poison,epoch,0,"bad","1:1","counter","1","1");}
+        catch(const std::logic_error&) {blocked=true;}
+        assert(blocked);
+        ready=store.pending_mail(64,300);
+        assert(ready.size()==1 && ready[0].operation_id=="next");
+        assert(store.commit(poison,epoch,0,"next","1:2","counter","2","2",false,nullptr,0,&ready[0]).revision==1);
+        assert(store.pending_mail().empty());
+    }
+    // A controller disappears after durable dispatch and before any failure
+    // or commit record. Recovery charges exactly one failure per marker.
+    const auto attempt_db=std::string(dir)+"/attempt.db";
+    const SyncKey crash_key{"tenant","mail","Counter","crasher"};
+    {
+        SqliteActorSync store(attempt_db);
+        auto epoch=store.activate_next(crash_key);
+        store.admit_mail(crash_key,epoch,"crash","1:1","counter");
+        store.admit_mail(crash_key,epoch,"next","1:2","counter");
+    }
+    std::int64_t now=1000;
+    for(int i=0;i<3;++i) {
+        const pid_t crashed=fork();
+        assert(crashed>=0);
+        if(crashed==0) {
+            try {
+                SqliteActorSync store(attempt_db);
+                const auto epoch=store.activate_next(crash_key);
+                auto heads=store.pending_mail(64,now);
+                if(heads.size()!=1 || heads[0].failures!=i || heads[0].attempt_epoch!=0) _exit(19);
+                const auto started=store.begin_mail(heads[0],epoch,now);
+                if(started.attempt_epoch!=epoch || store.mail_pending(heads[0],epoch)) _exit(20);
+                _exit(45);
+            } catch(...) {_exit(21);}
+        }
+        check_exit(crashed,45);
+        SqliteActorSync recovered(attempt_db);
+        const auto current=recovered.activate_next(crash_key);
+        auto heads=recovered.pending_mail(64,now);
+        assert(heads.size()==1 && heads[0].attempt_epoch==current-1 && heads[0].failures==i);
+        const auto marked=heads[0];
+        bool denied=false;
+        try {recovered.commit(crash_key,current,0,"crash","1:1","counter","1","1",false,nullptr,0,&marked);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        denied=false;
+        try {recovered.fail_mail(marked,current-1,now);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        assert(recovered.fail_mail(marked,current,now)==(i==2));
+        denied=false;
+        try {recovered.fail_mail(marked,current,now);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied && recovered.snapshot(crash_key).revision==0);
+        assert(!recovered.lookup_receipt(crash_key,current,"crash","1:1","counter"));
+        assert(recovered.changes_after(crash_key,0).empty());
+        if(i<2) {
+            now+=100*(i+1);
+            assert(recovered.pending_mail(64,now-1).empty());
+        }
+    }
+    {
+        SqliteActorSync store(attempt_db);
+        const auto epoch=store.activate_next(crash_key);
+        assert(store.admit_mail(crash_key,epoch,"crash","1:1","counter").dead_letter);
+        auto heads=store.pending_mail(64,now);
+        assert(heads.size()==1 && heads[0].operation_id=="next");
+        const auto started=store.begin_mail(heads[0],epoch,now);
+        bool denied=false;
+        try {store.commit(crash_key,epoch,0,"next","1:2","counter","2","2",false,nullptr,0,&heads[0]);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        bool rolled=false;
+        try {store.commit(crash_key,epoch,0,"next","1:2","counter","2","2",true,nullptr,0,&started);}
+        catch(const std::runtime_error&) {rolled=true;}
+        assert(rolled && store.mail_pending(started,epoch));
+        assert(store.commit(crash_key,epoch,0,"next","1:2","counter","2","2",false,nullptr,0,&started).revision==1);
+        assert(store.pending_mail().empty());
+        assert(store.admit_mail(crash_key,epoch,"next","1:2","counter").receipt->reply=="2");
+    }
+    // Immutable deployment guard rejects changed startup configuration
+    // even when a pending operation has not executed yet.
+    const auto deployment_db=std::string(dir)+"/deployment.db";
+    const SyncKey deployed{"tenant","mail","Counter","deployed"};
+    const std::string manifest="fixture-deployment-v1";
+    {
+        SqliteActorSync store(deployment_db);
+        store.bind_deployment(manifest);
+        const auto epoch=store.activate_next(deployed);
+        store.admit_mail(deployed,epoch,"pending","1:1","counter");
+    }
+    {
+        SqliteActorSync store(deployment_db);
+        for(const auto& rejected:{std::string{},std::string("changed-deployment")}) {
+            bool denied=false;
+            try {store.bind_deployment(rejected);}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+        }
+        store.bind_deployment(manifest);
+        const auto epoch=store.activate_next(deployed);
+        const auto heads=store.pending_mail();
+        assert(heads.size()==1 && heads[0].operation_id=="pending");
+        const auto result=store.commit(deployed,epoch,0,"pending","1:1","counter","1","1",false,nullptr,0,&heads[0]);
+        assert(result.revision==1 && store.pending_mail().empty());
+    }
+    {
+        SqliteActorSync legacy(db);
+        bool denied=false;
+        try {legacy.bind_deployment(manifest);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        legacy.bind_deployment("");
+    }
+    // Reserved principal namespace must not reinterpret legacy receipts
+    // or admit an old raw controller after gateway-mode activation.
+    {
+        const auto nsdb=std::string(dir)+"/principal-namespace.db";
+        SqliteActorSync store(nsdb);
+        store.bind_principal_namespace(false);
+        store.bind_principal_namespace(true);
+        store.bind_principal_namespace(true);
+        bool denied=false;
+        try {store.bind_principal_namespace(false);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+    }
+    {
+        const auto nsdb=std::string(dir)+"/principal-legacy.db";
+        SqliteActorSync store(nsdb);
+        const auto epoch=store.activate_next(deployed);
+        store.commit(deployed,epoch,0,"@principal:legacy","1:1","counter","1","1");
+        bool denied=false;
+        try {store.bind_principal_namespace(true);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        store.bind_principal_namespace(false);
+    }
+    {
+        const auto nsdb=std::string(dir)+"/principal-inbox.db";
+        SqliteActorSync store(nsdb);
+        const auto epoch=store.activate_next(deployed);
+        store.admit_mail(deployed,epoch,"@principal:legacy","1:1","counter");
+        bool denied=false;
+        try {store.bind_principal_namespace(true);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        store.bind_principal_namespace(false);
+    }
+    // Tenant limits span distinct object identities, including retained
+    // dead letters, and exact retries do not consume additional capacity.
+    {
+        const auto quota_db=std::string(dir)+"/tenant-quota.db";
+        SyncLimits limits;limits.inbox_entries_per_tenant=2;limits.inbox_command_bytes_per_tenant=6;
+        const SyncKey one{"tenant-a","mail","Counter","1"},two{"tenant-a","mail","Counter","2"},
+                      three{"tenant-a","mail","Counter","3"},other{"tenant-b","mail","Counter","1"};
+        {
+            SqliteActorSync store(quota_db,limits);
+            store.activate_next(one);store.activate_next(two);store.activate_next(three);store.activate_next(other);
+            auto seq=store.admit_mail(one,1,"one","1:1","counter").sequence;
+            store.admit_mail(two,1,"two","1:2","counter");
+            assert(store.admit_mail(one,1,"one","1:1","counter").sequence==seq);
+            bool denied=false;
+            try {store.admit_mail(three,1,"three","1:3","counter");}
+            catch(const std::length_error&) {denied=true;}
+            assert(denied);
+            store.admit_mail(other,1,"other","1:5","counter");
+            auto heads=store.fair_pending_mail(2,0);
+            assert(heads.size()==2 && heads[0].key.tenant=="tenant-a" && heads[1].key.tenant=="tenant-b");
+            heads=store.fair_pending_mail(1,0,"tenant-a");
+            assert(heads.size()==1 && heads[0].key.tenant=="tenant-b");
+            heads=store.fair_pending_mail(1,0,"tenant-b");
+            assert(heads.size()==1 && heads[0].operation_id=="one");
+            // A backed-off oldest object head must not expose its successor.
+            assert(!store.fail_mail(heads[0],1,0));
+            heads=store.fair_pending_mail(2,99);
+            assert(heads.size()==2 && heads[0].operation_id=="two" && heads[1].operation_id=="other");
+        }
+        bool denied=false;
+        try {SyncLimits reduced=limits;reduced.inbox_entries_per_tenant=1;SqliteActorSync store(quota_db,reduced);}
+        catch(const std::length_error&) {denied=true;}
+        assert(denied);
+        denied=false;
+        try {SyncLimits reduced=limits;reduced.inbox_command_bytes_per_tenant=5;SqliteActorSync store(quota_db,reduced);}
+        catch(const std::length_error&) {denied=true;}
+        assert(denied);
+        SqliteActorSync store(quota_db,limits);
+        assert(store.fair_pending_mail(2,100).size()==2);
+        // Dead-lettering does not release retained tenant capacity.
+        auto heads=store.fair_pending_mail(2,100);
+        assert(heads[0].operation_id=="one" && heads[0].failures==1);
+        assert(!store.fail_mail(heads[0],1,100));
+        heads=store.fair_pending_mail(2,300);
+        assert(heads[0].operation_id=="one" && heads[0].failures==2);
+        assert(store.fail_mail(heads[0],1,300));
+        assert(store.admit_mail(one,1,"one","1:1","counter").dead_letter);
+        bool full=false;
+        try {store.admit_mail(three,1,"three","1:3","counter");}
+        catch(const std::length_error&) {full=true;}
+        assert(full);
+        heads=store.fair_pending_mail(2,300);
+        assert(heads[0].operation_id=="two");
+        store.commit(two,1,0,"two","1:2","counter","2","2",false,nullptr,0,&heads[0]);
+        // Now the entry budget has space; the byte cap independently denies
+        // a four-byte command (3 retained + 4 > 6).
+        full=false;
+        try {store.admit_mail(three,1,"three","1:33","counter");}
+        catch(const std::length_error&) {full=true;}
+        assert(full);
+        assert(store.admit_mail(three,1,"three","1:3","counter").sequence>0);
+    }
+    // More hot objects than the scan limit cannot hide a sparse tenant.
+    {
+        const auto fair_db=std::string(dir)+"/fair.db";
+        SqliteActorSync store(fair_db);
+        for(int i=0;i<260;++i) {
+            const SyncKey key{"hot","mail","Counter",std::to_string(i)};
+            store.activate_next(key);store.admit_mail(key,1,"pending","1:1","counter");
+        }
+        const SyncKey cold{"quiet","mail","Counter","1"};
+        store.activate_next(cold);store.admit_mail(cold,1,"pending","1:1","counter");
+        const auto heads=store.fair_pending_mail(2,0);
+        assert(heads.size()==2 && heads[0].key.tenant=="hot" && heads[1].key.tenant=="quiet");
+        assert(store.fair_pending_mail(1,0,"hot")[0].key.tenant=="quiet");
+    }
+    // Principal admission is atomic, immutable across reopen, and denial
+    // is terminal without advancing state or manufacturing a success receipt.
+    {
+        const auto auth_db=std::string(dir)+"/principal-durable.db";
+        const SyncKey k{"tenant","mail","Counter","principal"};
+        {
+            SqliteActorSync store(auth_db);
+            store.bind_principal_namespace(true);
+            store.activate_next(k);
+            bool denied=false;
+            try {store.admit_mail(k,1,"raw","1:1","counter");}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            auto a=store.admit_mail(k,1,"@principal:a","1:1","counter","alice");
+            assert(a.sequence>0 && !a.dead_letter);
+            denied=false;
+            try {store.admit_mail(k,1,"@principal:a","1:1","counter","bob");}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            store.admit_mail(k,1,"@principal:b","1:2","counter","bob");
+        }
+        {
+            SqliteActorSync store(auth_db);
+            store.bind_principal_namespace(true);
+            auto epoch=store.activate_next(k);
+            auto heads=store.fair_pending_mail(2,0);
+            assert(heads.size()==1 && heads[0].principal=="alice");
+            auto started=store.begin_mail(heads[0],epoch,0);
+            auto forged=started;forged.principal="bob";
+            bool denied=false;
+            try {store.deny_mail(forged,epoch);}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            store.deny_mail(started,epoch);
+            auto terminal=store.admit_mail(k,epoch,"@principal:a","1:1","counter","alice");
+            assert(terminal.dead_letter && terminal.authorization_denied && !terminal.receipt);
+            assert(store.snapshot(k).revision==0 && store.changes_after(k,0).empty());
+            heads=store.pending_mail();
+            assert(heads.size()==1 && heads[0].principal=="bob");
+            auto next=store.begin_mail(heads[0],epoch,0);
+            assert(store.commit(k,epoch,0,"@principal:b","1:2","counter","2","2",false,nullptr,0,&next).revision==1);
+            assert(store.pending_mail().empty());
+        }
+    }
+    // Independent connections serialize policy changes against state commits.
+    {
+        const auto strict_db=std::string(dir)+"/strict-policy.db";
+        const SyncKey k{"tenant","mail","Counter","strict"};
+        SqliteActorSync store(strict_db),admin(strict_db);
+        store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+        const auto epoch=store.activate_next(k);
+        bool denied=false;
+        try {store.admit_mail(k,epoch,"@principal:one","1:1","counter","alice");}
+        catch(const PrincipalPolicyChanged&) {denied=true;}
+        assert(denied);
+        assert(admin.set_principal_policy(k,"alice",1,0,true)==1);
+        assert(admin.set_principal_policy(k,"bob",1,0,true)==1);
+        store.admit_mail(k,epoch,"@principal:one","1:1","counter","alice");
+        store.admit_mail(k,epoch,"@principal:two","1:2","counter","bob");
+        auto heads=store.pending_mail();
+        auto started=store.begin_mail(heads[0],epoch,0);
+        // A revoke/regrant ABA must still invalidate the in-flight version.
+        assert(admin.set_principal_policy(k,"alice",1,1,false)==2);
+        assert(admin.set_principal_policy(k,"alice",1,2,true)==3);
+        denied=false;
+        try {store.commit(k,epoch,0,"@principal:one","1:1","counter","1","1",false,nullptr,0,&started);}
+        catch(const PrincipalPolicyChanged&) {denied=true;}
+        assert(denied && store.snapshot(k).revision==0 && store.changes_after(k,0).empty());
+        store.deny_mail(started,epoch);
+        auto terminal=store.admit_mail(k,epoch,"@principal:one","1:1","counter","alice");
+        assert(terminal.authorization_denied && terminal.dead_letter && !terminal.receipt);
+        heads=store.pending_mail();
+        auto next=store.begin_mail(heads[0],epoch,0);
+        assert(store.commit(k,epoch,0,"@principal:two","1:2","counter","2","2",false,nullptr,0,&next).revision==1);
+        assert(admin.set_principal_policy(k,"bob",1,1,false)==2);
+        denied=false;
+        try {store.admit_mail(k,epoch,"@principal:two","1:2","counter","bob");}
+        catch(const PrincipalPolicyChanged&) {denied=true;}
+        assert(denied && store.snapshot(k).bytes=="2");
+        denied=false;
+        try {store.commit(k,epoch,1,"raw","1:1","counter","3","3");}
+        catch(const PrincipalPolicyChanged&) {denied=true;}
+        assert(denied);
+        denied=false;
+        try {admin.set_principal_policy(k,"bob",1,1,true);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        SqliteActorSync reopened(strict_db);
+        denied=false;
+        try {reopened.bind_transactional_policy(false);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        reopened.bind_transactional_policy(true);
+        assert(reopened.snapshot(k).revision==1 && reopened.pending_mail().empty());
+    }
+    // Redrive is atomic, creates a new identity and preserves the original
+    // terminal result. A revoked grant or a quota failure cannot create audit.
+    {
+        const auto db2=std::string(dir)+"/redrive.db";
+        const SyncKey key{"tenant","mail","Counter","redrive"};
+        const SyncKey other{"other","mail","Counter","redrive"};
+        std::int64_t original=0,new_sequence=0;
+        {
+            SqliteActorSync store(db2);
+            store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+            const auto epoch=store.activate_next(key);
+            store.activate_next(other);
+            store.set_principal_policy(key,"alice",1,0,true);
+            original=store.admit_mail(key,epoch,"@principal:original","1:2","counter","alice").sequence;
+            for(const auto now:{0,100,300}) {
+                auto heads=store.pending_mail(1,now);
+                assert(heads.size()==1);
+                const auto attempt=store.begin_mail(heads[0],epoch,now);
+                assert(store.fail_mail(attempt,epoch,now)==(now==300));
+            }
+            auto page=store.dead_letters(key,0,1);
+            assert(page.size()==1 && page[0].sequence==original && !page[0].authorization_denied);
+            assert(store.dead_letters(other).empty() && store.dead_letters(key,original).empty());
+            store.set_principal_policy(key,"alice",1,1,false);
+            bool denied=false;
+            try {store.redrive_dead_letter(key,epoch,original,"operator");}
+            catch(const PrincipalPolicyChanged&) {denied=true;}
+            assert(denied && store.pending_mail().empty() && store.dead_letters(key)[0].redrive_sequence==0);
+            store.set_principal_policy(key,"alice",1,2,true);
+            auto fresh=store.redrive_dead_letter(key,epoch,original,"operator");
+            new_sequence=fresh.new_sequence;
+            assert(new_sequence>original && !fresh.duplicate);
+            assert(store.redrive_dead_letter(key,epoch,original,"operator").duplicate);
+            denied=false;
+            try {store.redrive_dead_letter(key,epoch,original,"different");}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            denied=false;
+            try {store.admit_mail(key,epoch,fresh.operation_id,"1:2","counter","alice");}
+            catch(const std::invalid_argument&) {denied=true;}
+            assert(denied);
+            assert(store.admit_mail(key,epoch,"@principal:original","1:2","counter","alice").dead_letter);
+        }
+        {
+            SqliteActorSync store(db2);
+            store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+            auto epoch=store.activate_next(key);
+            auto prior=store.redrive_dead_letter(key,epoch,original,"operator");
+            assert(prior.duplicate && prior.new_sequence==new_sequence);
+            auto heads=store.pending_mail();
+            assert(heads.size()==1 && heads[0].sequence==new_sequence && heads[0].principal=="alice" && heads[0].command=="1:2");
+            auto attempt=store.begin_mail(heads[0],epoch,0);
+            store.commit(key,epoch,0,attempt.operation_id,attempt.command,attempt.schema,"2","2",false,nullptr,0,&attempt);
+            assert(store.pending_mail().empty() && store.snapshot(key).bytes=="2");
+            assert(store.redrive_dead_letter(key,epoch,original,"operator").duplicate);
+            assert(store.dead_letters(key)[0].redrive_sequence==new_sequence);
+            store.admit_mail(key,epoch,"@principal:denied","1:1","counter","alice");
+            auto rejected=store.pending_mail()[0];
+            store.deny_mail(rejected,epoch);
+            bool denied=false;
+            try {store.redrive_dead_letter(key,epoch,rejected.sequence,"operator");}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied && store.snapshot(key).revision==1);
+        }
+    }
+    // Archiving releases inbox capacity but preserves exact terminal
+    // identity, command, principal and any pre-existing redrive audit.
+    {
+        const auto archive_db=std::string(dir)+"/archive.db";
+        const SyncKey k{"tenant","mail","Counter","archive"};
+        SyncLimits limits;limits.inbox_entries_per_actor=1;limits.archive_entries_per_tenant=1;
+        std::int64_t source=0;
+        {
+            SqliteActorSync store(archive_db,limits);
+            store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+            auto epoch=store.activate_next(k);
+            store.set_principal_policy(k,"alice",1,0,true);
+            source=store.admit_mail(k,epoch,"@principal:old","1:2","counter","alice").sequence;
+            store.deny_mail(store.pending_mail()[0],epoch);
+            bool failed=false;
+            try {store.archive_dead_letter(k,epoch,source,"admin",true);}
+            catch(const std::runtime_error&) {failed=true;}
+            assert(failed && !store.dead_letters(k)[0].archived);
+            failed=false;
+            try {store.admit_mail(k,epoch,"@principal:new","1:3","counter","alice");}
+            catch(const std::length_error&) {failed=true;}
+            assert(failed);
+            assert(!store.archive_dead_letter(k,epoch,source,"admin").duplicate);
+            assert(store.archive_dead_letter(k,epoch,source,"admin").duplicate);
+            assert(store.dead_letters(k)[0].archived);
+            auto replay=store.admit_mail(k,epoch,"@principal:old","1:2","counter","alice");
+            assert(replay.sequence==source && replay.dead_letter && replay.authorization_denied);
+            failed=false;
+            try {store.admit_mail(k,epoch,"@principal:old","1:3","counter","alice");}
+            catch(const std::logic_error&) {failed=true;}
+            assert(failed);
+            const auto fresh=store.admit_mail(k,epoch,"@principal:new","1:3","counter","alice");
+            assert(fresh.sequence>source);
+            store.deny_mail(store.pending_mail()[0],epoch);
+            failed=false;
+            try {store.archive_dead_letter(k,epoch,fresh.sequence,"admin");}
+            catch(const std::length_error&) {failed=true;}
+            assert(failed);
+            auto page=store.dead_letters(k,source,1);
+            assert(page.size()==1 && page[0].sequence==fresh.sequence && !page[0].archived);
+        }
+        SqliteActorSync store(archive_db,limits);
+        auto epoch=store.activate_next(k);
+        assert(store.archive_dead_letter(k,epoch,source,"admin").duplicate);
+        assert(store.admit_mail(k,epoch,"@principal:old","1:2","counter","alice").dead_letter);
+        bool failed=false;
+        try {store.commit(k,epoch,0,"@principal:old","1:2","counter","2","2");}
+        catch(const std::logic_error&) {failed=true;}
+        assert(failed && store.snapshot(k).revision==0);
+    }
+    // Previously recorded redrive stays idempotent after archival.
+    {
+        const auto audit_db=std::string(dir)+"/archive-audit.db";
+        const SyncKey k{"tenant","mail","Counter","audit"};
+        SqliteActorSync store(audit_db);
+        store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+        auto epoch=store.activate_next(k);
+        store.set_principal_policy(k,"alice",1,0,true);
+        auto source=store.admit_mail(k,epoch,"@principal:old","1:1","counter","alice").sequence;
+        for(const auto now:{0,100,300}) {
+            auto mail=store.begin_mail(store.pending_mail(1,now)[0],epoch,now);
+            store.fail_mail(mail,epoch,now);
+        }
+        const auto redrive=store.redrive_dead_letter(k,epoch,source,"operator");
+        store.archive_dead_letter(k,epoch,source,"archiver");
+        const auto prior=store.redrive_dead_letter(k,epoch,source,"operator");
+        assert(prior.duplicate && prior.new_sequence==redrive.new_sequence);
+        const auto page=store.dead_letters(k);
+        assert(page.size()==1 && page[0].archived && page[0].redrive_sequence==redrive.new_sequence);
+        assert(store.pending_mail().size()==1);
+    }
+    // Atomic state/receipt/outbox/alarm effect: fail before commit, kill
+    // after commit before acknowledgement, replay without resetting deadline.
+    {
+        const auto alarm_db=std::string(dir)+"/atomic-alarm.db";
+        const SyncKey k{"tenant","mail","Counter","atomic-alarm"};
+        const SyncAlarmChange schedule{0,100};
+        {
+            SqliteActorSync store(alarm_db);
+            auto epoch=store.activate_next(k);
+            bool failed=false;
+            try {store.commit(k,epoch,0,"schedule","1:2","counter","2","2",true,nullptr,0,nullptr,&schedule);}
+            catch(const std::runtime_error&) {failed=true;}
+            assert(failed && store.snapshot(k).revision==0 && store.alarm_generation(k,epoch)==0);
+            assert(store.due_alarms(100).empty() && store.changes_after(k,0).empty());
+            assert(!store.lookup_receipt(k,epoch,"schedule","1:2","counter",&schedule));
+        }
+        const pid_t child=fork();assert(child>=0);
+        if(child==0) {
+            try {
+                SqliteActorSync store(alarm_db);auto epoch=store.activate_next(k);
+                store.commit(k,epoch,0,"schedule","1:2","counter","2","2",false,nullptr,0,nullptr,&schedule);
+                _exit(61);
+            } catch(...) {_exit(62);}
+        }
+        check_exit(child,61);
+        SqliteActorSync store(alarm_db);auto epoch=store.activate_next(k);
+        assert(store.snapshot(k).bytes=="2" && store.snapshot(k).revision==1);
+        assert(store.due_alarms(99).empty() && store.due_alarms(100).size()==1);
+        assert(store.lookup_receipt(k,epoch,"schedule","1:2","counter",&schedule)->duplicate);
+        bool failed=false;
+        try {store.lookup_receipt(k,epoch,"schedule","1:2","counter");}
+        catch(const std::logic_error&) {failed=true;}
+        assert(failed);
+        failed=false;
+        try {store.admit_mail(k,epoch,"schedule","1:2","counter");}
+        catch(const std::logic_error&) {failed=true;}
+        assert(failed);
+        const SyncAlarmChange wrong{0,101};
+        failed=false;
+        try {store.commit(k,epoch,0,"schedule","1:2","counter","2","2",false,nullptr,0,nullptr,&wrong);}
+        catch(const std::logic_error&) {failed=true;}
+        assert(failed);
+        const auto alarm=store.due_alarms(100)[0];
+        const SyncAlarmChange again{1,200};
+        const auto op=SqliteActorSync::alarm_operation_id(alarm.generation);
+        assert(store.commit(k,epoch,1,op,"alarm:100","counter","3","3",false,&alarm,100,nullptr,&again).revision==2);
+        assert(store.due_alarms(199).empty());
+        assert(store.due_alarms(200)[0].generation==2);
+        assert(store.commit(k,epoch,0,"schedule","1:2","counter","2","2",false,nullptr,0,nullptr,&schedule).duplicate);
+        assert(store.alarm_generation(k,epoch)==2);
+        const SyncAlarmChange stale{1,std::nullopt};
+        failed=false;
+        try {store.commit(k,epoch,2,"stale","1:1","counter","4","4",false,nullptr,0,nullptr,&stale);}
+        catch(const std::logic_error&) {failed=true;}
+        assert(failed && store.snapshot(k).revision==2 && store.alarm_generation(k,epoch)==2);
+        const SyncAlarmChange cancel{2,std::nullopt};
+        assert(store.commit(k,epoch,2,"cancel","1:1","counter","4","4",false,nullptr,0,nullptr,&cancel).revision==3);
+        assert(store.due_alarms(200).empty() && store.alarm_generation(k,epoch)==3);
+        assert(store.changes_after(k,0).size()==3);
+        store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+        failed=false;
+        try {store.set_alarm(k,epoch,3,300);}
+        catch(const PrincipalPolicyChanged&) {failed=true;}
+        assert(failed);
+    }
+    {
+        const auto db2=std::string(dir)+"/strict-pending-alarm.db";
+        const SyncKey k{"tenant","mail","Counter","pending"};
+        SqliteActorSync store(db2);
+        auto epoch=store.activate_next(k);store.set_alarm(k,epoch,0,0);
+        store.bind_principal_namespace(true);
+        bool denied=false;
+        try {store.bind_transactional_policy(true);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied && store.due_alarms(0).size()==1);
+    }
+    // A strict alarm captures the exact grant version when scheduled.
+    // Revocation/regrant invalidates that generation across restart.
+    {
+        const auto db2=std::string(dir)+"/principal-alarm.db";
+        const SyncKey k{"tenant","mail","Counter","strict-alarm"};
+        {
+            SqliteActorSync store(db2);
+            store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+            auto epoch=store.activate_next(k);
+            bool denied=false;
+            try {store.set_principal_alarm(k,epoch,0,0,"alice","operator");}
+            catch(const PrincipalPolicyChanged&) {denied=true;}
+            assert(denied && store.alarm_generation(k,epoch)==0);
+            store.set_principal_policy(k,"alice",1,0,true);
+            assert(store.set_principal_alarm(k,epoch,0,0,"alice","operator")==1);
+            auto info=store.principal_alarm_authority(k);
+            assert(info && info->principal=="alice" && info->operator_id=="operator" &&
+                   info->grant_version==1 && info->status==SyncAlarmStatus::pending);
+        }
+        SqliteActorSync store(db2),admin(db2);
+        store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+        auto epoch=store.activate_next(k);
+        auto alarm=store.due_alarms(0)[0];
+        assert(store.alarm_pending(alarm,epoch,0));
+        auto forged=alarm;forged.principal="bob";
+        bool denied=false;
+        try {store.alarm_pending(forged,epoch,0);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        admin.set_principal_policy(k,"alice",1,1,false);
+        admin.set_principal_policy(k,"alice",1,2,true);
+        denied=false;
+        try {store.commit(k,epoch,0,"@alarm:1","alarm:0","counter","1","1",false,&alarm,0);}
+        catch(const PrincipalPolicyChanged&) {denied=true;}
+        assert(denied && store.snapshot(k).revision==0 && store.changes_after(k,0).empty());
+        assert(store.deny_principal_alarm(alarm,epoch,0));
+        assert(!store.deny_principal_alarm(alarm,epoch,0));
+        assert(store.principal_alarm_authority(k)->status==SyncAlarmStatus::denied);
+        assert(store.due_alarms(0).empty());
+        assert(store.set_principal_alarm(k,epoch,1,0,"alice","operator")==2);
+        auto next=store.due_alarms(0)[0];
+        assert(next.grant_version==3 && !store.deny_principal_alarm(alarm,epoch,0));
+        denied=false;
+        try {store.commit(k,epoch,0,"@alarm:2","alarm:0","counter","1","1",true,&next,0);}
+        catch(const std::runtime_error&) {denied=true;}
+        assert(denied && store.alarm_pending(next,epoch,0));
+        assert(store.principal_alarm_authority(k)->status==SyncAlarmStatus::pending);
+        assert(store.commit(k,epoch,0,"@alarm:2","alarm:0","counter","1","1",false,&next,0).revision==1);
+        assert(store.principal_alarm_authority(k)->status==SyncAlarmStatus::fired);
+        assert(store.due_alarms(0).empty() && store.snapshot(k).bytes=="1");
+        admin.set_principal_policy(k,"alice",1,3,false);
+        assert(store.snapshot(k).revision==1);
+    }
+    // Crash after durable alarm dispatch, before a guest result exists.
+    // Recovery consumes that attempt once, then bounded retry exhausts
+    // the generation without manufacturing a committed state or receipt.
+    {
+        const auto db2=std::string(dir)+"/alarm-attempt.db";
+        const SyncKey k{"tenant","mail","Counter","retry-alarm"};
+        const SyncKey healthy{"tenant","mail","Counter","healthy-alarm"};
+        {
+            SqliteActorSync store(db2);
+            store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+            auto epoch=store.activate_next(k);
+            auto he=store.activate_next(healthy);
+            store.set_principal_policy(k,"alice",1,0,true);
+            store.set_principal_policy(healthy,"bob",1,0,true);
+            store.set_principal_alarm(k,epoch,0,0,"alice","operator");
+            store.set_principal_alarm(healthy,he,0,1,"bob","operator");
+        }
+        const pid_t child=fork();assert(child>=0);
+        if(child==0) {
+            try {
+                SqliteActorSync store(db2);
+                auto epoch=store.activate_next(k);
+                auto a=store.due_alarms(0)[0];
+                auto started=store.begin_alarm(a,epoch,0);
+                if(started.attempt_epoch!=epoch) _exit(64);
+                _exit(63);
+            } catch(...) {_exit(64);}
+        }
+        check_exit(child,63);
+        SqliteActorSync store(db2);
+        auto epoch=store.activate_next(k);
+        auto abandoned=store.due_alarms(0)[0];
+        assert(abandoned.attempt_epoch<epoch && abandoned.attempt_epoch>0 && abandoned.failures==0);
+        assert(!store.fail_alarm(abandoned,epoch,0));
+        assert(store.due_alarms(0).empty());
+        bool denied=false;
+        try {store.fail_alarm(abandoned,epoch,0);}
+        catch(const std::logic_error&) {denied=true;}
+        assert(denied);
+        auto h=store.due_alarms(1)[0];
+        assert(h.key.object_id==healthy.object_id);
+        auto he=store.snapshot(healthy).epoch;
+        h=store.begin_alarm(h,he,1);
+        assert(store.commit(healthy,he,0,"@alarm:1","alarm:1","counter","1","1",false,&h,1).revision==1);
+        assert(store.due_alarms(99).empty());
+        auto retry=store.due_alarms(100)[0];
+        assert(retry.due_ms==0 && retry.failures==1 && retry.attempt_epoch==0);
+        retry=store.begin_alarm(retry,epoch,100);
+        assert(!store.fail_alarm(retry,epoch,100));
+        assert(store.due_alarms(299).empty());
+        retry=store.begin_alarm(store.due_alarms(300)[0],epoch,300);
+        assert(store.fail_alarm(retry,epoch,300));
+        assert(store.due_alarms(1000).empty());
+        assert(store.principal_alarm_authority(k)->status==SyncAlarmStatus::failed);
+        assert(store.snapshot(k).revision==0 && store.changes_after(k,0).empty());
+        assert(!store.lookup_receipt(k,epoch,"@alarm:1","alarm:0","counter"));
+        SqliteActorSync reopened(db2);
+        reopened.bind_principal_namespace(true);reopened.bind_transactional_policy(true);
+        assert(reopened.principal_alarm_authority(k)->status==SyncAlarmStatus::failed);
+        assert(reopened.set_principal_alarm(k,epoch,1,400,"alice","operator")==2);
+        auto fresh=reopened.due_alarms(400)[0];
+        assert(fresh.generation==2 && fresh.failures==0 && fresh.attempt_epoch==0);
+        fresh=reopened.begin_alarm(fresh,epoch,400);
+        assert(reopened.commit(k,epoch,0,"@alarm:2","alarm:400","counter","1","1",false,&fresh,400).revision==1);
+        assert(reopened.principal_alarm_authority(k)->status==SyncAlarmStatus::fired);
+    }
+    // Strict mailbox effect is part of exact command identity, survives
+    // restart, and cannot commit separately from state or its grant fence.
+    {
+        const auto db2=std::string(dir)+"/mail-alarm-effect.db";
+        const SyncKey k{"tenant","mail","Counter","mail-alarm"};
+        const SyncMailAlarm effect{{0,100},"operator:one"};
+        const auto command=SqliteActorSync::encode_mail_alarm(2,effect);
+        {
+            SqliteActorSync store(db2);
+            store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+            auto epoch=store.activate_next(k);
+            store.set_principal_policy(k,"alice",1,0,true);
+            auto accepted=store.admit_mail(k,epoch,"@principal:effect",command,"counter","alice");
+            assert(accepted.sequence>0);
+            assert(store.admit_mail(k,epoch,"@principal:effect",command,"counter","alice").sequence==accepted.sequence);
+            bool rejected=false;
+            try {store.admit_mail(k,epoch,"@principal:effect","1:2","counter","alice");}
+            catch(const std::logic_error&) {rejected=true;}
+            assert(rejected);
+        }
+        SqliteActorSync store(db2),admin(db2);
+        store.bind_principal_namespace(true);store.bind_transactional_policy(true);
+        auto epoch=store.activate_next(k);
+        auto started=store.begin_mail(store.pending_mail()[0],epoch,0);
+        bool rejected=false;
+        try {store.commit(k,epoch,0,started.operation_id,command,"counter","2","2",false,nullptr,0,&started);}
+        catch(const std::invalid_argument&) {rejected=true;}
+        assert(rejected);
+        rejected=false;
+        try {store.commit(k,epoch,0,started.operation_id,command,"counter","2","2",true,nullptr,0,&started,&effect.change);}
+        catch(const std::runtime_error&) {rejected=true;}
+        assert(rejected && store.snapshot(k).revision==0 && store.alarm_generation(k,epoch)==0);
+        assert(store.commit(k,epoch,0,started.operation_id,command,"counter","2","2",false,nullptr,0,&started,&effect.change).revision==1);
+        auto authority=store.principal_alarm_authority(k);
+        assert(authority && authority->generation==1 && authority->principal=="alice" &&
+               authority->operator_id=="operator:one" && authority->grant_version==1);
+        assert(store.admit_mail(k,epoch,"@principal:effect",command,"counter","alice").receipt->duplicate);
+        const auto second=SqliteActorSync::encode_mail_alarm(1,SyncMailAlarm{{1,200},"operator:one"});
+        store.admit_mail(k,epoch,"@principal:revoked",second,"counter","alice");
+        started=store.begin_mail(store.pending_mail()[0],epoch,0);
+        admin.set_principal_policy(k,"alice",1,1,false);
+        admin.set_principal_policy(k,"alice",1,2,true);
+        const auto parsed=SqliteActorSync::mail_alarm_effect(second);
+        rejected=false;
+        try {store.commit(k,epoch,1,started.operation_id,second,"counter","3","3",false,nullptr,0,&started,&parsed->change);}
+        catch(const PrincipalPolicyChanged&) {rejected=true;}
+        assert(rejected && store.snapshot(k).revision==1 && store.alarm_generation(k,epoch)==1);
+        store.deny_mail(started,epoch);
+        // Stale generation terminates without mutating state or alarm.
+        store.admit_mail(k,epoch,"@principal:stale",command,"counter","alice");
+        started=store.begin_mail(store.pending_mail()[0],epoch,0);
+        rejected=false;
+        try {store.commit(k,epoch,1,started.operation_id,command,"counter","4","4",false,nullptr,0,&started,&effect.change);}
+        catch(const AlarmGenerationConflict&) {rejected=true;}
+        assert(rejected && store.snapshot(k).revision==1);
+        store.deny_mail(started,epoch,false);
+        auto terminal=store.admit_mail(k,epoch,"@principal:stale",command,"counter","alice");
+        assert(terminal.dead_letter && !terminal.authorization_denied);
+        rejected=false;
+        try {store.redrive_dead_letter(k,epoch,terminal.sequence,"operator");}
+        catch(const std::logic_error&) {rejected=true;}
+        assert(rejected);
+        // Overflow consumes the command but never applies the requested alarm.
+        store.admit_mail(k,epoch,"@principal:overflow",second,"counter","alice");
+        started=store.begin_mail(store.pending_mail()[0],epoch,0);
+        assert(store.commit(k,epoch,1,started.operation_id,second,"counter","2","mail_overflow",false,nullptr,0,&started).revision==2);
+        assert(store.alarm_generation(k,epoch)==1);
+        assert(store.admit_mail(k,epoch,"@principal:overflow",second,"counter","alice").receipt->reply=="mail_overflow");
+    }
+    // Rank across tenants before limiting the due scan; a hot tenant
+    // with more than a full page cannot hide the next tenant.
+    {
+        const auto db2=std::string(dir)+"/fair-alarms.db";
+        SqliteActorSync store(db2);
+        const SyncKey quiet{"z-quiet","mail","Counter","one"};
+        for(int i=0;i<260;++i) {
+            const SyncKey hot{"a-hot","mail","Counter",std::to_string(i)};
+            const auto epoch=store.activate_next(hot);
+            store.set_alarm(hot,epoch,0,0);
+        }
+        const auto epoch=store.activate_next(quiet);
+        store.set_alarm(quiet,epoch,0,1);
+        auto page=store.fair_due_alarms(2,1);
+        assert(page.size()==2 && page[0].key.tenant=="a-hot" && page[1].key.tenant==quiet.tenant);
+        page=store.fair_due_alarms(1,1,"a-hot");
+        assert(page.size()==1 && page[0].key.tenant==quiet.tenant);
+        const auto attempted=store.begin_alarm(page[0],epoch,1);
+        assert(!store.fail_alarm(attempted,epoch,1));
+        page=store.fair_due_alarms(256,100,"a-hot");
+        assert(page.size()==256);
+        for(const auto& item:page) assert(item.key.tenant=="a-hot");
+        page=store.fair_due_alarms(1,101,"a-hot");
+        assert(page.size()==1 && page[0].key.tenant==quiet.tenant && page[0].failures==1);
+    }
+    // Rolling budget: exact expiry, cross-connection serialization,
+    // persisted clock high-water, crash consumption, and downgrade denial.
+    {
+        const auto db2=std::string(dir)+"/guest-rate.db";
+        {
+            SqliteActorSync store(db2);
+            store.bind_guest_rate({1000,2});
+            store.reserve_guest_start("hot",100);
+            store.reserve_guest_start("hot",200);
+            bool full=false;
+            try {store.reserve_guest_start("hot",1099);}
+            catch(const std::length_error&) {full=true;}
+            assert(full);
+            store.reserve_guest_start("quiet",200);
+        }
+        {
+            SqliteActorSync store(db2);
+            store.bind_guest_rate({1000,2});
+            bool denied=false;
+            try {store.bind_guest_rate({});}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            denied=false;
+            try {store.bind_guest_rate({1000,3});}
+            catch(const std::logic_error&) {denied=true;}
+            assert(denied);
+            denied=false;
+            try {store.reserve_guest_start("hot",0);}
+            catch(const std::length_error&) {denied=true;}
+            assert(denied);
+            store.reserve_guest_start("hot",1100);
+            denied=false;
+            try {store.reserve_guest_start("hot",1199);}
+            catch(const std::length_error&) {denied=true;}
+            assert(denied);
+            store.reserve_guest_start("hot",1200);
+        }
+        const pid_t child=fork();assert(child>=0);
+        if(child==0) {
+            try {
+                SqliteActorSync store(db2);
+                store.bind_guest_rate({1000,2});
+                store.reserve_guest_start("crash",1200);
+                _exit(65);
+            } catch(...) {_exit(66);}
+        }
+        check_exit(child,65);
+        SqliteActorSync one(db2),two(db2);
+        std::atomic<int> admitted{0},denied{0};
+        auto race=[&](SqliteActorSync& store){
+            try {store.reserve_guest_start("crash",1200);++admitted;}
+            catch(const std::length_error&) {++denied;}
+        };
+        std::thread a(race,std::ref(one)),b(race,std::ref(two));
+        a.join();b.join();
+        assert(admitted==1 && denied==1);
+        bool full=false;
+        try {one.reserve_guest_start("crash",2199);}
+        catch(const std::length_error&) {full=true;}
+        assert(full);
+        one.reserve_guest_start("crash",2200);
+    }
+    // Contradictory reset of snapshot must not be treated as first spawn.
+    // Independent connection simulates a partial administrative repair,
+    // not a malicious DB writer with authority to erase all history.
+    {
+        const auto db2=std::string(dir)+"/reset-guard.db";
+        const SyncKey reset{"t","s","Counter","reset"},healthy{"t","s","Counter","healthy"};
+        {
+            SqliteActorSync store(db2);
+            store.activate(reset,1);store.activate(healthy,1);
+            assert(store.commit(reset,1,0,"first","1:1","counter","1","1").revision==1);
+        }
+        sqlite3* raw=nullptr;assert(sqlite3_open(db2.c_str(),&raw)==SQLITE_OK);
+        assert(sqlite3_exec(raw,"UPDATE sync_objects SET revision=0,schema_fp='',snapshot=X'' WHERE id='reset'",nullptr,nullptr,nullptr)==SQLITE_OK);
+        assert(sqlite3_changes(raw)==1);
+        {
+            SqliteActorSync store(db2);
+            auto reject=[](auto&& f){bool denied=false;try{f();}catch(const std::logic_error&){denied=true;}assert(denied);};
+            reject([&]{(void)store.snapshot(reset);});
+            reject([&]{store.activate(reset,2);});
+            reject([&]{(void)store.activate_next(reset);});
+            reject([&]{(void)store.lookup_receipt(reset,1,"first","1:1","counter");});
+            reject([&]{(void)store.commit(reset,1,0,"new","1:1","counter","1","1");});
+            assert(store.activate_next(healthy)==2);
+            assert(store.commit(healthy,2,0,"new","1:1","counter","1","1").revision==1);
+        }
+        sqlite3_stmt* p=nullptr;
+        assert(sqlite3_prepare_v2(raw,"SELECT epoch,revision FROM sync_objects WHERE id='reset'",-1,&p,nullptr)==SQLITE_OK);
+        assert(sqlite3_step(p)==SQLITE_ROW);
+        assert(sqlite3_column_int64(p,0)==1&&sqlite3_column_int64(p,1)==0);
+        assert(sqlite3_finalize(p)==SQLITE_OK);
+        assert(sqlite3_close(raw)==SQLITE_OK);
+    }
+    std::filesystem::remove_all(dir);
+}
