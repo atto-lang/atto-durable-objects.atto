@@ -58,6 +58,7 @@ async function compileJS() {
     assert.equal(snapshot.length,36);
     assert.equal(snapshot.readBigUInt64LE(9),0x46ec970556cc8237n);
     assert.equal(snapshot.readBigInt64LE(20),0n);
+    assert.equal(snapshot.toString('hex'),'4154544f53543031013782cc560597ec4601000100000000000000002b35b70ef92e387a');
     return {module,sha:hash(result.module_source),descriptor:hash(descriptor)};
 }
 function guest(n,op,d) {
@@ -75,7 +76,7 @@ function guest(n,op,d) {
 }
 async function turn(mode,tenant,id,epoch,request,op,delta,expected,expectedExit=0,guestCount=1) {
     const before=executed;
-    const child=spawn(driver,[mode,db,tenant,id,String(epoch),request,String(op),String(delta),'fixture-v1'],
+    const child=spawn(driver,[mode,db,tenant,id,String(epoch),request,String(op),String(delta),hybrid?'fixture-v2':'fixture-v1'],
       {stdio:['pipe','pipe','pipe']});
     let errors='', failure, requests=0;
     const lines=[];
