@@ -7,6 +7,8 @@ on:
       - 'native/include/ores/durable/counter_checkpoint_v1.hpp'
       - 'native/include/ores/durable/scalar_checkpoint_v1.hpp'
       - 'native/tests/scalar_checkpoint_v1_test.cpp'
+      - 'native/include/ores/durable/bounded_checkpoint_v2.hpp'
+      - 'native/tests/bounded_checkpoint_v2_test.cpp'
       - 'native/include/ores/durable/scalar_turn_v1.hpp'
       - 'native/tests/scalar_turn_v1_test.cpp'
       - 'native/tests/counter_checkpoint_v1_test.cpp'
@@ -62,7 +64,7 @@ jobs:
           ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" node tests/durable_counter_guest.mjs
       - name: Compile host driver and execute real guest-to-SQLite process test
         env:
-          STORAGE_SHA: 4aa6f849cac9441f47a8cba2c06f2fa966a8dadc
+          STORAGE_SHA: 43a8d8889df1d8712bf7d51d7d98261900a06303
           ATTO_COMPILER_SOURCE_SHA: 96664d383d8779e2f732648cee9e42aac71c08b1
         run: |
           set -euo pipefail
@@ -71,7 +73,7 @@ jobs:
           git -C "$RUNNER_TEMP/storage" checkout --detach FETCH_HEAD
           test "$(git -C "$RUNNER_TEMP/storage" rev-parse HEAD)" = "$STORAGE_SHA"
           git -C "$RUNNER_TEMP/storage" fsck --full
-          test "$(git -C "$RUNNER_TEMP/storage" rev-parse HEAD^{tree})" = fe9367328a5da937d3cb701ca24205b16f643e03
+          test "$(git -C "$RUNNER_TEMP/storage" rev-parse HEAD^{tree})" = 119895cdf73fb46ae71ed84ae04964d4ce6a64a8
           test -z "$(git -C "$RUNNER_TEMP/storage" status --porcelain)"
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev libssl-dev
@@ -122,7 +124,7 @@ jobs:
       - name: Execute host-only storage seam against pinned PR 9
         env:
           EXPECTED: ${{ github.event.pull_request.head.sha }}
-          STORAGE_SHA: 4aa6f849cac9441f47a8cba2c06f2fa966a8dadc
+          STORAGE_SHA: 43a8d8889df1d8712bf7d51d7d98261900a06303
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED"
@@ -133,7 +135,7 @@ jobs:
           git -C "$RUNNER_TEMP/storage" checkout --detach FETCH_HEAD
           test "$(git -C "$RUNNER_TEMP/storage" rev-parse HEAD)" = "$STORAGE_SHA"
           git -C "$RUNNER_TEMP/storage" fsck --full
-          test "$(git -C "$RUNNER_TEMP/storage" rev-parse HEAD^{tree})" = fe9367328a5da937d3cb701ca24205b16f643e03
+          test "$(git -C "$RUNNER_TEMP/storage" rev-parse HEAD^{tree})" = 119895cdf73fb46ae71ed84ae04964d4ce6a64a8
           test -z "$(git -C "$RUNNER_TEMP/storage" status --porcelain)"
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev libssl-dev
@@ -146,6 +148,8 @@ jobs:
           ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 timeout 30 "$RUNNER_TEMP/counter-checkpoint-test"
           g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Inative/include native/tests/scalar_checkpoint_v1_test.cpp -o "$RUNNER_TEMP/scalar-checkpoint-test"
           ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 timeout 30 "$RUNNER_TEMP/scalar-checkpoint-test"
+          g++ -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Inative/include native/tests/bounded_checkpoint_v2_test.cpp -o "$RUNNER_TEMP/bounded-checkpoint-test"
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 timeout 60 "$RUNNER_TEMP/bounded-checkpoint-test"
           g++ -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/scalar_turn_v1_test.cpp -lsqlite3 -o "$RUNNER_TEMP/scalar-turn-test"
           ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 timeout 60 "$RUNNER_TEMP/scalar-turn-test"
           g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
