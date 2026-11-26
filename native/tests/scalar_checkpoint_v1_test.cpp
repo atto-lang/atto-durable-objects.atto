@@ -57,6 +57,13 @@ int main(){
     rejects([&]{(void)ScalarCheckpointV1("Ledger",{{"a",static_cast<K>(9)}});});
     rejects([&]{(void)ScalarCheckpointV1("Other",{{"balance",K::Int},{"open",K::Bool},{"last",K::Int}}).decode(bytes);});
     rejects([&]{(void)ScalarCheckpointV1("Ledger",{{"last",K::Int},{"open",K::Bool},{"balance",K::Int}}).decode(bytes);});
+    // Four immutable vectors from atto-platform-conformance's existing
+    // contracts/actor-persistence-scalar-wire-v1.json (blob 863a9774e8c355abfd9d8f1258d5f5d53bc96434).
+    const ScalarCheckpointV1 shared("Counter",{{"count",K::Int},{"enabled",K::Bool}});
+    assert(hex(shared.encode({I(100),true}))=="4154544f5354303101c9a1af17fc8684bd020001640000000000000002018fd7fcf2f2744e29");
+    assert(hex(shared.encode({std::numeric_limits<I>::min(),false}))=="4154544f5354303101c9a1af17fc8684bd0200010000000000000080020058ebbfc357901b30");
+    assert(hex(ScalarCheckpointV1("EmptyActor",{}).encode({}))=="4154544f5354303101c3fbc65066197bff0000b3c015f0f5029da5");
+    assert(hex(ScalarCheckpointV1("OtherCounter",{{"count",K::Int}}).encode({I(100)}))=="4154544f53543031010201d7f4b9c36b6c0100016400000000000000eb0202552d636527");
     const ScalarCheckpointV1 empty("Empty",{});
     assert(empty.encode({}).size()==27&&empty.decode(empty.encode({})).empty());
     std::vector<ScalarCheckpointV1::Field> fields;
@@ -66,5 +73,5 @@ int main(){
     assert(maximum.encode(values).size()==2331&&maximum.decode(maximum.encode(values))==values);
     fields.push_back({"extra",K::Bool});
     rejects([&]{(void)ScalarCheckpointV1("Maximum",fields);});
-    std::cout<<"SCALAR_CHECKPOINT_V1_PASS roundtrips=10001 bitflips="<<bytes.size()*8<<" max_fields=256\n";
+    std::cout<<"SCALAR_CHECKPOINT_V1_PASS roundtrips=10001 bitflips="<<bytes.size()*8<<" max_fields=256 shared_golden=4\n";
 }
