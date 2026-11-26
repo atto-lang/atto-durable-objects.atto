@@ -1,6 +1,7 @@
 #pragma once
 
 #include <sqlite3.h>
+#include "ores/durable/snapshot_admission_v1.hpp"
 #include <cstddef>
 #include <charconv>
 #include <algorithm>
@@ -540,6 +541,7 @@ public:
             if (static_cast<std::size_t>(count.number(0)) > limits_.actor_keys_per_database)
                 throw std::length_error("actor key storage quota exhausted");
         }
+        (void)snapshot_locked(key); // deny corrupt revival before publishing epoch
         tx.commit();
     }
 
@@ -574,6 +576,7 @@ public:
             if (static_cast<std::size_t>(count.number(0)) > limits_.actor_keys_per_database)
                 throw std::length_error("actor key storage quota exhausted");
         }
+        (void)snapshot_locked(key); // deny corrupt revival before publishing epoch
         tx.commit();
         return epoch;
     }
@@ -1908,11 +1911,13 @@ private:
         s.text(i,key.tenant); s.text(i+1,key.name_space); s.text(i+2,key.actor_type); s.text(i+3,key.object_id);
     }
     SyncSnapshot snapshot_locked(const SyncKey& key) {
-        Statement s(db_, "SELECT epoch,revision,schema_fp,snapshot FROM sync_objects WHERE "
-                         "tenant=? AND space=? AND actor_type=? AND id=?");
+        Statement s(db_, snapshot_admission_v1::query);
         bind_key(s,key);
         if (s.step()!=SQLITE_ROW) throw std::logic_error("sync actor missing");
-        return {s.number(0),s.number(1),s.str(2),s.blob(3)};
+        SyncSnapshot result{s.number(0),s.number(1),s.str(2),s.blob(3)};
+        snapshot_admission_v1::validate(result.epoch,result.revision,result.schema,result.bytes,
+                                       s.number(4),s.number(5)!=0);
+        return result;
     }
     std::int64_t projection_required_epoch_locked(std::string_view consumer,
                                                    const SyncKey& key) {
