@@ -30,7 +30,8 @@ int main(int argc,char** argv) {
         const auto epoch=number(argv[5]);
         const auto op=number(argv[7]);
         const auto delta=number(argv[8]);
-        if (std::string_view(argv[9])!="fixture-v1") throw std::invalid_argument("fixture protocol");
+        const bool canonical=std::string_view(argv[9])=="fixture-v2";
+        if (!canonical && std::string_view(argv[9])!="fixture-v1") throw std::invalid_argument("fixture protocol");
         SqliteActorSync store(argv[2]);
         if (mode=="activate") {
             store.activate(key,epoch);
@@ -48,7 +49,8 @@ int main(int argc,char** argv) {
             }
             throw std::runtime_error("guest result missing");
         };
-        auto result=CounterTurn::run(store,key,epoch,argv[6],op,delta,run_guest,mode=="rollback");
+        auto result=canonical?CounterTurn::run_canonical(store,key,epoch,argv[6],op,delta,run_guest,mode=="rollback"):
+            CounterTurn::run(store,key,epoch,argv[6],op,delta,run_guest,mode=="rollback");
         if (!result) {
             std::cout<<"REJECTED\n"<<std::flush;
             return 0;
