@@ -9,6 +9,7 @@ on:
       - 'native/tests/scalar_checkpoint_v1_test.cpp'
       - 'native/include/ores/durable/bounded_checkpoint_v2.hpp'
       - 'native/tests/bounded_checkpoint_v2_test.cpp'
+      - 'native/tests/bounded_v2_utf8_adversarial.cpp'
       - 'native/include/ores/durable/scalar_turn_v1.hpp'
       - 'native/tests/scalar_turn_v1_test.cpp'
       - 'native/tests/bounded_turn_v2_test.cpp'
@@ -151,6 +152,8 @@ jobs:
           ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 timeout 30 "$RUNNER_TEMP/scalar-checkpoint-test"
           g++ -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Inative/include native/tests/bounded_checkpoint_v2_test.cpp -o "$RUNNER_TEMP/bounded-checkpoint-test"
           ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 timeout 60 "$RUNNER_TEMP/bounded-checkpoint-test"
+          g++ -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Inative/include native/tests/bounded_v2_utf8_adversarial.cpp -o "$RUNNER_TEMP/bounded-utf8-test"
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 timeout 60 "$RUNNER_TEMP/bounded-utf8-test"
           g++ -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/scalar_turn_v1_test.cpp -lsqlite3 -o "$RUNNER_TEMP/scalar-turn-test"
           ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 timeout 60 "$RUNNER_TEMP/scalar-turn-test"
           g++ -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/bounded_turn_v2_test.cpp -lsqlite3 -o "$RUNNER_TEMP/bounded-turn-test"
