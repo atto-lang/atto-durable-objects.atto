@@ -1,4 +1,5 @@
 #pragma once
+#include "ores/durable/counter_checkpoint_v1.hpp"
 #include "ores/durable/actor_sync.hpp" // prerequisite: durable objects PR #9
 #include <charconv>
 #include <cstdint>
@@ -115,6 +116,50 @@ public:
         (void)decode(receipt.reply);
         return receipt;
     }
+    // Separate opt-in canonical checkpoint lane. Do not reinterpret the
+    // existing decimal prototype, or admit its mail/alarm envelopes here.
+    // Caller still owns the exclusive permit for the whole durable turn.
+    template<class Guest>
+    static std::optional<SyncCommit> run_canonical(SqliteActorSync& store,const SyncKey& key,
+            std::int64_t epoch,std::string_view request_id,std::int64_t op,std::int64_t delta,
+            Guest&& guest,bool inject_precommit_failure=false) {
+        if(key.actor_type!="Counter" || (op!=1 && op!=2) ||
+           (op==1 && (delta<=0 || delta>maximum)) || (op==2 && delta!=0))
+            throw std::invalid_argument("invalid canonical counter command");
+        const auto command=std::to_string(op)+":"+std::to_string(delta);
+        const auto snapshot=store.snapshot(key);
+        if(snapshot.epoch!=epoch)throw std::logic_error("stale writer epoch");
+        if(snapshot.revision<0)throw std::logic_error("invalid counter revision");
+        std::int64_t committed=0;
+        if(snapshot.revision==0) {
+            if(!snapshot.schema.empty()||!snapshot.bytes.empty())
+                throw std::logic_error("invalid uninitialized canonical checkpoint");
+        } else {
+            if(snapshot.schema!=CounterCheckpointV1::schema)
+                throw std::logic_error("counter schema migration required");
+            committed=CounterCheckpointV1::decode(snapshot.bytes);
+        }
+        // Even duplicate responses cannot launder a corrupt checkpoint.
+        if(auto prior=store.lookup_receipt(key,epoch,request_id,command,CounterCheckpointV1::schema)) {
+            if(prior->revision<=0||prior->revision>snapshot.revision)
+                throw std::logic_error("invalid canonical receipt revision");
+            (void)decode(prior->reply);
+            return prior;
+        }
+        const auto next=guest(committed,op,delta);
+        if(op==1 && delta>maximum-committed) {
+            if(next!=-1)throw std::logic_error("invalid guest transition");
+            return std::nullopt;
+        }
+        if(next!=(op==2?committed:committed+delta))
+            throw std::logic_error("invalid guest transition");
+        auto receipt=store.commit(key,epoch,snapshot.revision,request_id,command,
+            CounterCheckpointV1::schema,CounterCheckpointV1::encode(next),
+            std::to_string(next),inject_precommit_failure);
+        (void)decode(receipt.reply);
+        return receipt;
+    }
+
     // Durable command encoding is canonical and bounded before guest entry.
     template<class Guest>
     static std::optional<SyncCommit> run_mail(SqliteActorSync& store,const SyncMail& mail,
