@@ -13,6 +13,8 @@ on:
       - 'native/include/ores/durable/scalar_turn_v1.hpp'
       - 'native/tests/scalar_turn_v1_test.cpp'
       - 'native/tests/bounded_turn_v2_test.cpp'
+      - 'native/tests/bounded_receive_guest_driver.cpp'
+      - 'tests/durable_bounded_receive_process_e2e.mjs'
       - 'native/tests/counter_checkpoint_v1_test.cpp'
       - 'native/tests/counter_turn_test.cpp'
       - 'native/include/ores/durable/counter_directory.hpp'
@@ -158,6 +160,15 @@ jobs:
           ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 timeout 60 "$RUNNER_TEMP/scalar-turn-test"
           g++ -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/bounded_turn_v2_test.cpp -lsqlite3 -o "$RUNNER_TEMP/bounded-turn-test"
           ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 timeout 60 "$RUNNER_TEMP/bounded-turn-test"
+          git init "$RUNNER_TEMP/receive-js"
+          GIT_TERMINAL_PROMPT=0 git -C "$RUNNER_TEMP/receive-js" -c credential.helper= fetch --depth=1 https://github.com/atto-lang/atto-source.js.git fb6d8c92d37aa2a105c9c2340fd1f9bc9ef6f64b
+          git -C "$RUNNER_TEMP/receive-js" checkout --detach FETCH_HEAD
+          git -C "$RUNNER_TEMP/receive-js" fsck --full
+          test "$(git -C "$RUNNER_TEMP/receive-js" rev-parse HEAD)" = fb6d8c92d37aa2a105c9c2340fd1f9bc9ef6f64b
+          test "$(git -C "$RUNNER_TEMP/receive-js" rev-parse HEAD^{tree})" = 743db81257e7cfca5330fd7905d8323ae2885edf
+          test -z "$(git -C "$RUNNER_TEMP/receive-js" status --porcelain)"
+          g++ -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/bounded_receive_guest_driver.cpp -lsqlite3 -o "$RUNNER_TEMP/bounded-receive-driver"
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ATTO_JS_RECEIVE_COMPILER="$RUNNER_TEMP/receive-js/src/durable-bounded-receive-v2.mjs" ATTO_BOUNDED_DRIVER="$RUNNER_TEMP/bounded-receive-driver" node tests/durable_bounded_receive_process_e2e.mjs
           g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
             -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/counter_directory_test.cpp \
             -lsqlite3 -o "$RUNNER_TEMP/counter-directory-test"
