@@ -5,6 +5,8 @@ on:
       - 'guest/**'
       - 'native/include/ores/durable/counter_turn.hpp'
       - 'native/include/ores/durable/counter_checkpoint_v1.hpp'
+      - 'native/include/ores/durable/scalar_checkpoint_v1.hpp'
+      - 'native/tests/scalar_checkpoint_v1_test.cpp'
       - 'native/tests/counter_checkpoint_v1_test.cpp'
       - 'native/tests/counter_turn_test.cpp'
       - 'native/include/ores/durable/counter_directory.hpp'
@@ -136,6 +138,8 @@ jobs:
           echo 'HOST_ONLY_COUNTER_TURN_PASS'
           g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Inative/include native/tests/counter_checkpoint_v1_test.cpp -o "$RUNNER_TEMP/counter-checkpoint-test"
           ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 timeout 30 "$RUNNER_TEMP/counter-checkpoint-test"
+          g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Inative/include native/tests/scalar_checkpoint_v1_test.cpp -o "$RUNNER_TEMP/scalar-checkpoint-test"
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 timeout 30 "$RUNNER_TEMP/scalar-checkpoint-test"
           g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
             -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/counter_directory_test.cpp \
             -lsqlite3 -o "$RUNNER_TEMP/counter-directory-test"
