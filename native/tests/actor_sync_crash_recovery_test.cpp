@@ -1089,5 +1089,37 @@ int main() {
         assert(full);
         one.reserve_guest_start("crash",2200);
     }
+    // Contradictory reset of snapshot must not be treated as first spawn.
+    // Independent connection simulates a partial administrative repair,
+    // not a malicious DB writer with authority to erase all history.
+    {
+        const auto db2=std::string(dir)+"/reset-guard.db";
+        const SyncKey reset{"t","s","Counter","reset"},healthy{"t","s","Counter","healthy"};
+        {
+            SqliteActorSync store(db2);
+            store.activate(reset,1);store.activate(healthy,1);
+            assert(store.commit(reset,1,0,"first","1:1","counter","1","1").revision==1);
+        }
+        sqlite3* raw=nullptr;assert(sqlite3_open(db2.c_str(),&raw)==SQLITE_OK);
+        assert(sqlite3_exec(raw,"UPDATE sync_objects SET revision=0,schema_fp='',snapshot=X'' WHERE id='reset'",nullptr,nullptr,nullptr)==SQLITE_OK);
+        assert(sqlite3_changes(raw)==1);
+        {
+            SqliteActorSync store(db2);
+            auto reject=[](auto&& f){bool denied=false;try{f();}catch(const std::logic_error&){denied=true;}assert(denied);};
+            reject([&]{(void)store.snapshot(reset);});
+            reject([&]{store.activate(reset,2);});
+            reject([&]{(void)store.activate_next(reset);});
+            reject([&]{(void)store.lookup_receipt(reset,1,"first","1:1","counter");});
+            reject([&]{(void)store.commit(reset,1,0,"new","1:1","counter","1","1");});
+            assert(store.activate_next(healthy)==2);
+            assert(store.commit(healthy,2,0,"new","1:1","counter","1","1").revision==1);
+        }
+        sqlite3_stmt* p=nullptr;
+        assert(sqlite3_prepare_v2(raw,"SELECT epoch,revision FROM sync_objects WHERE id='reset'",-1,&p,nullptr)==SQLITE_OK);
+        assert(sqlite3_step(p)==SQLITE_ROW);
+        assert(sqlite3_column_int64(p,0)==1&&sqlite3_column_int64(p,1)==0);
+        assert(sqlite3_finalize(p)==SQLITE_OK);
+        assert(sqlite3_close(raw)==SQLITE_OK);
+    }
     std::filesystem::remove_all(dir);
 }
