@@ -77,5 +77,48 @@ int main() {
     }
     for(const auto* bad: {"","00","-1","+1","1000000001","1x"})
         rejects([&]{(void)CounterTurn::decode(bad);});
+    // Canonical lane must store binary bytes in SQLite, not merely compare
+    // guest descriptors. Legacy state remains untouched and cannot migrate
+    // by switching the compiler/profile on a live identity.
+    const SyncKey binary{"a","counters","Counter","binary"};
+    {
+        SqliteActorSync store(db);
+        store.activate(binary,1);
+        rejects([&]{CounterTurn::run_canonical(store,key,2,"legacy",2,0,never);});
+        auto first=CounterTurn::run_canonical(store,binary,1,"one",1,42,transition);
+        assert(first && first->reply=="42" && first->revision==1);
+        assert(store.snapshot(binary).schema==CounterCheckpointV1::schema);
+        assert(store.snapshot(binary).bytes==CounterCheckpointV1::encode(42));
+        assert(store.changes_after(binary,0).at(0).bytes==CounterCheckpointV1::encode(42));
+        rejects([&]{CounterTurn::run(store,binary,1,"legacy",2,0,never);});
+        bool failed=false;
+        try {CounterTurn::run_canonical(store,binary,1,"rollback",1,1,transition,true);}
+        catch(const std::runtime_error&){failed=true;}
+        assert(failed && store.snapshot(binary).bytes==CounterCheckpointV1::encode(42));
+        assert(!store.lookup_receipt(binary,1,"rollback","1:1",CounterCheckpointV1::schema));
+    }
+    {
+        SqliteActorSync store(db);
+        store.activate(binary,2);
+        rejects([&]{CounterTurn::run_canonical(store,binary,1,"one",1,42,never);});
+        auto replay=CounterTurn::run_canonical(store,binary,2,"one",1,42,never);
+        assert(replay && replay->duplicate && replay->reply=="42");
+        auto next=CounterTurn::run_canonical(store,binary,2,"two",1,1,transition);
+        assert(next && next->reply=="43");
+    }
+    // Mutate bytes via an independent SQLite connection; existing receipt
+    // must not mask a corrupt durable checkpoint.
+    sqlite3* raw=nullptr;
+    assert(sqlite3_open(db.c_str(),&raw)==SQLITE_OK);
+    assert(sqlite3_exec(raw,"UPDATE sync_objects SET snapshot=zeroblob(36) WHERE tenant='a' AND space='counters' AND actor_type='Counter' AND id='binary'",nullptr,nullptr,nullptr)==SQLITE_OK);
+    assert(sqlite3_changes(raw)==1);
+    assert(sqlite3_close(raw)==SQLITE_OK);
+    {
+        SqliteActorSync store(db);
+        auto not_called=[](I,I,I)->I{assert(false);return -1;};
+        rejects([&]{CounterTurn::run_canonical(store,binary,2,"one",1,42,not_called);});
+        rejects([&]{CounterTurn::run_canonical(store,binary,2,"three",1,1,not_called);});
+        assert(store.snapshot(binary).revision==2);
+    }
     std::filesystem::remove_all(dir);
 }
