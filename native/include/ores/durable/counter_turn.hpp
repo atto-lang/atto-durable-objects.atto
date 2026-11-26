@@ -140,10 +140,12 @@ public:
             committed=CounterCheckpointV1::decode(snapshot.bytes);
         }
         // Even duplicate responses cannot launder a corrupt checkpoint.
-        if(auto prior=store.lookup_receipt(key,epoch,request_id,command,CounterCheckpointV1::schema)) {
+        if(auto prior=store.lookup_receipt(key,epoch,request_id,command,CounterCheckpointV1::schema,nullptr,&snapshot)) {
             if(prior->revision<=0||prior->revision>snapshot.revision)
                 throw std::logic_error("invalid canonical receipt revision");
-            (void)decode(prior->reply);
+            const auto replayed=decode(prior->reply);
+            if(prior->revision==snapshot.revision&&replayed!=committed)
+                throw std::logic_error("canonical receipt conflicts with checkpoint");
             return prior;
         }
         const auto next=guest(committed,op,delta);
@@ -155,8 +157,9 @@ public:
             throw std::logic_error("invalid guest transition");
         auto receipt=store.commit(key,epoch,snapshot.revision,request_id,command,
             CounterCheckpointV1::schema,CounterCheckpointV1::encode(next),
-            std::to_string(next),inject_precommit_failure);
-        (void)decode(receipt.reply);
+            std::to_string(next),inject_precommit_failure,nullptr,0,nullptr,nullptr,&snapshot);
+        if(receipt.duplicate||receipt.revision!=snapshot.revision+1||decode(receipt.reply)!=next)
+            throw std::logic_error("unexpected canonical commit receipt");
         return receipt;
     }
 
