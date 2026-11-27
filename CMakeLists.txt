@@ -26,11 +26,25 @@ if(BUILD_TESTING)
   add_executable(durable_isolate_queues_test native/tests/durable_isolate_queues_test.cpp)
   target_link_libraries(durable_isolate_queues_test PRIVATE ores_durable_objects)
   target_compile_options(durable_isolate_queues_test PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror;-UNDEBUG>)
   add_executable(durable_persisted_fence_guard_test native/tests/durable_persisted_fence_guard_test.cpp)
   target_link_libraries(durable_persisted_fence_guard_test PRIVATE ores_durable_objects)
   target_compile_options(durable_persisted_fence_guard_test PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror;-UNDEBUG>)
+  add_executable(durable_tenant_fault_quarantine_test native/tests/durable_tenant_fault_quarantine_test.cpp)
+  target_link_libraries(durable_tenant_fault_quarantine_test PRIVATE ores_durable_objects)
+  target_compile_options(durable_tenant_fault_quarantine_test PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror;-UNDEBUG>)
+  add_test(NAME durable_tenant_fault_quarantine COMMAND durable_tenant_fault_quarantine_test)
+  set_tests_properties(durable_tenant_fault_quarantine PROPERTIES TIMEOUT 30)
+  # Separate executable: VFS registration is SQLite process-global; the
+  # test uses a single tenant-selected WAL interception without guest code.
+  add_executable(durable_sqlite_vfs_fault_test native/tests/durable_sqlite_vfs_fault_test.cpp)
+  target_link_libraries(durable_sqlite_vfs_fault_test PRIVATE ores_durable_objects)
+  target_compile_options(durable_sqlite_vfs_fault_test PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror;-UNDEBUG>)
+  add_test(NAME durable_sqlite_vfs_fault COMMAND durable_sqlite_vfs_fault_test)
+  set_tests_properties(durable_sqlite_vfs_fault PROPERTIES TIMEOUT 30)
   add_test(NAME durable_persisted_fence_guard COMMAND durable_persisted_fence_guard_test)
   add_test(NAME durable_isolate_queues COMMAND durable_isolate_queues_test)
   set_tests_properties(durable_isolate_queues PROPERTIES TIMEOUT 30)

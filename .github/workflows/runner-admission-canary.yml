@@ -1,0 +1,25 @@
+# No checkout, no private source, no secrets, and no repository token.
+# A positive executed step proves only runner admission, never native correctness.
+name: Durable source-free runner admission
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/runner-admission-canary.yml'
+  workflow_dispatch:
+permissions: {}
+jobs:
+  admission:
+    name: No-checkout runner admission
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Prove runner has started execution
+        shell: bash
+        env:
+          EXPECTED_RUN_ID: ${{ github.run_id }}
+          EXPECTED_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_RUN_ID"
+          test -n "$EXPECTED_ATTEMPT"
+          printf 'RUNNER_ADMISSION_STEP_EXECUTED run=%s attempt=%s\n' "$EXPECTED_RUN_ID" "$EXPECTED_ATTEMPT"

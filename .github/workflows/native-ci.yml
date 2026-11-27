@@ -5,10 +5,51 @@ on:
       - 'native/**'
       - 'CMakeLists.txt'
       - '.github/workflows/native-ci.yml'
+      - 'scripts/**'
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
+  # This job has NO checkout, secrets, private source or repository token.
+  # Use its executed-step receipt only to establish hosted-runner admission.
+  runner-admission:
+    name: No-checkout runner admission
+    runs-on: ubuntu-24.04
+    permissions: {}
+    timeout-minutes: 2
+    steps:
+      - name: Verify hosted runner started
+        shell: bash
+        env:
+          EXPECTED_RUN_ID: ${{ github.run_id }}
+          EXPECTED_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_RUN_ID"
+          test -n "$EXPECTED_ATTEMPT"
+          printf 'RUNNER_ADMISSION_STEP_EXECUTED run=%s attempt=%s\n' "$EXPECTED_RUN_ID" "$EXPECTED_ATTEMPT"
+  # This runs a disposable five-test CMake project, never the native runtime.
+  # Its success certifies only the verification harness, not the private code.
+  verifier-contract:
+    name: Source-free verifier contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact tree
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          bash scripts/verify-native-tree.sh .
+      - name: Test verifier success and fail-closed contracts (source-free fixture)
+        run: |
+          set -euo pipefail
+          bash scripts/tests/verify-native-runner-contract.sh
   address-undefined:
     name: ${{ matrix.compiler }} ASan + UBSan
     runs-on: ubuntu-latest
@@ -27,7 +68,7 @@ jobs:
           EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-          test -z "$(git status --porcelain --untracked-files=all)"
+          bash scripts/verify-native-tree.sh .
           git ls-tree -r HEAD native CMakeLists.txt
       - name: Install system SQLite development headers
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
@@ -38,12 +79,51 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1
         run: |
           set -euo pipefail
-          "$CXX" -std=c++17 -pthread -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG \
-            -fno-omit-frame-pointer -fsanitize=address,undefined \
-            -Inative/include native/tenant_runtime.cpp native/tests/durable_isolate_queues_test.cpp \
-            -lsqlite3 -o "$RUNNER_TEMP/durable-native-test"
-          "$RUNNER_TEMP/durable-native-test"
+          for test_name in durable_isolate_queues_test durable_tenant_fault_quarantine_test durable_sqlite_vfs_fault_test; do
+            "$CXX" -std=c++17 -pthread -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG \
+              -fno-omit-frame-pointer -fsanitize=address,undefined \
+              -Inative/include native/tenant_runtime.cpp "native/tests/$test_name.cpp" \
+              -lsqlite3 -o "$RUNNER_TEMP/$test_name"
+            "$RUNNER_TEMP/$test_name"
+          done
           echo "EXACT_HEAD_NATIVE_ASAN_UBSAN_PASS=${{ github.event.pull_request.head.sha || github.sha }}"
+  native-ctest:
+    name: Native CTest ${{ matrix.build_type }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact checkout
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          bash scripts/verify-native-tree.sh .
+      - name: Build and execute assert-enabled CTest
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+          cmake -S . -B "$RUNNER_TEMP/durable-ctest" -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          cmake --build "$RUNNER_TEMP/durable-ctest" --parallel 2
+          ctest --test-dir "$RUNNER_TEMP/durable-ctest" --show-only > "$RUNNER_TEMP/ctest-discovery.txt"
+          cat "$RUNNER_TEMP/ctest-discovery.txt"
+          test "$(grep -Ec '^[[:space:]]*Test[[:space:]]*#[0-9]+:' "$RUNNER_TEMP/ctest-discovery.txt")" -eq 5
+          grep -Eq 'Total Tests: 5$' "$RUNNER_TEMP/ctest-discovery.txt"
+          for name in sqlite_durable_storage_test durable_isolate_queues durable_persisted_fence_guard durable_tenant_fault_quarantine durable_sqlite_vfs_fault; do
+            grep -Eq "^[[:space:]]*Test[[:space:]]*#[0-9]+:[[:space:]]+$name$" "$RUNNER_TEMP/ctest-discovery.txt"
+          done
+          ctest --test-dir "$RUNNER_TEMP/durable-ctest" --output-on-failure --verbose
+          echo "EXACT_HEAD_CTEST_${{ matrix.build_type }}_PASS=$EXPECTED_SHA"
   thread-sanitizer:
     name: GCC ThreadSanitizer
     runs-on: ubuntu-latest
@@ -60,11 +140,13 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-          test -z "$(git status --porcelain --untracked-files=all)"
+          bash scripts/verify-native-tree.sh .
           sudo apt-get update && sudo apt-get install -y libsqlite3-dev
-          g++ -std=c++17 -pthread -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG \
-            -fno-omit-frame-pointer -fsanitize=thread -Inative/include \
-            native/tenant_runtime.cpp native/tests/durable_isolate_queues_test.cpp \
-            -lsqlite3 -o "$RUNNER_TEMP/durable-native-tsan"
-          "$RUNNER_TEMP/durable-native-tsan"
+          for test_name in durable_isolate_queues_test durable_tenant_fault_quarantine_test durable_sqlite_vfs_fault_test; do
+            g++ -std=c++17 -pthread -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG \
+              -fno-omit-frame-pointer -fsanitize=thread -Inative/include \
+              native/tenant_runtime.cpp "native/tests/$test_name.cpp" \
+              -lsqlite3 -o "$RUNNER_TEMP/$test_name-tsan"
+            "$RUNNER_TEMP/$test_name-tsan"
+          done
           echo "EXACT_HEAD_NATIVE_TSAN_PASS=$EXPECTED_SHA"

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <sqlite3.h>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -10,6 +11,8 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace ores::durable {
 
@@ -26,6 +29,30 @@ struct Limits {
 };
 
 enum class EnqueueStatus { Accepted, Duplicate, LockFull, TenantFull };
+
+// These are host-only diagnostic bit flags, not a guest API. A nonzero value
+// quarantines this tenant for the lifetime of the runtime. No auto-unquarantine.
+enum TenantIncident : unsigned {
+    NoIncident = 0,
+    RetryStorageFailure = 1u << 0,
+    AckStorageFailure = 1u << 1,
+    RollbackStorageFailure = 1u << 2,
+    SqliteCloseFailure = 1u << 3,
+    LockUnlockFailure = 1u << 4,
+    FileCloseFailure = 1u << 5,
+    AdmissionStorageFailure = 1u << 6,
+    ClaimStorageFailure = 1u << 7,
+    ReadStorageFailure = 1u << 8
+};
+
+// Test-only fault seam at the trusted host's SQLite/POSIX call boundaries.
+// Synthetic failures exercise containment; they are not SQLite VFS I/O receipts.
+enum class StorageFaultPoint {
+    None, EnqueueBeforeCommit, ClaimBeforeCommit, RetryBeforeWrite, RetryBeforeCommit,
+    AckBeforeWrite, AckBeforeCommit,
+    Rollback, SqliteClose, LockUnlock, FileClose, ReadState, PendingQuery,
+    IncidentUnlink, IncidentDirSync, IncidentGuardRelease
+};
 struct Receipt {
     EnqueueStatus status;
     std::int64_t sequence;
@@ -46,6 +73,7 @@ public:
         explicit TenantHandle(const std::shared_ptr<Tenant>& t);
     public:
         TenantHandle() = default;
+        unsigned incident_flags() const noexcept; // nonzero means quarantined
     };
 
     class Lease final {
@@ -77,7 +105,13 @@ public:
     TenantRuntime(const TenantRuntime&) = delete;
     TenantRuntime& operator=(const TenantRuntime&) = delete;
     TenantHandle open_tenant(const std::string& tenant_id);
+    // Trusted supervisor-only recovery; never call automatically on restart.
+    TenantHandle recover_tenant(const std::string& tenant_id);
     void close_tenant(const TenantHandle&); // leaves persisted queues for restart
+    // Trusted test harness only: never expose to Oreslang guest code.
+    void inject_fault_for_test(const TenantHandle&, StorageFaultPoint, int sqlite_code = SQLITE_IOERR);
+    // Host supervisor polls this outside noexcept teardown. Never a guest callback.
+    std::vector<std::pair<std::string, unsigned>> quarantined_tenants() const;
 
     Receipt enqueue(const TenantHandle&, const std::string& object_id,
                     const std::string& lock_id, const std::string& request_id,
@@ -95,6 +129,10 @@ private:
         sqlite3* db = nullptr;
         int lock_fd = -1; // POSIX per-tenant OS-process singleton fence
         bool accepting = true;
+        std::atomic<unsigned> incidents{NoIncident};
+        StorageFaultPoint fault_point = StorageFaultPoint::None; // guarded by Core::mu
+        int fault_code = SQLITE_IOERR;
+        void quarantine(unsigned bit) noexcept { incidents.fetch_or(bit, std::memory_order_relaxed); }
         std::unordered_map<std::string, std::int64_t> active; // one per lock_id
         Tenant(std::string key, std::uint64_t gen) : id(std::move(key)), generation(gen) {}
         ~Tenant() noexcept;
@@ -108,9 +146,11 @@ private:
         Core(std::filesystem::path p, Limits l) : root(std::move(p)), limits(l) {}
     };
     std::shared_ptr<Core> core_;
+    TenantHandle open_impl(const std::string& tenant_id, bool supervised_recovery);
     static std::shared_ptr<Tenant> check_tenant(const Core&, const TenantHandle&);
     static std::shared_ptr<Tenant> check_lease(const Core&, const Lease&);
     static void retry_locked(Core&, Lease&);
+    static void inject_sqlite_fault(Tenant&, StorageFaultPoint);
 };
 
 } // namespace ores::durable
