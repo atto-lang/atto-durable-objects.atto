@@ -38,6 +38,69 @@ int main() {
         try { (void)restarted.open_tenant("t"); }
         catch (const std::overflow_error&) { refused = true; }
         assert(refused);
+
+        // Each independently corrupted tenant must be rejected on recovery,
+        // rather than leaving invisible jobs or allowing lock reassignment.
+        const auto reject_corrupt = [&](const std::string& name, const char* mutation) {
+            const auto isolated = root / name;
+            {
+                TenantRuntime seeded(isolated);
+                auto tenant = seeded.open_tenant("t");
+                assert(seeded.enqueue(tenant,"obj","lock","req","data").status
+                       == EnqueueStatus::Accepted);
+                seeded.close_tenant(tenant);
+            }
+            const auto db_file = isolated / "tenant-74.sqlite"; // hex("t")
+            sqlite3* damaged = nullptr;
+            assert(sqlite3_open_v2(db_file.c_str(), &damaged, SQLITE_OPEN_READWRITE,
+                                   nullptr) == SQLITE_OK);
+            assert(sqlite3_exec(damaged, mutation, nullptr, nullptr, nullptr) == SQLITE_OK);
+            assert(sqlite3_close(damaged) == SQLITE_OK);
+            TenantRuntime restarted_case(isolated);
+            bool rejected = false;
+            try { (void)restarted_case.open_tenant("t"); }
+            catch (const std::runtime_error&) { rejected = true; }
+            assert(rejected);
+        };
+        reject_corrupt("invalid-status", "UPDATE jobs SET status=7");
+        reject_corrupt("negative-fence", "UPDATE jobs SET fence=-1");
+        reject_corrupt("negative-attempt", "UPDATE jobs SET attempt=-1");
+        reject_corrupt("negative-version", "UPDATE objects SET version=-1");
+        reject_corrupt("foreign-lock", "UPDATE jobs SET lock_id='wrong'");
+        reject_corrupt("missing-object", "UPDATE jobs SET object_id='missing'");
+        // SQLite's INTEGER affinity accepts huge REAL values without
+        // raising a constraint error; all persisted counters must remain
+        // actual INTEGER storage before the native runtime reads int64.
+        reject_corrupt("real-status", "UPDATE jobs SET status=1e100");
+        reject_corrupt("real-fence", "UPDATE jobs SET fence=1e100");
+        reject_corrupt("real-attempt", "UPDATE jobs SET attempt=1e100");
+        reject_corrupt("real-version", "UPDATE objects SET version=1e100");
+        reject_corrupt("real-dedupe-sequence", "UPDATE dedupe SET seq=1e100");
+        // A recovered active claim needs a further increment for the
+        // next claim; refuse values that would create a permanently
+        // unclaimable persisted queue after startup.
+        reject_corrupt("near-overflow-active",
+                       "UPDATE jobs SET status=1,fence=9223372036854775805");
+        reject_corrupt("near-overflow-pending",
+                       "UPDATE jobs SET status=0,fence=9223372036854775806");
+
+        // Pending jobs and idempotency receipts must refer to exactly the
+        // same request, sequence, object, lock and payload. Completed jobs
+        // legitimately retain dedupe records without an active queue row.
+        reject_corrupt("missing-receipt", "DELETE FROM dedupe");
+        reject_corrupt("incorrect-receipt-seq", "UPDATE dedupe SET seq=2");
+        reject_corrupt("incorrect-receipt-payload",
+                       "UPDATE dedupe SET payload=X'11'");
+        reject_corrupt("incorrect-receipt-object",
+                       "UPDATE dedupe SET object_id='other'");
+        reject_corrupt("incorrect-receipt-lock",
+                       "UPDATE dedupe SET lock_id='wrong'");
+        reject_corrupt("incorrect-receipt-request",
+                       "UPDATE dedupe SET request_id='other'");
+        reject_corrupt("negative-job-sequence", "UPDATE jobs SET seq=-1");
+        reject_corrupt("receipt-aliases-another-job",
+                       "INSERT INTO dedupe(request_id,seq,object_id,lock_id,payload) "
+                       "VALUES('forged',1,'obj','lock',X'00')");
     } catch (...) {
         std::filesystem::remove_all(root);
         throw;

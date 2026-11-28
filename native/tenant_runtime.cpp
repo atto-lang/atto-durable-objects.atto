@@ -88,6 +88,9 @@ void schema(sqlite3* db) {
     sql(db,"PRAGMA journal_mode=WAL");
     sql(db,"PRAGMA synchronous=FULL");
     sql(db,"PRAGMA foreign_keys=ON");
+    // Validate, requeue and promote the schema in one atomic WAL transaction.
+    // A failed admission must never leave a partially recovered queue.
+    Tx startup_tx(db);
     if (scalar(db,"PRAGMA user_version") > 1) throw std::runtime_error("unsupported durable schema");
     sql(db,"CREATE TABLE IF NOT EXISTS objects("
            "object_id TEXT PRIMARY KEY,lock_id TEXT NOT NULL,version INTEGER NOT NULL DEFAULT 0,state BLOB NOT NULL DEFAULT X'')");
@@ -99,15 +102,54 @@ void schema(sqlite3* db) {
     sql(db,"CREATE TABLE IF NOT EXISTS dedupe("
            "request_id TEXT PRIMARY KEY, seq INTEGER NOT NULL,object_id TEXT NOT NULL,"
            "lock_id TEXT NOT NULL,payload BLOB NOT NULL)");
-    sql(db,"PRAGMA user_version=1");
+    // Fail closed on malformed persistent metadata instead of silently
+    // hiding unreachable queue entries or reviving a job under another lock.
+    // Read-only validation precedes recovery so an invalid file is not
+    // partially repaired and accidentally promoted to an active tenant.
+    // SQLite INTEGER affinity does not guarantee integer storage: very
+    // large REAL values are allowed and must never reach sqlite3_column_int64.
+    if (scalar(db,"SELECT COUNT(*) FROM jobs WHERE "
+                  "status NOT IN (0,1) OR fence<0 OR attempt<0 OR "
+                  "typeof(status)!='integer' OR typeof(fence)!='integer' OR "
+                  "typeof(attempt)!='integer'") != 0)
+        throw std::runtime_error("invalid persisted durable job metadata");
+    if (scalar(db,"SELECT COUNT(*) FROM objects WHERE "
+                  "version<0 OR typeof(version)!='integer'") != 0)
+        throw std::runtime_error("invalid persisted durable object version");
+    if (scalar(db,"SELECT COUNT(*) FROM dedupe WHERE "
+                  "seq<=0 OR typeof(seq)!='integer'") != 0)
+        throw std::runtime_error("invalid persisted durable dedupe sequence");
+    if (scalar(db,"SELECT COUNT(*) FROM jobs AS j "
+                  "LEFT JOIN objects AS o ON o.object_id=j.object_id "
+                  "WHERE o.object_id IS NULL OR o.lock_id<>j.lock_id") != 0)
+        throw std::runtime_error("persisted durable job has invalid object lock");
+    // Every pending job must have an identical idempotency receipt. A
+    // completed job may keep its receipt after its queue row is deleted.
+    if (scalar(db,"SELECT COUNT(*) FROM jobs AS j "
+                  "LEFT JOIN dedupe AS d ON d.request_id=j.request_id "
+                  "WHERE j.seq<=0 OR d.request_id IS NULL OR d.seq<>j.seq "
+                  "OR d.object_id<>j.object_id OR d.lock_id<>j.lock_id "
+                  "OR d.payload<>j.payload") != 0)
+        throw std::runtime_error("persisted durable job/receipt mismatch");
+    // A historical receipt must never point at a different live job, even
+    // if its own original job has already been ACKed and removed.
+    if (scalar(db,"SELECT COUNT(*) FROM dedupe AS d "
+                  "JOIN jobs AS j ON j.seq=d.seq "
+                  "WHERE d.request_id<>j.request_id OR d.object_id<>j.object_id "
+                  "OR d.lock_id<>j.lock_id OR d.payload<>j.payload") != 0)
+        throw std::runtime_error("persisted durable receipt aliases another job");
+
     // Recovery must not overflow the persistent fencing counter. SQLite can
     // promote an overflowing INTEGER expression to REAL; such a fence would
     // make stale leases impossible to distinguish reliably.
-    if (scalar(db,"SELECT COUNT(*) FROM jobs WHERE status=1 AND "
-                  "(fence<0 OR fence>=9223372036854775807)") != 0)
+    if (scalar(db,"SELECT COUNT(*) FROM jobs WHERE "
+                  "(status=1 AND fence>=9223372036854775805) OR "
+                  "(status=0 AND fence>=9223372036854775806)") != 0)
         throw std::overflow_error("durable recovery fencing exhausted");
     // Recover abandoned in-flight turns; state and ACK share a WAL commit.
     sql(db,"UPDATE jobs SET status=0,fence=fence+1 WHERE status=1");
+    sql(db,"PRAGMA user_version=1");
+    startup_tx.commit();
 }
 } // namespace
 
