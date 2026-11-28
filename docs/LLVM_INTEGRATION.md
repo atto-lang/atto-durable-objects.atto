@@ -44,3 +44,60 @@ on a local filesystem, not distributed-leader consensus. Support for
 network filesystems/failover is out of scope until separate fencing work.
 Never copy private LLVM implementation source into this repository without
 its explicit source-export authorization.
+
+## Lifecycle hardening draft (issue #4)
+
+The adapter now proposes the following order for **trusted in-process**
+tenant retirement:
+
+1. Under its adapter mutex, close OresVM guest/actor admission with
+   `begin_shutdown` (unless already quiescing/stopped).
+2. Require `complete_shutdown`: all tracked actor and guest pins must drain.
+   An exception keeps the tenant registered; neither the durable store nor
+   the isolate is destroyed. Retry may resume from the quiescing phase.
+3. Require the stopped phase, then close the durable tenant store. If an
+   in-flight durable lease prevents this step, retain registration and reject
+   new queue admission; the existing lease can still complete/retry.
+4. Persist the **in-memory** per-tenant lifecycle stage `StoreRetired` only
+   after a successful storage close. If VM destruction later fails, retry
+   that step **without touching the retired store**. After successful VM
+   destruction, mark `VmDestroyed` and invalidate the adapter handle.
+
+The lifecycle stages are process-local only; this is not durable supervisor
+incident delivery. A host crash between steps must be reconciled against
+the filesystem lease, WAL recovery state, and VM generation on restart.
+Do not interpret `StoreRetired` as proof that external effects completed.
+
+On activation failure, preserve copies of both generation-fenced handles
+until insertion succeeds, then attempt store and VM cleanup independently.
+If either cleanup fails, report **cleanup incomplete** instead of claiming
+that tenant activation or rollback succeeded. A failed start must enter
+this cleanup path as well. The current host has no persistent cleanup-incident
+registry, so an incomplete rollback remains a production blocker.
+
+### Opt-in exact-LLVM integration test
+
+Provide an *already authorized local* checkout of LLVM PR #1158 (or its
+compatible successor). Do not copy LLVM source into this repository or
+mirror private source into another organization.
+
+```sh
+cmake -S . -B build-llvm -DCMAKE_BUILD_TYPE=Debug \
+  -DORES_DURABLE_TEST_LLVM_ADAPTER=ON \
+  -DORESVM_INCLUDE_DIR=/path/to/authorized/oreslang-source.llvm/src/main/cpp
+cmake --build build-llvm --parallel
+ctest --test-dir build-llvm -R durable_llvm_adapter_lifecycle --output-on-failure
+```
+
+The opt-in native test checks retained stores after a rejected close with
+an active lease, queue-admission refusal after shutdown begins, independent
+tenant progress, an injected interruption **after store close and before VM
+destroy**, idempotent retry without a second SQLite close, reopening after a
+storage-open failure, and stale handle rejection. It does **not** prove fail-injected OresVM start/create/destroy
+exceptions, resource-pin shutdown races, actual Oreslang guest code, worker
+sandboxing, or native AOT. Add those tests and record the LLVM header SHA,
+adapter SHA, compiler binary, full job steps, and sanitizer outputs before
+promoting issue #4.
+
+**Verification status:** this draft is a source-level change. No compiler,
+CTest, sanitizer, or exact LLVM integration run has been executed for it.
