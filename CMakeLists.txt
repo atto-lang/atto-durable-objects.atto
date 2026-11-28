@@ -21,7 +21,15 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
   target_compile_options(ores_durable_objects PRIVATE -Wall -Wextra -Wpedantic -Werror)
 endif()
 
+# Host-only workflow effect-command replay oracle; no AttoLang guest proof.
+add_executable(durable_workflow_replay_oracle_test tests/WorkflowReplayOracleTest.cpp)
+target_include_directories(durable_workflow_replay_oracle_test PRIVATE src/native)
+target_compile_features(durable_workflow_replay_oracle_test PRIVATE cxx_std_17)
+target_compile_options(durable_workflow_replay_oracle_test PRIVATE
+  $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic -Werror -UNDEBUG>)
+
 if(BUILD_TESTING)
+  add_test(NAME durable_workflow_replay_oracle COMMAND durable_workflow_replay_oracle_test)
   add_test(NAME sqlite_durable_storage_test COMMAND sqlite_durable_storage_test)
   add_executable(durable_isolate_queues_test native/tests/durable_isolate_queues_test.cpp)
   target_link_libraries(durable_isolate_queues_test PRIVATE ores_durable_objects)
