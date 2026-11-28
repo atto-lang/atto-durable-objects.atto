@@ -1,16 +1,16 @@
-> **AI agent instructions (organization-wide):** Before working on code, issues, or pull requests, read and follow the [organization `AGENTS.md`](https://github.com/ores-truffle-oreslang/.github/blob/main/AGENTS.md), including its **merge-first stealth-development policy**. Honor any repository-local `AGENTS.md`, explicit holds, and GitHub-enforced rules.
+> **AI agent instructions (organization-wide):** Before working on code, issues, or pull requests, read and follow the [organization `AGENTS.md`](https://github.com/atto-lang/.github/blob/main/AGENTS.md), including its **merge-first stealth-development policy**. Honor any repository-local `AGENTS.md`, explicit holds, and GitHub-enforced rules.
 
-# Oreslang Durable Objects (LLVM)
+# AttoLang Durable Objects
 
 ## AttoLang migration and authoritative specification (2026-11-18)
 
-**AttoLang** is the current public name of Oreslang. This `ores-truffle-oreslang/oreslang-durable-objects.ores` repository retains its historical context. **No verified one-to-one successor:** consult [atto-lang](https://github.com/atto-lang) before linking or migrating this project. Legacy source and commands below reflect this checkout; do not automatically substitute new CLI names or claim feature parity. These repositories are not assumed to have identical Git histories, issues, pull requests, or implementation results.
+**AttoLang** is the current public name of Oreslang. This `atto-lang/atto-durable-objects.atto` repository is the current development target for this work. Its predecessor is `ores-truffle-oreslang/oreslang-durable-objects.ores`; migration does not establish identical source history or executable parity. Legacy source and commands below reflect this checkout; do not automatically substitute new CLI names or claim feature parity. These repositories are not assumed to have identical Git histories, issues, pull requests, or implementation results.
 
 **The canonical language specification is [atto-lang/atto-spec](https://github.com/atto-lang/atto-spec)**. Portable `.atto` modules belong in [atto-common-source](https://github.com/atto-lang/atto-common-source) and executed cross-backend positive/negative fixtures in [atto-platform-conformance](https://github.com/atto-lang/atto-platform-conformance). The proposed modern rules include `snake_case` methods, ownership `borrow!`/`take!`/`share!`/`copy!`/`copy!!`, [implicit borrowing](https://github.com/atto-lang/atto-spec/blob/main/language/implicit-argument-borrow-v1.md), [file/module constants including nonthrowing launch-time environment reads](https://github.com/atto-lang/atto-spec/blob/main/language/file-module-const-v1.md), and [separate bitwise-shift and directional-stream operators](https://github.com/atto-lang/atto-spec/blob/main/language/bitwise-and-stream-operators-v1.md). These are contract/design directions, not a claim this legacy implementation supports all syntax.
 
 Preserve historic `.ores` paths, command names, ABI/wire names and pinned fixtures until verified replacements exist. Avoid Python support tooling/tests; prefer Rust. Do not infer successful compilation, actor isolation or cross-backend parity from README examples, host-only tests, or zero-step GitHub Actions. Document exact commit/tree, target, toolchain, executed guest tests and explicit failures/unsupported status.
 
-Status: **draft contract and native LLVM host substrate**, not a production durable-object service.
+Status: **native host substrate plus draft AttoLang guest integration**, not a production durable-object service.
 
 A durable object is a stable `(tenant_id, namespace, object_id)` identity with actor-owned state, persistent transactional storage, and a single logical owner at a time. An **OresVM** host owns one **IsolateVM per tenant incarnation**. Each IsolateVM owns **multiple bounded FIFO queues keyed by a tenant-scoped LockId**. Actors and durable objects live inside that tenant isolate; each actor retains sealed state and its own arena.
 
@@ -23,6 +23,980 @@ OresVM root
   Tenant B -> IsolateVM (generation gB, distinct heaps and queues)
        LockId 7 -> a completely different FIFO and owner
 ```
+
+## Goal: Cloudflare Durable Objects–style computing
+
+Provide stable named virtual actors with colocated computation and transactional
+storage, automatic activation, exclusive turns, durable alarms and idle
+passivation. AttoLang intentionally targets non-reentrant actor turns across
+suspension rather than replicating all JavaScript event-loop semantics.
+
+```text
+authenticated tenant + namespace + object name
+    -> virtual actor directory / fenced activation
+    -> exclusive turn permit
+    -> durable receipt lookup (matching replay returns original reply)
+    -> precompiled AttoLang guest proposes next state
+    -> SQLite WAL atomic state + receipt + outbox commit
+    -> ownership-checked response publication
+```
+
+The directory, scheduler and external publication authority are work in
+progress; epoch checks alone are not an ownership election protocol.
+
+### Implementation progress (2026-11-24)
+
+| Capability | Evidence / status |
+| --- | --- |
+| Tenant FIFO queues and SQLite WAL substrate | Existing host code, not a sandbox |
+| Epoch, revision, exact command/schema receipts and outbox | [Storage PR #9](https://github.com/atto-lang/atto-durable-objects.atto/pull/9), draft |
+| Bounded counter guest and self-tests | [guest/durable_counter.atto](guest/durable_counter.atto), source candidate |
+| Commit-gated counter adapter | [counter_turn.hpp](native/include/ores/durable/counter_turn.hpp), earlier host-only CI passed |
+| Compile-once scalar Wasm entry | [Compiler PR #566](https://github.com/atto-lang/atto-source.rs/pull/566), draft, not executed |
+| Compiled guest to SQLite, hard kill after commit, replay | [Process integration fixture](tests/durable_counter_process_e2e.mjs), not executed |
+| Automatic named activation, exclusive FIFO turns, explicit passivation | [Host directory prototype](native/include/ores/durable/counter_directory.hpp), tests authored, not executed |
+| Automatic idle passivation, multi-object scheduling | Bounded host worker-pool prototype, tests authored (not executed) |
+| Cooperative single-host controller ownership | POSIX advisory lock prototype, competing-controller test authored |
+| Durable alarms | Generation-fenced storage + optional automatic FIFO dispatch prototype; tests authored, not executed |
+| Persistent mailbox admission and restart dispatch | Wave 9 host regression passed |
+| Mailbox retry, dead letters and completion reservation | Wave 9 host regression passed |
+| Typed RPC and secure transport | Planned |
+| WebSocket hibernation, placement, replication and failover | Planned |
+
+### Virtual actor directory (host prototype)
+
+[CounterDirectory](native/include/ores/durable/counter_directory.hpp) resolves
+the full tenant/namespace/type/name tuple. Trusted authorization is checked
+at admission, execution and before returning a receipt. A fixed-size worker
+pool (1–64 workers, default 1) runs separate FIFO object lanes; a running lane
+is never scheduled twice, even if its trusted callback blocks. Rotating
+ready-object selection avoids fixed key-order starvation. SQLite transactions
+remain serialized through the shared store; distinct guest computations can
+progress concurrently. Pending admissions and active epochs have separate
+quotas. Worker threads, rather than guest carriers, perform blocking storage.
+
+```text
+authorized request -> bounded per-object FIFO -> ready lane rotation
+    -> exclusive worker turn -> lazy persisted epoch -> guest transition
+    -> atomic state/receipt/outbox -> host future
+```
+
+Explicit passivation is a FIFO barrier. Optional monotonic-clock idle
+passivation removes only a lane with no executing or queued turn. It never
+deletes committed state; the next authorized request allocates a fresh
+persisted epoch. Idle passivation is disabled by default; configure a positive
+duration on the host. An authorized `is_active` diagnostic is observational
+only, not a lease or capability.
+
+A persistent POSIX advisory lock on the canonical database's sibling
+`.controller.lock` file prevents cooperating local controllers from opening
+the same store simultaneously. The lock spans the full worker and store
+lifetime and is never unlinked by the controller. It assumes a trusted local
+directory, stable paths, and cooperative raw-store users; not distributed
+consensus, hostile-filesystem defense or a tenant sandbox. Authorization and
+guest callbacks must be thread-safe and terminating. The host future is not
+the AttoLang suspension ABI, and does not grant network publication rights.
+
+[Directory tests](native/tests/counter_directory_test.cpp) now cover 100
+ordered turns, dedupe, backpressure, restart, explicit and idle passivation,
+cross-object progress during a held turn, no same-object overlap, and
+competing-controller rejection. CI also schedules ASan/UBSan. None of this
+new directory evidence has executed yet. Compiled guest integration in the
+directory, authenticated ingress, unified durable inbox, cancellation, fuel/time
+quotas and production alarm policy remain outstanding.
+
+### Persistent mailbox (host prototype)
+
+The durable API is explicitly separate from the transient `send()` path:
+
+```text
+admit(key, stable request ID, operation, delta)
+    -> authenticated FIFO control turn
+    -> SQLite transaction inserts immutable pending mail
+    -> admission receipt (sequence, not a state-transition ACK)
+    -> restart-safe mailbox poller selects oldest pending record per object
+    -> exclusive object turn checks owner, identity, command and schema
+    -> atomic snapshot + completion receipt + outbox + inbox removal
+```
+
+Retrying the identical request returns its pending sequence or committed
+receipt; conflicting commands/schemas reject. Pending rows survive restart
+and cannot be consumed out of order or bypassed by a direct commit with
+the same ID. The reserved alarm namespace cannot be admitted. Defaults
+bound pending mail to 128 records per actor, 4096 per database and 64 MiB
+aggregate command bytes; persisted limits are checked again at reopen.
+The separate configurable mailbox poller (disabled by default) now has a candidate bounded concurrent dispatch path described in Wave 16. The counter
+demo commits a terminal `mail_overflow` receipt with unchanged state.
+Explicitly classified stopped-guest failures use the bounded persistent retry policy below; other handler/authorization faults stop dispatch visibly through `mail_fault()`; backpressure retains pending rows.
+
+An admission future is not proof of eventual completion or network
+publication. Only requests admitted through this API have restart-safe
+admission; transient sends, alarms and controls can interleave between
+durable mailbox entries. FIFO is guaranteed within the durable mailbox,
+not across these separate admission domains. Host callbacks are not
+compiled guest execution. Administrative dead-letter retention/requeue, tenant fairness, authentication of persisted principals and unified durable ingress remain open. The
+regression tests cover process exit after admission, reopen, exact replay,
+stale epochs, head checks, rollback, quota rejection and drain after
+restart; new execution evidence is pending.
+
+### Durable mailbox retries and poison isolation (host prototype)
+
+The trusted runner can signal `RetryableGuestFailure` only after guest
+execution has physically stopped without committing. A separate SQLite
+retry record tracks the exact mailbox head's classified failures, next
+eligible Unix-millisecond deadline and terminal dead-letter status.
+The fixed v1 policy is:
+
+| Recorded failure | Outcome |
+| --- | --- |
+| 1 | Retry after 100 ms |
+| 2 | Retry after 200 ms |
+| 3 | Terminal dead letter; allow next live FIFO entry |
+
+A backed-off head blocks later entries for that object, but ready heads
+for other objects remain discoverable. Epoch, immutable command, schema,
+sequence, previous failure count and deadline are checked in the retry
+transaction. Dead letters retain original identity/payload and return
+`dead_letter=true` on exact admission replay; no success receipt or
+state/outbox mutation is manufactured. They remain charged against inbox
+count and byte budgets. No automatic requeue or destructive retention
+policy is provided.
+
+Admission reserves one completion receipt and outbox slot for each live
+pending entry. Other commits cannot consume those reservations. Reopen
+checks existing reservations against configured limits. Dead-lettering
+releases completion slots but not the retained inbox budget.
+
+Classified stopped-guest failures and abandoned dispatch markers use this
+policy. Database, ownership, authorization and unexpected faults stop the
+poller; a surviving marker is resolved only under a fresh fenced activation.
+The compiled scalar watchdog and fuel worker have separate executed evidence.
+ The Wave 16 candidate dispatches distinct objects concurrently, but a nonterminating trusted callback can still occupy a worker. These are not production guarantees of poison isolation or eventual
+delivery. Tests cover retry deadlines, restart, stale attempt fencing,
+dead-letter replay, healthy object progress and reserved capacity; no
+new exact-head execution receipts yet.
+
+### Durable alarms (host prototype)
+
+The storage candidate in [PR #9](https://github.com/atto-lang/atto-durable-objects.atto/pull/9)
+persists one Unix-millisecond deadline per logical object, with a monotonic
+alarm generation that survives cancel and consume. Setting/replacing or
+cancelling requires the current generation and owner epoch; cancellation
+retains a tombstone. The reserved receipt identity `@alarm:<generation>`
+cannot be submitted as an ordinary request. Legacy conflicting receipts
+fail closed on migration. Due scans are indexed and bounded.
+
+The directory provides trusted, asynchronous `set_alarm(key, generation,
+due_ms)`, `alarm_generation(key)`, and cancellation via a null deadline.
+An optional positive alarm poll interval enables a dedicated supervisor
+poller (disabled by default). It scans at most 64 due records per batch,
+submits at most one outstanding alarm turn, and uses the same exclusive
+FIFO lane as ordinary operations. Dormant objects activate under a fresh
+epoch. The worker checks the deadline, alarm generation and epoch again;
+it atomically consumes the deadline with state, immutable receipt and
+outbox update. Restart scans persisted deadlines; a consumed alarm is not
+run twice. Clock deadlines use wall-clock time, while polling and idle
+passivation use monotonic elapsed time.
+
+For the bounded counter demo an alarm invokes the existing increment-by-one
+transition. At maximum count it records terminal `alarm_overflow` with
+unchanged state. Queue/activation saturation delays dispatch; unexpected
+faults stop the poller and are exposed through `alarm_fault()` for trusted
+supervisor recovery. Shutdown drains a currently dispatched alarm.
+This is not a general compiled alarm-handler ABI: scheduling/cancellation
+are separate fenced control transactions, not atomic with arbitrary guest
+state changes. Durable retry backoff/dead-letter policy, per-tenant fair
+alarm dispatch, authenticated capabilities, hard watchdogs, multi-host
+ownership and integrated compiled guest execution remain outstanding.
+
+Host regression cases cover cancel/replace, stale owner and generation,
+rollback, reopen, auto-activation, consumed receipt replay and terminal
+overflow. See the directory and actor-sync recovery tests; new tests remain
+unexecuted pending exact-head CI. No exactly-once external effect claim.
+
+### Deterministic fuel and Linux process limits (Wave 11 — executed)
+
+The optional [Rust fuel worker](guest/fuel-worker/src/main.rs) uses pinned
+Wasmi 0.31.2 and a fresh 50,000-unit budget per scalar evaluation. Fuel
+exhaustion has a distinct status from traps and wall-clock timeouts.
+The scalar profile rejects imports, linear memories, tables and start
+functions, checks artifact SHA-256 and admits one instance. Linux limits
+cap address space at 256 MiB, CPU at two seconds and descriptors at 16;
+core dumps are disabled. Parent-death SIGKILL is installed with an identity
+check. The parent watchdog and physical reap remain mandatory.
+These are engine-specific process limits, not portable AttoLang fuel,
+aggregate tenant quotas or a production sandbox.
+
+The same compiled looping fixture tests both execution engines. The fuel
+case must report fuel exhaustion, retry three times, dead-letter and permit
+healthy mail. Direct versions are pinned; CI resolves a lockfile, records
+its digest and graph, then builds --locked. A reviewed committed transitive
+lock remains required. [Wave 11 guest run 45536758165](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45536758165)
+executed exact head `bd3b79570ced4ad3b5ba9e76c1c9b69049a69bee` and emitted
+`COMPILED_COUNTER_FUEL_WORKER_PASS` and `COMPILED_COUNTER_PROCESS_WATCHDOG_PASS`.
+The compiled looping artifact SHA-256 was
+`66c10e6311e347e92d726945a62937af1798d8d8f9abe33f4e62e0293d00b2a7`.
+
+### Crash-counted mailbox dispatch (Wave 12 candidate)
+
+Storage PR #9 adds a durable dispatch marker bound to the exact FIFO head
+and active epoch. The directory commits it before calling the scalar guest.
+A successful state/receipt/outbox transaction deletes the inbox and cascades
+the marker; a classified stopped-guest failure atomically clears the marker
+and advances retry metadata. A surviving marker under an older epoch is
+charged once before launching another attempt. Duplicate/stale tokens and
+unmarked completion of a marked head are rejected. The third charge dead
+letters the original request without inventing a success receipt.
+
+The conservative policy counts a crash after recording the marker even if
+guest launch had not occurred. Only the cooperating single-host controller
+and pure, authority-free scalar guest are supported. Controller lock release without inherited worker guards
+and epoch rotation are not proof of physical retirement of an arbitrary
+orphan guest, nor safe recovery of external side effects. General actor
+recovery requires a supervisor that establishes physical quiescence.
+The storage fork/reopen and directory controller-exit regressions are new;
+Wave 12 exact-head execution passed (receipt below).
+
+### Controller retirement and scoped deployment (Wave 13 candidate)
+
+Wave 12 guest and host integration passed on exact head
+`b8ca89bd51c691c6b32d13a4c29e606f1921dbf3`:
+[run 45653321529](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45653321529).
+The new process runner inherits the controller's locked open file description
+at reserved fd 3 while a synchronous directory callback executes. All other
+nonstandard descriptors are closed. The trusted worker must retain fd 3
+without unlocking it, including after controller death; the kernel denies
+a new cooperating controller until the worker releases it on exit.
+Standalone fixture calls have no controller guard. This is intentionally
+fail-closed: a nonterminating or stopped orphan can block takeover until
+a trusted supervisor retires it. This assumes a trusted worker and local
+filesystem; it is not containment of arbitrary native code or descendants,
+nor distributed election. The regression kills the controller, uses a
+subreaper to observe a synthetic orphan, verifies lock denial, and checks
+that a replacement can run the real compiled guest only after retirement.
+
+The immutable host-side CounterArtifactRegistry selects a pinned artifact
+and fuel runner by full tenant/namespace/type scope, never by guest input.
+Keyed callbacks receive the authenticated identity after the directory's
+authorization checks; the registry requires the scoped controller guard.
+Workers independently hash exact bytes before executing. Missing and
+duplicate scope bindings fail closed; wrong artifact digests yield no
+successful state transition. The tests use real compiled Wasm for two
+tenant scopes. This is a trusted static allowlist, not signed distribution,
+network principal authentication, durable manifest-version binding,
+or an artifact upgrade protocol. Legacy unkeyed callbacks remain host
+fixtures; production ingress must compose principal authorization with
+the registry check. General actor ABI proposal extends
+[atto-spec #63](https://github.com/atto-lang/atto-spec/pull/63);
+the scalar implementation is not that ABI.
+
+Wave 13 guest and host regressions passed in run 45653915725 (see below).
+
+### Signed immutable deployment identity (Wave 14 candidate)
+
+The trusted artifact registry canonicalizes the complete scope set using
+length-framed exact bytes sorted by tenant/namespace/type. Its v1 identity
+includes each artifact SHA-256, the scalar engine/fuel profile and wall
+budget, rather than the machine-local path. The new SQLite deployment
+record binds those exact bytes transactionally before any worker starts.
+Reopening with reordered identical bindings is allowed; changed artifact,
+scope, budget or absent manifest is denied, even for a receipt replay.
+A populated legacy store cannot be silently adopted. No in-place upgrade,
+key revocation, or removal of pending mail is offered.
+
+The host-only SignedCounterDeployment path verifies a detached Ed25519
+signature over that exact canonical manifest via OpenSSL EVP and an
+operator-provisioned trusted public key. No private signing key is required
+at runtime. An immutable verified registry supplies both dispatch and
+scope admission, composed with an independent trusted ingress authorizer.
+The registry checks its controller-bound deployment before executing, and
+the fuel worker independently checks the actual artifact digest. Host
+fixture constructors remain trusted low-level APIs; they are not a secure
+network boundary. The trusted runner executable and filesystem are still
+operator-controlled, not independently attested by this manifest. Signed
+manifest verification is not principal authentication, revocation or
+anti-rollback across a restored/deleted database. Persisted artifact
+upgrades require an explicit quiescent migration and receipt policy.
+
+The compiled-fuel regression generates an ephemeral test-only Ed25519 key,
+checks signature/key/manifest tampering, validates scoped dispatch, verifies
+restart deduplication and pending-mail recovery under identical deployment,
+and rejects changed configuration and legacy fallback. These are authored
+tests, not a Wave 14 execution receipt.
+
+### Persistent rolling guest-start accounting (Wave 28 candidate)
+
+The signed Linux fuel-worker profile now derives an exact rolling
+guest-start allowance from the smaller of rolling fuel and CPU
+reservation ceilings divided by the fixed per-worker envelope.
+Defaults: 60,000 ms, 6,000,000 fuel and 240 CPU seconds, admitting at
+most 120 starts per tenant per rolling minute (further bounded by
+in-flight slots). Each accepted start charges a full 50,000 fuel and
+2 CPU-second reservation, never refunded after failure or crash.
+This is conservative admission accounting, not measured CPU time,
+RSS or a portable instruction-cost metric. Executions spanning a
+window are still bounded by concurrent reservations but are not
+measured or apportioned across windows.
+
+SQLite persists the exact window/allowance configuration, timestamp
+ledger and clock high-water under a write transaction. Expiry is
+an exact sliding window, not a fixed bucket. Backward clock movement
+cannot reset the budget; forward movement follows the trusted host
+clock. Rows are bounded to 4,096 per tenant and 65,536 per database.
+Changing or disabling an already bound policy fails closed on reopen;
+offline migration is required. Budget policy is per controller database,
+not distributed, signed into the artifact manifest, or resistant to
+database rollback or old writer binaries.
+
+Transient guest invocation charges only when the guest runs, not for
+an exact receipt replay. Mail and alarm dispatch reserve before marking
+an attempt; quota denial leaves pending work and failure counts intact.
+A crash between charge and launch conservatively spends the allowance.
+Typed rate backpressure preserves the current activation; the pollers
+retry according to their existing polling intervals. Metadata-only
+admission/control turns do not consume the guest-start allowance.
+
+Storage regressions cover exact expiry, restart, backward time,
+crash charge retention, cross-connection contention and policy
+downgrade. Host regression requires exact replay free, durable work
+unmarked while throttled, and quiet-tenant progress. Signed compiled
+fuel-guest regression exercises one-start budget, restart and a
+second tenant. A focused local C++/SQLite harness using the ledger
+methods and schema passed normal and ASan/UBSan builds (marker
+FOCUSED_ROLLING_LEDGER_SQLITE_PASS); this is not an exact-tree build
+or the complete runtime suite. New CI head must execute the full
+regressions. Storage pin: `5822a39cbd8fe49200961dcd0d396827c379d16b`.
+
+Wave 26 [run 45679320463](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45679320463)
+passed both integration jobs. Its logs report compiled Node watchdog
+and wasmi fuel receipts with seven reaped failures per test suite,
+Wasm SHA-256
+`8cd298cdfff9a5b0bec56db72871430f29bac91d54fd8cbe6179886f7ecb67c1`.
+Host directory ASan/UBSan and storage recovery markers also passed.
+Wave 27 remained queued at inspection. These historical results
+do not certify Wave 28.
+
+### Compiled durable Counter actor (next candidate)
+
+[Compiler PR #566](https://github.com/atto-lang/atto-source.rs/pull/566)
+now adds an opt-in `--durable-counter-actor-v1` mode at
+`d8763e35749191a9a94c68e79a40496fb50558bf`. It parses the actual
+[durable actor source](guest/durable_counter_actor.atto), validates its
+persistable state schema and exact receive AST, and uses the ordinary
+actor checker on a validation-only volatile clone. It never emits that
+clone. Only the proven single-field zero-initialized integer increment
+shape is lowered to the existing checked scalar broker ABI. Unsupported
+state, handlers, imports and extra declarations fail closed. The normal
+browser compiler still refuses durable actor runtime lowering.
+
+The process integration suite now runs twice, against the original scalar
+function and against the actual actor declaration, on separately created
+databases. Each requires seven executed Wasm transitions across thirteen
+host process invocations, one compilation, rollback, SIGKILL after commit,
+fenced restart, exact replay and tenant isolation. The existing scalar
+watchdog/fuel and other regression suites remain mandatory. No host
+transition substitute or source-only pass is accepted. Both compiler and
+integration CI are pending; no new execution claim.
+
+This is a deliberately restricted actor-to-scalar specialization, not
+general actor dispatch, user-defined message ADTs, general generated
+snapshot codecs, suspension or arbitrary durable actor execution.
+The broker still owns the counter-specific bounded domain and read
+operation, SQLite state encoding and transaction. The pinned compiler
+and host must converge with the typed actor-state and Job ingress branches
+before broader semantics or cross-backend parity can be claimed.
+
+### Shared tenant resource reservations (Wave 27 candidate)
+
+All transient, durable mailbox, alarm and control turns now share a
+per-tenant queued/running limit in the directory scheduler. Limits are
+checked under the same mutex as lane admission/dispatch; a running slot
+is retained until its whole turn returns, including classified or unknown
+failure. A full tenant queue rejects new submissions with backpressure;
+already durable work is retained for subsequent scans. Each supervisor
+also limits its outstanding futures per tenant, while the shared lane
+scheduler enforces the combined running cap across both supervisors.
+No secondary unbounded tenant registry is needed. The trusted generic
+host configuration defaults to the existing global limits.
+
+The signed Linux fuel-worker profile additionally derives its per-tenant
+running slots from the minimum of the address-space, engine fuel and CPU
+reservation ceilings divided by the fixed per-worker envelope (256 MiB
+RLIMIT_AS, 50,000 fuel, 2 CPU seconds). Default budget: 32 queued turns,
+512 MiB address-space reservations, 100,000 in-flight fuel, 4 in-flight
+CPU seconds, at most two running turns, further clamped to global worker
+count. Trusted deployment/gateway constructors accept smaller or larger
+budgets; configurations that cannot reserve even one worker fail closed.
+Every running turn conservatively reserves a full slot, even if it only
+reads a receipt or updates metadata. No guest or request can select its
+budget. Existing signed artifact manifest remains unchanged; the budget
+is trusted runtime configuration, not an attested or persisted policy.
+
+This bounds concurrent reservations under the trusted synchronous
+single-process-per-turn fuel-worker contract, not actual RSS, host memory,
+startup before rlimits, cumulative CPU/fuel per time window, or distributed
+tenant usage. No cgroup or measured resource accounting is claimed.
+Queue and execution caps are per directory, not global across hosts;
+global queue/worker/activation limits still apply. No guarantee of
+progress under arbitrary saturation or nonterminating trusted callbacks.
+
+Host regressions hold one tenant's turn, fill its queue, require another
+tenant to progress, check exception releases the slot, and exercise
+combined mailbox/alarm/transient work under a one-slot tenant cap.
+Budget dimension and invalid-configuration tests are included in the
+process guest suite; an existing compiled alarm test is run with a
+single-slot signed budget. New tests are authored, not yet executed.
+The Wave 26 storage pin is unchanged:
+`878101271489a7167cad807c8f946f28911e65cd`.
+
+### Concurrent tenant-aware alarm dispatch (Wave 26 candidate)
+
+The alarm poller now submits up to the configured worker count of distinct
+object futures and independently reaps completed turns, rather than
+waiting synchronously for each alarm. The bounded eligible scan ranks
+alarms within tenants before LIMIT and rotates from the last attempted
+tenant. Retry-delayed and exhausted generations are excluded. Object
+lanes remain exclusive across alarm, mailbox and other host work. Queue
+or activation saturation is backpressure; unexpected faults stop new
+dispatch and drain already accepted futures. This is tenant-aware
+candidate selection, not a reservation of CPU time or guaranteed fairness
+under arbitrary saturation. Alarm and mailbox pollers share the existing
+worker pool; aggregate per-tenant resource limits are separate work.
+
+Storage regression schedules 260 hot-tenant objects and verifies a quiet
+tenant remains visible before the page limit, including rotation and
+retry eligibility. Host regression holds an alarm and requires a
+different tenant to progress before releasing it, with a same-object
+successor unable to overtake the held turn. The compiled watchdog
+fixture additionally loops when committed state is 11 and the actual
+alarm increment is 1; both Node deadline and wasmi fuel workers are
+expected to exhaust exactly three alarm attempts, retain unchanged
+state, permit the healthy alarm and reap all children. No substituted
+host operation is used. These are authored regressions, not executed
+Wave 26 evidence. Storage pin: `878101271489a7167cad807c8f946f28911e65cd`.
+
+Wave 23 original CI failed to fetch a mistyped storage SHA, not a guest
+semantic failure. The corrected cumulative Wave 24
+[run 45675549581](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45675549581)
+and Wave 25 [run 45676354679](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45676354679)
+both completed guest and host jobs successfully. They are historical
+receipts and do not certify Wave 26.
+
+### Authorized atomic mailbox and alarm effects (Wave 25 candidate)
+
+Strict signed-deployment hosts may use `admit_with_alarm` with a trusted
+operator-and-principal authorization callback, an authenticated principal,
+an increment, and an explicit expected alarm generation/deadline/operator
+identity. This is not exposed to ordinary principal capabilities. The
+canonical command extension retains the immutable effect in the durable
+inbox, receipt and terminal archive, including its operator identity.
+An exact retry resolves the prior admission or receipt; a changed or
+omitted effect conflicts with the original command. The current persisted
+increment grant is required at admission and dispatch and its attempt
+version is checked in the commit transaction. That same version is bound
+to the installed alarm. The operator callback authorizes admission, not
+an independently transactionally revocable operator grant.
+
+State, receipt, outbox, inbox consumption, alarm generation/deadline and
+principal alarm authority are committed atomically. An overflow consumes
+the mail with its rejected receipt and does not apply the effect. A stale
+alarm generation rolls back the entire proposed state change and terminally
+dead-letters the exact mail without an authorization-denied flag. This
+uses the existing terminal retry sentinel (not evidence of three actual
+guest failures). Effect-bearing dead letters cannot be redriven; a fresh
+authorized request with a new expected generation is required.
+No cancellation grant, arbitrary guest effects, or external effects are
+implemented. This trusted host command is not a new AttoLang guest ABI.
+
+Storage regressions cover exact replay, omitted effects, rollback, grant
+revoke/regrant, stale generation, terminal redrive rejection and overflow.
+A signed deployment compiled-guest regression admits the effect, restarts
+before mailbox execution, replays the receipt, restarts before alarm firing,
+and verifies the alarm commits once. New tests are authored, not executed.
+Storage pin: `f9c19f9370d7f613302c2772ccab39f8b9f33b57`.
+Wave 22 [run 45672643607](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45672643607)
+completed both integration jobs successfully; Waves 23–24 were still queued.
+
+### Crash-counted alarm attempts and bounded retries (Wave 24 candidate)
+
+The trusted runtime persists a generation-scoped attempt marker before
+invoking an alarm guest. An abandoned marker from a physically retired
+older controller consumes one failure on recovery before another attempt
+can begin. A classified stopped-guest failure consumes the same budget:
+two retries with 100 ms and 200 ms delay, then terminal exhaustion on
+the third failure. The original alarm deadline and generation remain
+unchanged during backoff. The eligible scan skips delayed alarms, so
+unrelated due alarms can progress. Exact generation/attempt/failure/deadline
+matching and the controller epoch fence stale failure tokens. Successful
+state/receipt/outbox/consume transactions clear retry metadata; exhaustion
+clears the deadline without state mutation or a success receipt. The
+latest strict alarm diagnostic distinguishes failed from denied and fired.
+Explicit replacement starts a new generation and clears the old retry
+metadata. This is bounded latest-generation state, not append-only history.
+
+Persisted principal grant version is rechecked at attempt admission,
+failure resolution and state commit. Policy denial takes precedence over
+retry and clears the exact generation. Unknown infrastructure failures
+still stop the supervisor and retain the marker for recovery. Trusted
+classified failures must mean physical guest retirement; a crash after
+marking but before launch conservatively counts. The existing poller
+remains sequential; no concurrent tenant-fair alarm dispatch or
+general effectful guest semantics are claimed. Legacy trusted unmarked
+storage calls remain supported only when no persisted attempt exists.
+
+Storage regression forks a controller that exits after marking, checks
+stale-token rejection, retry delay, unrelated healthy commit, exhaustion,
+restart and explicit fresh generation. Host directory regression injects
+classified failures and requires exactly three attempts with independent
+healthy progress. These new retry tests are host/storage tests, not
+proof of actual guest traps. Existing compiled-guest tests remain in CI.
+Storage pin: `7ed8d0e4acea3de125ca0b2c3a7bd530c1aac484`.
+New-head execution is pending.
+
+### Principal-bound alarm authorization (Wave 23 candidate)
+
+Strict principal mode now supports a trusted operator scheduling path
+`schedule_principal_alarm(key, generation, due, principal, operator_id, authorize_operator)`.
+The operator callback must authenticate the operator and independently
+authorize the exact object, principal and scheduling action. It is not
+a network endpoint or an ordinary principal capability. The scalar
+alarm handler increments by one, so the scheduler requires the existing
+exact-object op=1 grant and persists its version, principal, operator
+identity and alarm generation atomically with the deadline. Missing grants
+deny scheduling. The captured grant version is deliberately not refreshed
+on dispatch: revocation followed by regrant invalidates the old generation.
+An operator must explicitly schedule a fresh generation.
+
+The signed deployment can opt into an alarm poll interval in strict mode
+with its trusted scope/principal policy. Startup rejects unbound legacy
+pending alarms rather than retroactively assigning authority. The scheduler
+checks the external scope/principal policy before guest entry and after
+return, and SQLite checks the exact bound principal, generation and
+persisted grant again in the same write transaction as state, receipt,
+outbox and alarm consumption. A revocation committed first prevents
+that generation from committing; a commit ordered first remains committed.
+Policy denial marks the exact generation denied and clears the deadline
+without a successful receipt or actor state change. A stale scan cannot
+cancel a replacement generation. Latest-generation authority/status
+(pending, fired, denied) is available to trusted diagnostics; this is not
+an append-only alarm audit.
+
+The operator callback itself is not transactionally versioned, and
+revocation cannot retroactively undo committed work. A pure scalar guest
+may execute speculatively during a race but cannot commit against a revoked
+persisted grant. General guest effects, principal-bound atomic state plus
+alarm scheduling, cancellation grants, durable alarm attempts/backoff and
+fair concurrent alarm dispatch remain separate future work. Unknown alarm
+faults still stop the poller and preserve pending work; no automatic retry
+or liveness guarantee is claimed. Existing standalone raw alarm mutations
+remain forbidden in strict mode. Older writer binaries must not be used.
+
+Storage tests cover missing grant, forged binding, restart, revoke/regrant,
+stale-generation denial, atomic rollback and fired status. A host test
+holds the executing alarm while an independent admin connection revokes
+and restores its permission; the independent authorized alarm must
+progress. A signed-deployment compiled guest test exercises denied and
+authorized alarms after restart. These are authored tests, not executed
+Wave 23 receipts. Storage pin:
+`904a4d90563ddf956998a1d1d4d51b1a50d6fd`.
+
+### Atomic state and alarm scheduling (Wave 22 candidate)
+
+The trusted scalar counter host may submit an exclusive non-principal turn
+with `send_with_alarm(key, request, op, delta, SyncAlarmChange{generation, due})`.
+A missing effect leaves the current alarm unchanged; an explicit null
+deadline cancels it. SQLite validates the expected generation and commits
+state, receipt, outbox, and alarm generation/deadline in one transaction.
+The effect is bound to the operation receipt: exact replay never reschedules
+an already consumed/replaced alarm, and omission or modification of the
+effect on replay fails closed (including ordinary mailbox admission).
+The storage seam also supports consuming a due alarm and installing its
+next generation atomically. A failed transaction leaves the previous
+snapshot, receipt history, outbox and alarm unchanged.
+
+This is a trusted host-proposed alarm effect, not a new compiled guest
+effect ABI or a durable mailbox scheduling command. The compiled scalar
+guest still only computes the counter transition. The principal gateway
+does not expose the new API. Wave 22 strict transactional policy rejected alarms; Wave 23 adds a separate principal-bound trusted operator path as described above. Unbound pending alarms and raw alarm mutations remain forbidden.
+Do not use older writer binaries or bypass the trusted host boundary.
+
+Storage tests cover injected rollback, a fork exiting after commit before
+acknowledgement, effect replay/conflicts, consume-and-replace, stale
+generation rollback, cancellation and strict mode rejection. Compiled
+guest integration schedules an alarm with a real Wasm transition, restarts,
+replays the original operation, rejects changed effects, then fires the
+persisted alarm. These are authored tests, not executed Wave 22 evidence.
+Storage pin: `445307999926c5d7dc359faac4d54972107c9439`.
+
+Wave 20 [run 45668736104](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45668736104)
+and Wave 21 [run 45669610810](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45669610810)
+completed both host and compiled guest integration jobs successfully.
+The committed fuel-worker dependency lockfile was used in those runs.
+Wave 19 [run 45665677376](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45665677376)
+also completed both jobs. Receipts are historical exact-head evidence,
+not certification of the current candidate.
+
+### Bounded dead-letter archival (Wave 21 candidate)
+
+A separately authorized operator can archive terminal principal mail in
+strict mode. The SQLite transaction moves the exact original object key,
+operation ID, command bytes, schema, principal and denial status into
+an immutable archive record with the archiving operator identity.
+Any existing redrive audit is copied into that record before removing
+the inbox row and its dependent retry/principal metadata. A failed
+transaction leaves the original unchanged. Inbox count and command
+byte capacity are released; archived identities remain reserved.
+Exact authorized admission replay returns the same terminal status;
+conflicting replay and state commits under the archived ID are rejected.
+Inspection uses one bounded sequence-ordered page across both stores.
+
+The archive defaults to 65,536 records and 64 MiB of command bytes
+per database, and 4,096 records and 16 MiB per tenant. Reopening with
+insufficient limits and new archives that exceed those limits fail
+closed. No eviction, automatic identity reuse, physical file shrink,
+or total database byte cap is implied. Archive is terminal: unredriven
+archived mail cannot be redriven; a previously recorded redrive remains
+idempotently discoverable by its original authorized operator, subject
+to the current principal grant. Operators must choose redrive before
+archiving if another execution is desired. Local audit records are not
+externally tamper-evident. No compatibility with older writer binaries
+is claimed.
+
+Tests cover capacity release, injected rollback, archived exact replay
+and conflicting reuse, archive exhaustion, merged pagination, restart,
+separate operator archive permission and retained redrive audit.
+The storage pin is `4ba9d0f793c9cc88aa279fe5f572c49d62b4904e`.
+These are authored tests, not executed Wave 21 receipts.
+
+Wave 17 [run 45661384441](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45661384441)
+and Wave 18 [run 45662149576](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45662149576)
+completed both guest and host integration jobs successfully. Wave 19
+host seam passed, guest was in progress at inspection; Wave 20 remained
+queued. These receipts apply to the corresponding historical heads.
+
+### Operator dead-letter administration (Wave 20 candidate)
+
+The trusted CounterDeadLetterAdmin adapter requires an upstream-authenticated
+operator and a separate exact-object/action policy. Inspection pages are
+bounded to 256 records and expose identity, principal, terminal denial flag
+and replacement sequence, not command payload or raw guest errors.
+Strict-policy redrive is explicit, never automatic. It refuses
+authorization-denied mail and requires the original principal's current
+persisted grant. The old message remains terminal. Redrive copies the
+immutable command, schema and principal to a new reserved operation ID and
+new FIFO sequence, with ordinary admission quotas and completion reservations.
+Admission and source/replacement/operator audit are committed atomically.
+One redrive per source row; exact retry by the same operator returns its
+original audit result even after replacement completion. Different operators
+cannot silently adopt it. Recovery still checks the current grant at
+attempt and commit. The new audit is bounded to 65,536 rows. Retained inbox originals and replacement messages count against quotas; Wave 21 adds bounded archival with preserved terminal identities. No unsafe purge, identity reuse or administrative bypass of the authorization fence.
+
+Operator policy is a trusted callback, not a network authentication system
+or a transactional revocation guarantee. It is checked before and after
+handoff; revocation after admission cannot undo it. Redrive is an explicit
+new execution, not exactly-once replay of a previous success. The audit is
+a local SQLite record, not a tamper-evident external log. Retention/archive
+with preserved deduplication tombstones remains open.
+
+Storage and host directory tests cover scope and operator action denial,
+revoked grants, exact redrive retry, original terminal result, restart,
+fresh FIFO execution and refusal of authorization-denied redrive. New
+tests are authored, not execution-verified. Storage pin:
+`1560ceba4eedfcc5c8be8f95902987f0366261a8`.
+
+Wave 16 [run 45660631104](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45660631104)
+passed both guest and host jobs at head
+`78465334d6a1f33821080f938ae7df33e5f5187b`. Its complete resolved fuel-worker
+Cargo.lock was recovered and independently SHA-256 checked:
+`a4802aa3eb93c0748c2d87a51b766a458c6a2909844ab3eda6054e294d6550e1`.
+The exact 23-package lock is now committed; CI requires it and builds
+--locked without regenerating it. New-head verification is outstanding.
+
+### Transactional principal authorization (Wave 19 candidate)
+
+An opt-in strict mode adds a persisted, exact-object principal/operation
+grant with a monotonic version. The trusted operator sets grants through
+`SqliteActorSync::set_principal_policy(key, principal, op, expected_version, allowed)`;
+version zero means absent, and each successful update advances the version.
+Missing grants deny by default. Revocation retains a versioned tombstone;
+regranting cannot recreate a stale attempt's grant version. The policy
+table is bounded to 65,536 rows. This API is a trusted administrative
+boundary, not exposed to guest code or a network caller.
+
+The same SQLite transaction that admits a message or returns its replay
+checks the current grant. Starting an attempt persists its grant version
+with the attempt marker. State/receipt/outbox/inbox consumption checks
+that exact version and current permission inside BEGIN IMMEDIATE.
+A revocation committed first therefore prevents the old attempt's
+state commit, even if the grant was restored before guest return.
+A state commit ordered first remains committed; later revocation denies
+future replay through durable admission until a current grant permits it.
+An invalidated attempt becomes a retained terminal authorization denial
+in a subsequent fenced transaction. A crash between failed commit and
+terminal denial is recovered through the existing durable attempt protocol;
+it never retroactively commits that rejected attempt.
+
+Strict mode is irreversible for the database and must be enabled on
+a drained inbox. Configure a signed principal gateway with transactional
+policy enabled and recovery disabled, provision exact grants through a
+trusted operator, then restart with recovery enabled. Transient/raw/alarm
+state commits are rejected in strict mode; network transport and
+transactional alarm/control grants are not implemented. Existing non-strict
+mode retains its earlier external-policy race limitation. Only the
+persisted grant is serialized with commit, not an arbitrary external
+policy callback, identity-provider revocation, transport handoff or
+external side effect. Use exclusive deployment and do not reopen the
+database with older binaries that do not enforce the new mode.
+
+Regression tests cover default denial, stale grant updates, revocation
+followed by regrant during a held guest turn, commit-before-revocation,
+replay denial, strict-mode downgrade rejection, and subsequent authorized
+FIFO progress. A compiled scalar guest test covers strict grant recovery
+after restart. Tests are authored, not execution-verified at this head.
+CI pins storage head `cf147f32d1ef6e1924b3d40377ae0a68309d752d`.
+
+### Durable principal-bound ingress (Wave 18 candidate)
+
+The signed-deployment gateway now provides `admit(capability, request, delta)`
+and an opt-in durable recovery poll interval. The live capability must
+belong to the current gateway, authorize the exact principal/object/op,
+and be unexpired during submission and admission handoff. SQLite commits
+the trusted stable principal binding with the immutable inbox row in the
+same transaction. The request identity remains the principal-scoped
+digest used by transient ingress; exact replay requires a fresh authorized
+grant. Stable principal names must not be reassigned by the upstream
+identity provider.
+
+Capability expiration limits new admissions, not the lifetime of a
+previously accepted message. Recovery re-evaluates current trusted
+scope and principal policy before dispatch, before guest entry, and
+after guest return but before state commit. An explicit policy denial
+terminally dead-letters the exact fenced head with
+`authorization_denied=true`, without a successful receipt, state change
+or outbox publication. The dead sentinel shares the existing retry table
+(its internal count of three is not evidence of three guest executions);
+the principal record distinguishes policy denial. The retained entry
+keeps its tenant quota and prevents automatic resurrection on regrant.
+The next authorized FIFO head remains eligible. A policy exception or
+missing binding fails closed rather than being classified as denial.
+
+Principal-mode startup rejects unbound legacy inbox rows; it never
+retroactively assigns them a principal. Raw admission is disabled in
+gateway mode. Principal recovery uses the same ownership/attempt fencing,
+bounded guest runner and tenant-aware discovery. The trusted policy
+provider must be thread-safe, current and available across restarts.
+The gateway still does not authenticate network credentials, persist the
+policy itself, provide linearizable revocation with the SQLite commit,
+or grant alarms/control capabilities. Policy change racing the commit
+can suppress handoff but cannot undo a committed transition. The scalar
+guest has no external effects; general effectful actors need stronger
+transactional authorization semantics.
+
+Storage tests cover immutable principal bindings, exact-attempt forgery
+rejection, raw admission denial and terminal denial after reopen.
+The compiled guest integration admits Alice and Bob with the same client
+request ID, restarts under a revoked Alice policy, requires Bob to commit,
+and verifies that regranting Alice returns the terminal denial rather
+than replaying her mutation. These tests are authored, not executed
+on the new head. CI pins storage head
+`71d0ec81d534888b9b6b1ddcc0f6c37c7f0919aa`.
+
+### Tenant-aware durable admission and dispatch (Wave 17 candidate)
+
+Storage PR #9 bounds retained inbox records across all objects and
+namespaces of a tenant: default 1,024 records and 16 MiB of aggregate
+command payload, in addition to existing actor/database limits. Dead
+letters remain charged until a future explicit retention API; exact
+pending/terminal replay is checked before admission quotas. Reopen
+rejects a configuration that would silently abandon retained mail.
+These are inbox payload/count limits, not total database size, actor
+activation quota, aggregate CPU/memory quota or a network rate limit.
+
+The scheduler uses a rotating tenant cursor and ranks eligible heads
+within each tenant before applying the 256-head scan limit. A sparse
+tenant's head need not wait behind all earlier hot-tenant objects.
+Within one tenant older eligible heads come first; a backed-off head
+still blocks later live mail for its own object. Existing per-object
+FIFO, durable attempt/epoch fencing and worker bounds remain in force.
+The cursor is volatile and this is best-effort discovery fairness, not
+a guaranteed tenant resource share, preemption or latency SLA. The
+ordinary transient scheduler and alarm poller are not tenant-fair yet.
+
+Regression cases include 260 hot objects plus a sparse tenant, cursor
+wraparound, single-worker integration (quiet tenant second), retry
+backoff, retained dead-letter capacity, exact replay under saturation,
+independent byte limit rejection and fail-closed quota reduction.
+The new tests are authored and the workflow pins storage head
+`9ab67c38f5b9c889daf69ac8c73061018310e36d`; exact-head execution is pending.
+
+Wave 18 introduces candidate durable principal binding and terminal denial; see the dedicated section above. No existing transient receipt is reinterpreted as durable authorization.
+
+### Concurrent durable mailbox recovery (Wave 16 candidate)
+
+The mailbox supervisor no longer waits synchronously for a single object
+before admitting another. It tracks at most one outstanding future per
+full logical object identity and at most the configured worker count
+overall (1–64). Ready futures are collected independently; a bounded
+scan of up to 256 eligible heads fills available slots. Exclusive per-object
+lanes, epoch/attempt fencing, durable FIFO and completion reservations
+are unchanged. A slow or backed-off head does not necessarily block an
+independent ready object when a worker slot is available. An unexpected
+fault stops new dispatch when observed, publishes the fault and drains
+already submitted turns before the supervisor exits. Shutdown drains
+accepted work; nonterminating trusted callbacks remain unsupported.
+This is bounded cross-object concurrency, not a guaranteed per-tenant
+fairness or admission latency policy.
+
+A host regression holds the first durable turn open with a promise,
+requires an independent object's commit while the held object's revision
+stays zero, then releases it and requires both same-object turns to
+complete in FIFO order. This test is authored, not yet execution-verified.
+
+Fuel-worker CI now emits the complete non-secret resolved Cargo.lock
+between explicit markers, plus its digest and dependency graph. A
+committed lock is never regenerated; the build uses --locked. The
+previous executed Wave 11 lock digest was
+`a4802aa3eb93c0748c2d87a51b766a458c6a2909844ab3eda6054e294d6550e1`.
+Wave 20 retrieved and committed the exact lock bytes after digest verification. A fresh exact-head locked build remains required.
+
+### Principal-scoped ingress (Wave 15 candidate)
+
+Wave 13 exact-head `5fedf9fe3589b1d856f118d79245232209af5f62`
+guest and host jobs passed in [run 45653915725](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45653915725).
+Wave 14 signed deployment and Wave 15 principal tests still require their
+own exact-head receipts.
+
+CounterPrincipalGateway issues opaque, process-local, exact-object and
+operation capabilities to a **previously authenticated** stable principal.
+Trusted policy is checked at issue, submission, worker entry, before and
+after guest execution, and before host receipt handoff. Grants expire in
+at most five minutes; a capability from a previous gateway instance is
+not accepted. Principal and caller request ID are canonically length-framed
+and SHA-256 scoped in a reserved receipt namespace, so two principals
+using the same client request ID cannot replay each other's receipt.
+A fresh valid grant may replay that principal's original committed request
+after restart. Conflicting command replay remains rejected by storage.
+
+Gateway startup reserves the namespace transactionally and rejects legacy
+inbox/receipt collisions; ordinary raw controller startup is denied once
+gateway mode is enabled. The raw store and authorized-send hook remain
+trusted host APIs, not network boundaries. A policy change racing the final
+SQLite transaction cannot undo a commit; post-commit revocation can
+suppress reply handoff, and external transport must recheck publication
+authority. This does not provide linearizable revocation or network token
+authentication. Wave 15 exposed transient send only. Wave 18 adds candidate durable principal admission; persisted policy/revocation, authenticated transport, alarm/control grants and key rotation remain future work. Tests cover per-principal receipt isolation, scope denial, operation
+bounds, expiry, policy change, restart grants, replay and reserved
+namespace collision. No Wave 15 execution claim.
+
+General compiled durable actor lowering remains a separate compiler task:
+coordinate [Rust/Wasm #167](https://github.com/atto-lang/atto-source.rs/pull/167)
+(sealed state), [#402](https://github.com/atto-lang/atto-source.rs/pull/402)
+(typed Job ingress), and [#566](https://github.com/atto-lang/atto-source.rs/pull/566)
+(scalar transition) with [spec #63](https://github.com/atto-lang/atto-spec/pull/63).
+None of those independently establishes the general durable actor ABI.
+
+### Bounded compiled guest process runner (Wave 10 — executed)
+
+[Exact-head run 45534083712](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45534083712)
+executed commit `60950899a13b6b1a7d407c6bc48eceed58fa6c78`, tree
+`66d1c3039e7a4a6bd47e63399374a71f93bc7ef4`. Both guest and host jobs
+passed. The guest emitted `COMPILED_COUNTER_PROCESS_WATCHDOG_PASS` with
+one compilation, a 1500 ms deadline and four expected reaped timeout
+children. This verifies the previous head, not the new fuel engine.
+
+
+[CounterProcessGuest](native/include/ores/durable/counter_process_guest.hpp)
+is a Linux/glibc host runner compatible with the existing directory's scalar
+guest callback. It launches a fixed trusted Node/Wasm worker without a shell,
+with an empty environment, redirected standard streams and closed extra file
+descriptors. The worker verifies the expected SHA-256, reads at most 1 MiB of
+Wasm, rejects host imports and unexpected exports, and returns one canonical
+bounded scalar. The parent bounds stdout and waits for the child to exit.
+A wall-clock deadline triggers SIGKILL followed by waitpid/reap **before**
+reporting a classified failure; a Wasm trap is classified only after exit.
+Digest, protocol and unexpected process errors fail closed.
+
+The new [compiled watchdog fixture](tests/durable_counter_watchdog_e2e.mjs)
+compiles an AttoLang transition once, including a deliberately looping branch,
+then exercises the directory with actual Wasm children. Tests require a deadline
+timeout, no remaining child, terminal dead-letter status after three classified
+failures, subsequent healthy execution, and artifact digest rejection.
+This is a candidate process-per-turn reference, not a high-performance
+persistent worker pool. It assumes trusted immutable script/artifact paths,
+a sole waitpid owner, and a cooperating local controller. It is not a full
+hostile-tenant sandbox: OS/cgroup memory and CPU limits, deterministic Wasm
+worker isolation and authenticated artifact
+provenance remain outstanding. A wall deadline includes startup and scheduling;
+an uninterruptible OS process cannot be treated as stopped until actually reaped.
+
+### Executed Wave 9 evidence (2026-11-24)
+
+- [Runtime run 45522504636](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45522504636)
+  executed exact head `d18f26d328b618b056120c0a863b81bb9c71be0d`,
+  root tree `6ff280af9f08119ec852a17e05882a273f6117dc`.
+  The compiled scalar SQLite process fixture passed 13 process turns, seven
+  actual guest evaluations, one compiler invocation and a single repeated
+  Wasm SHA-256 `8ac38b5b4ea76e6e0b8c9df56d72353c2e7739f6f1ab5e3e341c7dd3ae69ec64`.
+  Host-only counter, directory, ASan/UBSan and storage alarm/mailbox/retry
+  recovery tests passed separately.
+- [Storage run 45522468879](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45522468879)
+  executed GCC TSan and GCC/Clang ASan/UBSan jobs on
+  `e4133470f18d7c2c9a0bf250df6b86096488b9b3` (tree
+  `9873db34a026ad3a48269d1d42f0677d129fe9f2`).
+- [Compiler ABI run 45520132964](https://github.com/atto-lang/atto-source.rs/actions/runs/45520132964)
+  emitted `DURABLE_SCALAR_ABI_V1_PASS` at
+  `1d6e8e31453064b6530c5c82679aef3cc9db489b` (tree
+  `89f29eb33650b69d3ab8a12da73a28ea26f4b42f`). Broader compiler
+  CI remains red: the native checked-i64 fixture imports an unavailable
+  legacy crate `oreslang_source_rs`; full corpus, formatting and repository
+  policy gates require independent remediation. No cross-backend parity claim.
+
+These receipts supersede the older pending statuses for Wave 9 and earlier
+features covered by those tests. Wave 10 and Wave 11 watchdog/fuel evidence is recorded above; Wave 12 passed; Wave 13 remains unverified.
+
+### Compile-once candidate ABI
+
+The opt-in Rust/Wasm compiler mode in PR #566 (not available on all backends)
+keeps the existing browser main ABI unchanged. It requires a checked
+`durable_transition(int,int,int)->int` and exposes
+`atto_durable_transition_v1(i64,i64,i64)->i64`. It rejects heap/state,
+actors, generators and host imports in this restricted scalar profile.
+This is a prototype transition ABI, not a public durable actor API.
+
+```sh
+# Build attoc from the pinned compiler candidate, not an arbitrary installed CLI.
+attoc --durable-scalar-v1 counter.atto -o counter.wasm
+# counter.atto must define durable_transition and a zero-argument main.
+```
+
+The fixture compiles one Wasm artifact and creates a fresh instance per
+evaluation. State is loaded from the fenced store; a guest cannot commit
+or publish replies directly. Guest execution must ultimately be bounded
+by fuel/time and memory quotas, with authenticated artifact admission.
+
+### Security and evidence
+
+- Authenticate tenant/object identity before resolving a capability. No
+  cross-tenant mutable pointer sharing. Reject mismatched request IDs,
+  schemas, stale epochs and revisions.
+- Atomically commit state, immutable receipt and outbox intent before
+  publishing success. External effects are at least once, not exactly once.
+- A lost reply must be resolved before rerunning a guest (including an
+  increment that would now overflow). Ambiguous outcomes require recovery.
+- Use isolated bounded storage workers; never block an actor carrier with
+  SQLite or hold a mutable state borrow across suspension.
+- [Historical exact-head CI](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45519080501):
+  at `b480200054c1ac34a055355b80637247197ea49e`, compiler build and host-only
+  counter integration passed; guest compilation failed with E_FI.
+  The syntax was corrected, but later guest/kill-recovery runs remain
+  unverified. [Compiler candidate CI](https://github.com/atto-lang/atto-source.rs/actions/runs/45520132964)
+  and [wave 4 CI](https://github.com/atto-lang/atto-durable-objects.atto/actions/runs/45520213102)
+  were queued at this review. Do not promote historical host passes to
+  current-head guest or cross-backend evidence.
+- See [guest parity and implementation notes](docs/ATTO_GUEST_PARITY.md)
+  and [PR #15](https://github.com/atto-lang/atto-durable-objects.atto/pull/15)
+  for exact dependency pins, tests, limits and current work. Java/GraalVM,
+  LLVM, .NET NativeAOT, Wasm and Cranelift durable actor parity remains unverified.
 
 ## Contract
 

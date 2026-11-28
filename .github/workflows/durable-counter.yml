@@ -1,0 +1,188 @@
+name: Durable counter guest and host seam
+on:
+  pull_request:
+    paths:
+      - 'guest/**'
+      - 'native/include/ores/durable/counter_turn.hpp'
+      - 'native/include/ores/durable/counter_checkpoint_v1.hpp'
+      - 'native/include/ores/durable/scalar_checkpoint_v1.hpp'
+      - 'native/tests/scalar_checkpoint_v1_test.cpp'
+      - 'native/include/ores/durable/bounded_checkpoint_v2.hpp'
+      - 'native/tests/bounded_checkpoint_v2_test.cpp'
+      - 'native/tests/bounded_v2_utf8_adversarial.cpp'
+      - 'native/include/ores/durable/scalar_turn_v1.hpp'
+      - 'native/tests/scalar_turn_v1_test.cpp'
+      - 'native/tests/bounded_turn_v2_test.cpp'
+      - 'native/tests/bounded_receive_guest_driver.cpp'
+      - 'tests/durable_bounded_receive_process_e2e.mjs'
+      - 'native/tests/counter_checkpoint_v1_test.cpp'
+      - 'native/tests/counter_turn_test.cpp'
+      - 'native/include/ores/durable/counter_directory.hpp'
+      - 'native/tests/counter_directory_test.cpp'
+      - 'README.md'
+      - 'tests/durable_counter_guest.mjs'
+      - 'tests/durable_counter_process_e2e.mjs'
+      - 'native/tests/counter_guest_driver.cpp'
+      - 'native/include/ores/durable/counter_process_guest.hpp'
+      - 'native/include/ores/durable/counter_artifact_registry.hpp'
+      - 'native/include/ores/durable/counter_signed_deployment.hpp'
+      - 'native/include/ores/durable/counter_principal_gateway.hpp'
+      - 'native/include/ores/durable/counter_dead_letter_admin.hpp'
+      - 'native/tests/counter_process_guest_test.cpp'
+      - 'tests/durable_counter_watchdog_e2e.mjs'
+      - '.github/workflows/durable-counter.yml'
+permissions:
+  contents: read
+jobs:
+  guest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Verify guest source and build pinned public Rust compiler
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha }}
+          COMPILER_SHA: 96664d383d8779e2f732648cee9e42aac71c08b1
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED"
+          test -z "$(git status --porcelain)"
+          git rev-parse HEAD^{tree}
+          git init "$RUNNER_TEMP/atto-compiler"
+          git -C "$RUNNER_TEMP/atto-compiler" fetch --depth=1 https://github.com/atto-lang/atto-source.rs.git "$COMPILER_SHA"
+          git -C "$RUNNER_TEMP/atto-compiler" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/atto-compiler" rev-parse HEAD)" = "$COMPILER_SHA"
+          test "$(git -C "$RUNNER_TEMP/atto-compiler" rev-parse HEAD^{tree})" = 425c3a1d3f5af829772d4309e447eda0953b3c9e
+          git -C "$RUNNER_TEMP/atto-compiler" fsck --full
+          rustup toolchain install 1.85.1 --profile minimal
+          cd "$RUNNER_TEMP/atto-compiler"
+          cargo +1.85.1 build --locked --release --bin attoc
+      - name: Execute compiled counter Wasm and compiler negative
+        env:
+          ATTO_COMPILER_SOURCE_SHA: 96664d383d8779e2f732648cee9e42aac71c08b1
+        run: |
+          set -euo pipefail
+          ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" node tests/durable_counter_guest.mjs
+      - name: Compile host driver and execute real guest-to-SQLite process test
+        env:
+          STORAGE_SHA: 43a8d8889df1d8712bf7d51d7d98261900a06303
+          ATTO_COMPILER_SOURCE_SHA: 96664d383d8779e2f732648cee9e42aac71c08b1
+        run: |
+          set -euo pipefail
+          git init "$RUNNER_TEMP/storage"
+          GIT_TERMINAL_PROMPT=0 git -C "$RUNNER_TEMP/storage" -c credential.helper= fetch --depth=1 https://github.com/atto-lang/atto-durable-objects.atto.git "$STORAGE_SHA"
+          git -C "$RUNNER_TEMP/storage" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/storage" rev-parse HEAD)" = "$STORAGE_SHA"
+          git -C "$RUNNER_TEMP/storage" fsck --full
+          test "$(git -C "$RUNNER_TEMP/storage" rev-parse HEAD^{tree})" = 119895cdf73fb46ae71ed84ae04964d4ce6a64a8
+          test -z "$(git -C "$RUNNER_TEMP/storage" status --porcelain)"
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev libssl-dev
+          g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
+            -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/counter_guest_driver.cpp \
+            -lsqlite3 -o "$RUNNER_TEMP/counter-guest-driver"
+          ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" \
+            COUNTER_DRIVER="$RUNNER_TEMP/counter-guest-driver" node tests/durable_counter_process_e2e.mjs
+          DURABLE_ACTOR_PROFILE=1 ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" \
+            COUNTER_DRIVER="$RUNNER_TEMP/counter-guest-driver" node tests/durable_counter_process_e2e.mjs
+          git init "$RUNNER_TEMP/atto-js"
+          GIT_TERMINAL_PROMPT=0 git -C "$RUNNER_TEMP/atto-js" -c credential.helper= fetch --depth=1 https://github.com/atto-lang/atto-source.js.git c784b71a2e38959ac081bb7cf35d6070bcd4a89f
+          git -C "$RUNNER_TEMP/atto-js" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/atto-js" rev-parse HEAD)" = c784b71a2e38959ac081bb7cf35d6070bcd4a89f
+          test "$(git -C "$RUNNER_TEMP/atto-js" rev-parse HEAD^{tree})" = 3e9980f69bb878875915df6c79be4df0ac5cfe10
+          git -C "$RUNNER_TEMP/atto-js" fsck --full
+          DURABLE_ACTOR_PROFILE=1 DURABLE_JS_COMPILER="$RUNNER_TEMP/atto-js/src/transpile-worker.mjs" ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" \
+            COUNTER_DRIVER="$RUNNER_TEMP/counter-guest-driver" node tests/durable_counter_process_e2e.mjs
+      - name: Execute compiled looping guest with process watchdog and durable mailbox recovery
+        env:
+          ATTO_COMPILER_SOURCE_SHA: 96664d383d8779e2f732648cee9e42aac71c08b1
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
+            -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/counter_process_guest_test.cpp \
+            -lsqlite3 -lcrypto -o "$RUNNER_TEMP/counter-process-test"
+          # The reviewed lock is mandatory. Never resolve new versions in CI.
+          test -f guest/fuel-worker/Cargo.lock
+          sha256sum guest/fuel-worker/Cargo.lock
+          echo 'BEGIN_FUEL_WORKER_CARGO_LOCK'
+          cat guest/fuel-worker/Cargo.lock
+          echo 'END_FUEL_WORKER_CARGO_LOCK'
+          cargo +1.85.1 tree --locked --manifest-path guest/fuel-worker/Cargo.toml
+          cargo +1.85.1 build --locked --release --manifest-path guest/fuel-worker/Cargo.toml \
+            --target-dir "$RUNNER_TEMP/fuel-target"
+          ATTOC="$RUNNER_TEMP/atto-compiler/target/release/attoc" \
+            COUNTER_PROCESS_TEST="$RUNNER_TEMP/counter-process-test" \
+            COUNTER_FUEL_WORKER="$RUNNER_TEMP/fuel-target/release/atto-durable-fuel-worker" \
+            node tests/durable_counter_watchdog_e2e.mjs
+  host-seam:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Execute host-only storage seam against pinned PR 9
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha }}
+          STORAGE_SHA: 43a8d8889df1d8712bf7d51d7d98261900a06303
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED"
+          test -z "$(git status --porcelain)"
+          git rev-parse HEAD^{tree}
+          git init "$RUNNER_TEMP/storage"
+          GIT_TERMINAL_PROMPT=0 git -C "$RUNNER_TEMP/storage" -c credential.helper= fetch --depth=1 https://github.com/atto-lang/atto-durable-objects.atto.git "$STORAGE_SHA"
+          git -C "$RUNNER_TEMP/storage" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/storage" rev-parse HEAD)" = "$STORAGE_SHA"
+          git -C "$RUNNER_TEMP/storage" fsck --full
+          test "$(git -C "$RUNNER_TEMP/storage" rev-parse HEAD^{tree})" = 119895cdf73fb46ae71ed84ae04964d4ce6a64a8
+          test -z "$(git -C "$RUNNER_TEMP/storage" status --porcelain)"
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev libssl-dev
+          g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
+            -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/counter_turn_test.cpp \
+            -lsqlite3 -o "$RUNNER_TEMP/counter-turn-test"
+          "$RUNNER_TEMP/counter-turn-test"
+          echo 'HOST_ONLY_COUNTER_TURN_PASS'
+          g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Inative/include native/tests/counter_checkpoint_v1_test.cpp -o "$RUNNER_TEMP/counter-checkpoint-test"
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 timeout 30 "$RUNNER_TEMP/counter-checkpoint-test"
+          g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Inative/include native/tests/scalar_checkpoint_v1_test.cpp -o "$RUNNER_TEMP/scalar-checkpoint-test"
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 timeout 30 "$RUNNER_TEMP/scalar-checkpoint-test"
+          g++ -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Inative/include native/tests/bounded_checkpoint_v2_test.cpp -o "$RUNNER_TEMP/bounded-checkpoint-test"
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 timeout 60 "$RUNNER_TEMP/bounded-checkpoint-test"
+          g++ -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Inative/include native/tests/bounded_v2_utf8_adversarial.cpp -o "$RUNNER_TEMP/bounded-utf8-test"
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 timeout 60 "$RUNNER_TEMP/bounded-utf8-test"
+          g++ -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/scalar_turn_v1_test.cpp -lsqlite3 -o "$RUNNER_TEMP/scalar-turn-test"
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 timeout 60 "$RUNNER_TEMP/scalar-turn-test"
+          g++ -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/bounded_turn_v2_test.cpp -lsqlite3 -o "$RUNNER_TEMP/bounded-turn-test"
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 timeout 60 "$RUNNER_TEMP/bounded-turn-test"
+          git init "$RUNNER_TEMP/receive-js"
+          GIT_TERMINAL_PROMPT=0 git -C "$RUNNER_TEMP/receive-js" -c credential.helper= fetch --depth=1 https://github.com/atto-lang/atto-source.js.git fb6d8c92d37aa2a105c9c2340fd1f9bc9ef6f64b
+          git -C "$RUNNER_TEMP/receive-js" checkout --detach FETCH_HEAD
+          git -C "$RUNNER_TEMP/receive-js" fsck --full
+          test "$(git -C "$RUNNER_TEMP/receive-js" rev-parse HEAD)" = fb6d8c92d37aa2a105c9c2340fd1f9bc9ef6f64b
+          test "$(git -C "$RUNNER_TEMP/receive-js" rev-parse HEAD^{tree})" = 743db81257e7cfca5330fd7905d8323ae2885edf
+          test -z "$(git -C "$RUNNER_TEMP/receive-js" status --porcelain)"
+          g++ -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -no-pie -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/bounded_receive_guest_driver.cpp -lsqlite3 -o "$RUNNER_TEMP/bounded-receive-driver"
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ATTO_JS_RECEIVE_COMPILER="$RUNNER_TEMP/receive-js/src/durable-bounded-receive-v2.mjs" ATTO_BOUNDED_DRIVER="$RUNNER_TEMP/bounded-receive-driver" node tests/durable_bounded_receive_process_e2e.mjs
+          g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
+            -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/counter_directory_test.cpp \
+            -lsqlite3 -o "$RUNNER_TEMP/counter-directory-test"
+          timeout 60 "$RUNNER_TEMP/counter-directory-test"
+          echo 'HOST_ONLY_COUNTER_DIRECTORY_PASS'
+          g++ -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
+            -fno-omit-frame-pointer -fsanitize=address,undefined \
+            -Inative/include -I"$RUNNER_TEMP/storage/native/include" native/tests/counter_directory_test.cpp \
+            -lsqlite3 -o "$RUNNER_TEMP/counter-directory-sanitized"
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+            timeout 90 "$RUNNER_TEMP/counter-directory-sanitized"
+          echo 'HOST_ONLY_COUNTER_DIRECTORY_ASAN_UBSAN_PASS'
+          g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG -pthread \
+            -I"$RUNNER_TEMP/storage/native/include" "$RUNNER_TEMP/storage/native/tests/actor_sync_crash_recovery_test.cpp" \
+            -lsqlite3 -o "$RUNNER_TEMP/actor-sync-crash-test"
+          timeout 60 "$RUNNER_TEMP/actor-sync-crash-test"
+          echo 'HOST_ONLY_ACTOR_SYNC_ALARM_MAILBOX_RETRY_RECOVERY_PASS'

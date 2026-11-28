@@ -1,0 +1,8 @@
+// Restricted compiler-backed durable actor profile; broker owns storage.
+// The compiler checks this actual receive AST before lowering the turn.
+define durable actor Counter as
+    state count: int = 0;
+    receive(ActorMail<int> mail) -> void {
+        self.count = self.count + mail.value;
+    }
+end
